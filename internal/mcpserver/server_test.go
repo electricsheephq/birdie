@@ -57,7 +57,9 @@ func (s *session) next() map[string]any {
 			s.t.Fatalf("bad JSON from server: %q", l)
 		}
 		return m
-	case <-time.After(10 * time.Second):
+	// Longer than any tool call's timeout in these tests (15s), so a slow
+	// but successful wait_for_reply isn't cut off here.
+	case <-time.After(20 * time.Second):
 		s.t.Fatal("timed out waiting for server output")
 	}
 	return nil
