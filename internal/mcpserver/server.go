@@ -276,7 +276,8 @@ func (s *Server) syncSession(ctx context.Context, h Host) {
 			s.replaces = old
 		case old != "":
 			// A new conversation (/clear): what was pinned to the old one
-			// waits for it.
+			// waits for it, including a stand-in's move not yet reported.
+			s.replaces = ""
 			if err := s.c.EndSession(ctx, old); err != nil {
 				s.log.Printf("end session: %v", err)
 			}
@@ -343,13 +344,17 @@ func (s *Server) pump(ctx context.Context) {
 			pause(ctx, 5*time.Second)
 			continue
 		}
-		if s.c.Session() != polled {
-			// The conversation changed while the poll was out, so these are
-			// another conversation's: back to the queue to wait for it.
+		if h := s.currentHost(); s.c.Session() != polled || (h != nil && h.Session().ID != polled) {
+			// The conversation changed while the poll was out (/clear), so
+			// these are another conversation's: back to the queue to wait for
+			// it, and act for the new one before polling again.
 			for _, m := range msgs {
 				if err := s.c.Nack(context.WithoutCancel(ctx), m.ID); err != nil {
 					s.log.Printf("nack %s: %v", m.ID, err)
 				}
+			}
+			if h != nil {
+				s.syncSession(ctx, h)
 			}
 			continue
 		}
@@ -520,35 +525,53 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 		}
 	}
 	ch := s.addWaiter(thread)
-	defer s.removeWaiter(thread, ch)
-	s.waitMu.Lock()
-	already := s.shown[thread]
-	delete(s.shown, thread)
-	s.waitMu.Unlock()
-	if len(already) > 0 {
-		return already, nil
-	}
-	// The pump only takes what this session is due. Naming the thread also
-	// collects what in it waits for a session that has gone.
-	if msgs, err := s.c.Inbox(ctx, thread, 0); err != nil || len(msgs) > 0 {
-		s.ackAll(ctx, msgs, err)
-		return msgs, err
-	}
-	select {
-	case m := <-ch:
-		msgs := []bus.Message{m}
+	// finish stops the pump routing here, then takes what it already did:
+	// those are confirmed, so dropping them would lose them.
+	finish := func(msgs []bus.Message) []bus.Message {
+		s.removeWaiter(thread, ch)
 		for {
 			select {
 			case m := <-ch:
 				msgs = append(msgs, m)
 			default:
-				return msgs, nil
+				return msgs
 			}
 		}
-	case <-ctx.Done():
-		return nil, nil
+	}
+	s.waitMu.Lock()
+	already := s.shown[thread]
+	delete(s.shown, thread)
+	s.waitMu.Unlock()
+	if len(already) > 0 {
+		return finish(already), nil
+	}
+	// The pump only takes what this session is due. Naming the thread also
+	// collects what in it waits for a session that has gone, so check the
+	// thread itself now and then.
+	tick := time.NewTicker(threadCheck)
+	defer tick.Stop()
+	for {
+		msgs, err := s.c.Inbox(ctx, thread, 0)
+		if ctx.Err() != nil {
+			return finish(nil), nil
+		}
+		if err != nil || len(msgs) > 0 {
+			s.ackAll(ctx, msgs, err)
+			return finish(msgs), err
+		}
+		select {
+		case m := <-ch:
+			return finish([]bus.Message{m}), nil
+		case <-tick.C:
+		case <-ctx.Done():
+			return finish(nil), nil
+		}
 	}
 }
+
+// threadCheck is how often a push session waiting on a thread checks it for
+// messages the pump doesn't take.
+const threadCheck = 2 * time.Second
 
 func deadlineOf(ctx context.Context) time.Time {
 	d, _ := ctx.Deadline()

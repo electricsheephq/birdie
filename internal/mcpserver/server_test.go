@@ -444,3 +444,53 @@ func TestStandInSessionMovesToTheRealOne(t *testing.T) {
 		t.Fatalf("check_inbox = %+v", out)
 	}
 }
+
+// A held answer that arrives while a push session waits on its thread is
+// collected too, not only one already there.
+func TestPushWaitCollectsAHeldAnswerThatArrivesLater(t *testing.T) {
+	ctx := context.Background()
+	h := &fakeHost{tier: bus.TierPush, pushed: make(chan bus.Message, 4)}
+	s, cursor, st := setupHost(t, h)
+	waitFor(t, "the session to register", sessionLive(cursor))
+
+	done := make(chan map[string]any, 1)
+	go func() {
+		done <- s.call("tools/call", map[string]any{"name": "wait_for_reply", "arguments": map[string]any{"thread_id": "thr_late", "timeout_seconds": 8}})
+	}()
+	time.Sleep(300 * time.Millisecond)
+	late := bus.Message{ID: "msg_late", ThreadID: "thr_late", From: "cursor", To: "claude", ToSession: "gone", Content: "late answer", Status: bus.StatusQueued, CreatedAt: time.Now()}
+	if err := st.InsertMessage(ctx, late); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case res := <-done:
+		out := toolJSON(t, res)
+		if msgs, _ := out["messages"].([]any); len(msgs) != 1 || msgs[0].(map[string]any)["id"] != "msg_late" {
+			t.Fatalf("wait_for_reply = %+v", out)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("wait_for_reply didn't return")
+	}
+	noPush(t, h, 200*time.Millisecond)
+}
+
+// /clear with no tool call or report since: the pump's poll still acts for
+// the old conversation, so what it takes must not be shown in the new one.
+func TestClearBeforeTheBridgeNoticesKeepsOldAnswersOut(t *testing.T) {
+	ctx := context.Background()
+	h := &fakeHost{tier: bus.TierPush, pushed: make(chan bus.Message, 4)}
+	s, cursor, st := setupHost(t, h)
+	waitFor(t, "the session to register", sessionLive(cursor))
+
+	q := send(t, s, map[string]any{"to": "cursor", "content": "question"})
+	h.setID("sess-2")
+	a, err := cursor.Send(ctx, bus.SendInput{InReplyTo: q.ID, Content: "answer to the old conversation"})
+	if err != nil || a.ToSession != "sess-1" {
+		t.Fatalf("a = %+v, %v", a, err)
+	}
+	noPush(t, h, time.Second)
+	waitFor(t, "the answer to wait for its session", func() bool {
+		got, _ := st.GetMessage(ctx, a.ID)
+		return got.Status == bus.StatusQueued
+	})
+}

@@ -596,3 +596,27 @@ func TestReplacingAStandInMovesItsMessages(t *testing.T) {
 		t.Fatalf("bad replaces: err = %v", err)
 	}
 }
+
+// A session that took a message and gave it back hasn't taken part.
+func TestAMessageGivenBackDoesntMakeASessionPartOfTheThread(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	now := time.Now()
+	report(t, b, "claude", "first", "first", bus.TierPush, now)
+	m, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_n", Content: "start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := take(t, b, "claude", "first"); len(got) != 1 {
+		t.Fatalf("first got %+v", got)
+	}
+	if err := b.Nack(ctx, "claude", m.ID); err != nil {
+		t.Fatal(err)
+	}
+	f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_n", Content: "more"})
+	if err != nil || f.ToSession != "" {
+		t.Fatalf("follow-up = %+v, %v", f, err)
+	}
+}

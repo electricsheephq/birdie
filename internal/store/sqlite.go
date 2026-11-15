@@ -267,9 +267,9 @@ func (s *SQLite) Thread(ctx context.Context, threadID, agent string) ([]bus.Mess
 func (s *SQLite) ThreadSession(ctx context.Context, threadID, from, agent string) (string, error) {
 	var id string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT CASE WHEN m.sender = ? THEN m.from_session WHEN m.taken_by != '' THEN m.taken_by ELSE m.to_session END
+		`SELECT CASE WHEN m.sender = ? THEN m.from_session WHEN m.taken_by != '' AND m.status != 'queued' THEN m.taken_by ELSE m.to_session END
 		 FROM messages m WHERE m.thread_id = ?
-		   AND ((m.sender = ? AND m.recipient = ? AND (m.taken_by != '' OR m.to_session != ''))
+		   AND ((m.sender = ? AND m.recipient = ? AND ((m.taken_by != '' AND m.status != 'queued') OR m.to_session != ''))
 		     OR (m.sender = ? AND m.recipient = ? AND m.from_session != ''))
 		 ORDER BY m.seq DESC LIMIT 1`,
 		agent, threadID, from, agent, agent, from).Scan(&id)

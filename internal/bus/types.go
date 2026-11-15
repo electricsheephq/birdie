@@ -244,8 +244,8 @@ type Store interface {
 	// Thread returns the thread's messages that agent sent or received.
 	Thread(ctx context.Context, threadID, agent string) ([]Message, error)
 	// ThreadSession returns the session of agent that last took part in
-	// thread with from: the one that sent a message, or else took or was
-	// due one. It returns "" if none did.
+	// thread with from: the one that sent a message, or else took one (and
+	// didn't give it back) or was due one. It returns "" if none did.
 	ThreadSession(ctx context.Context, threadID, from, agent string) (string, error)
 	// ClaimInbox takes up to f.Limit messages for f.Agent, oldest first:
 	// queued ones and claimed ones whose lease ran out.
