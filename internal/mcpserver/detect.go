@@ -109,14 +109,36 @@ func procInfo(pid int) (ppid int, argv []string, err error) {
 	if runtime.GOOS == "windows" {
 		return 0, nil, fmt.Errorf("process info not supported on %s", runtime.GOOS)
 	}
-	out, err := exec.Command("ps", "-o", "ppid=", "-o", "args=", "-p", strconv.Itoa(pid)).Output()
+	// ps joins the arguments with spaces, so argv[0] comes from comm, the
+	// executable path on its own: on macOS it can contain a space, as in
+	// ~/Library/Application Support, where the Claude desktop app keeps the
+	// Claude Code it runs.
+	head, err := exec.Command("ps", "-o", "ppid=", "-o", "comm=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
 		return 0, nil, err
 	}
-	fields := strings.Fields(string(out))
-	if len(fields) < 2 {
+	args, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return 0, nil, err
+	}
+	return parsePS(pid, string(head), string(args))
+}
+
+// parsePS reads `ps -o ppid= -o comm=` and `ps -o args=` for one process.
+func parsePS(pid int, head, args string) (ppid int, argv []string, err error) {
+	ppidText, comm, _ := strings.Cut(strings.TrimSpace(head), " ")
+	comm = strings.TrimSpace(comm)
+	if comm == "" {
 		return 0, nil, fmt.Errorf("no process %d", pid)
 	}
-	ppid, err = strconv.Atoi(fields[0])
-	return ppid, fields[1:], err
+	if ppid, err = strconv.Atoi(ppidText); err != nil {
+		return 0, nil, err
+	}
+	args = strings.TrimSpace(args)
+	rest, ok := strings.CutPrefix(args, comm)
+	if !ok {
+		// argv[0] isn't the path, as for "node cli.js" started from PATH.
+		_, rest, _ = strings.Cut(args, " ")
+	}
+	return ppid, append([]string{comm}, strings.Fields(rest)...), nil
 }
