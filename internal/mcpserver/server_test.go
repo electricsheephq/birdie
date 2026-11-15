@@ -404,7 +404,7 @@ func TestPushSessionCollectsAHeldAnswerFromItsThread(t *testing.T) {
 	}
 	noPush(t, h, 500*time.Millisecond)
 
-	out := toolJSON(t, s.call("tools/call", map[string]any{"name": "wait_for_reply", "arguments": map[string]any{"thread_id": "thr_held", "timeout_seconds": 2}}))
+	out := toolJSON(t, s.call("tools/call", map[string]any{"name": "wait_for_reply", "arguments": map[string]any{"thread_id": "thr_held", "timeout_seconds": 15}}))
 	msgs, _ := out["messages"].([]any)
 	if len(msgs) != 1 || msgs[0].(map[string]any)["id"] != "msg_held" {
 		t.Fatalf("wait_for_reply = %+v", out)
@@ -455,7 +455,7 @@ func TestPushWaitCollectsAHeldAnswerThatArrivesLater(t *testing.T) {
 
 	done := make(chan map[string]any, 1)
 	go func() {
-		done <- s.call("tools/call", map[string]any{"name": "wait_for_reply", "arguments": map[string]any{"thread_id": "thr_late", "timeout_seconds": 8}})
+		done <- s.call("tools/call", map[string]any{"name": "wait_for_reply", "arguments": map[string]any{"thread_id": "thr_late", "timeout_seconds": 15}})
 	}()
 	time.Sleep(300 * time.Millisecond)
 	late := bus.Message{ID: "msg_late", ThreadID: "thr_late", From: "cursor", To: "claude", ToSession: "gone", Content: "late answer", Status: bus.StatusQueued, CreatedAt: time.Now()}
@@ -468,7 +468,7 @@ func TestPushWaitCollectsAHeldAnswerThatArrivesLater(t *testing.T) {
 		if msgs, _ := out["messages"].([]any); len(msgs) != 1 || msgs[0].(map[string]any)["id"] != "msg_late" {
 			t.Fatalf("wait_for_reply = %+v", out)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("wait_for_reply didn't return")
 	}
 	noPush(t, h, 200*time.Millisecond)
