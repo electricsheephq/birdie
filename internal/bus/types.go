@@ -209,8 +209,11 @@ type ReceiveInput struct {
 // ClaimFilter is ReceiveInput as the store needs it.
 type ClaimFilter struct {
 	Agent, Thread, Session string
-	// Unpinned also takes messages not pinned to a live session.
-	Unpinned  bool
+	// Unpinned also takes messages not pinned to any session.
+	Unpinned bool
+	// Orphans, with Unpinned, also takes messages pinned to a session that is
+	// no longer running: one closed, or not seen since LiveSince.
+	Orphans   bool
 	LiveSince time.Time
 	Limit     int
 	// LeaseUntil, when set, claims rather than delivers.
@@ -237,6 +240,10 @@ type Store interface {
 	ThreadAccess(ctx context.Context, threadID, agent string) (exists, member bool, err error)
 	// Thread returns the thread's messages that agent sent or received.
 	Thread(ctx context.Context, threadID, agent string) ([]Message, error)
+	// ThreadSession returns the session of agent that last took part in
+	// thread with from: the one that sent a message, or else took one (and
+	// didn't give it back) or was due one. It returns "" if none did.
+	ThreadSession(ctx context.Context, threadID, from, agent string) (string, error)
 	// ClaimInbox takes up to f.Limit messages for f.Agent, oldest first:
 	// queued ones and claimed ones whose lease ran out.
 	ClaimInbox(ctx context.Context, f ClaimFilter, now time.Time) ([]Message, error)

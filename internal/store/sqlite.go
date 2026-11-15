@@ -264,6 +264,21 @@ func (s *SQLite) Thread(ctx context.Context, threadID, agent string) ([]bus.Mess
 		threadID, agent, agent))
 }
 
+func (s *SQLite) ThreadSession(ctx context.Context, threadID, from, agent string) (string, error) {
+	var id string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT CASE WHEN m.sender = ? THEN m.from_session WHEN m.taken_by != '' AND m.status != 'queued' THEN m.taken_by ELSE m.to_session END
+		 FROM messages m WHERE m.thread_id = ?
+		   AND ((m.sender = ? AND m.recipient = ? AND ((m.taken_by != '' AND m.status != 'queued') OR m.to_session != ''))
+		     OR (m.sender = ? AND m.recipient = ? AND m.from_session != ''))
+		 ORDER BY m.seq DESC LIMIT 1`,
+		agent, threadID, from, agent, agent, from).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
 // inboxWhere is the condition for messages a ClaimFilter may take. It uses the
 // messages alias m.
 func inboxWhere(f bus.ClaimFilter, now time.Time) (string, []any) {
@@ -274,12 +289,16 @@ func inboxWhere(f bus.ClaimFilter, now time.Time) (string, []any) {
 		args = append(args, f.Thread)
 	}
 	if f.Session != "" {
-		if f.Unpinned {
+		switch {
+		case f.Unpinned && f.Orphans:
 			// Mail for a session that has gone falls to this one too.
 			q += ` AND (m.to_session = ? OR m.to_session = '' OR m.to_session NOT IN
 				(SELECT id FROM sessions WHERE agent = ? AND last_seen >= ? AND ended_at = 0))`
 			args = append(args, f.Session, f.Agent, f.LiveSince.UnixMilli())
-		} else {
+		case f.Unpinned:
+			q += ` AND (m.to_session = ? OR m.to_session = '')`
+			args = append(args, f.Session)
+		default:
 			q += ` AND m.to_session = ?`
 			args = append(args, f.Session)
 		}

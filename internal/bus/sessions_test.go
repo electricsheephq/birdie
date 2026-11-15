@@ -126,13 +126,136 @@ func TestAnswersGoBackToTheSessionThatAsked(t *testing.T) {
 		t.Fatalf("asker got %+v", got)
 	}
 
-	// If the asker has gone, its answer falls to the default session.
+	// If the asker has gone, its answer waits for it rather than falling to
+	// the default session, which never saw the question.
 	b.Send(ctx, "bot", bus.SendInput{InReplyTo: q.ID, Content: "one more thing"})
 	if err := b.EndSession(ctx, "claude", "asker"); err != nil {
 		t.Fatal(err)
 	}
+	if got := take(t, b, "claude", "listener"); len(got) != 0 {
+		t.Fatalf("the default session took a closed session's answer: %+v", got)
+	}
+	// The pin delivers it, not being the default: listener stays the default.
+	if err := st.SetAgentConfig(ctx, "claude", "default_session", "listener"); err != nil {
+		t.Fatal(err)
+	}
+	report(t, b, "claude", "asker", "asker", bus.TierPush, time.Now())
+	if got := take(t, b, "claude", "asker"); len(got) != 1 {
+		t.Fatalf("the asker came back and got %+v", got)
+	}
+}
+
+// An answer sent after its session closed must not reach a session opened
+// since, however recent: issue #1.
+func TestAnswerToAClosedSessionWaitsForIt(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "eva", nil)
+	addAgent(t, st, "claude", nil)
+	report(t, b, "claude", "oneshot", "oneshot", bus.TierPush, time.Now())
+
+	q, err := b.Send(ctx, "claude", bus.SendInput{To: "eva", Content: "question", FromSession: "oneshot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.EndSession(ctx, "claude", "oneshot"); err != nil {
+		t.Fatal(err)
+	}
+	a, err := b.Send(ctx, "eva", bus.SendInput{InReplyTo: q.ID, Content: "go ahead with that"})
+	if err != nil || a.ToSession != "oneshot" {
+		t.Fatalf("answer = %+v, %v", a, err)
+	}
+	if !strings.Contains(a.Note, "oneshot is no longer open") || !strings.Contains(a.Note, "unless one waits on this thread") {
+		t.Fatalf("note = %q", a.Note)
+	}
+
+	report(t, b, "claude", "fresh", "fresh", bus.TierPush, time.Now())
+	if n, err := b.Unread(ctx, bus.ReceiveInput{Agent: "claude", Session: "fresh"}); err != nil || n != 0 {
+		t.Fatalf("unread in the new session = %d, %v", n, err)
+	}
+	if got := take(t, b, "claude", "fresh"); len(got) != 0 {
+		t.Fatalf("the new default session took the answer: %+v", got)
+	}
+	// New conversations still go to the default.
+	if _, err := b.Send(ctx, "eva", bus.SendInput{To: "claude", Content: "new topic"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := take(t, b, "claude", "fresh"); len(got) != 1 || got[0].Content != "new topic" {
+		t.Fatalf("default session got %+v", got)
+	}
+
+	// Waiting on the thread names it, so that can still collect the answer.
+	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "fresh", Thread: q.ThreadID, Lease: time.Minute})
+	if err != nil || len(got) != 1 || got[0].ID != a.ID {
+		t.Fatalf("thread wait got %+v, %v", got, err)
+	}
+}
+
+// A session that stops reporting without closing counts as gone too.
+func TestAnswerToALapsedSessionWaitsForIt(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "eva", nil)
+	addAgent(t, st, "claude", nil)
+	now := time.Now()
+	report(t, b, "claude", "asker", "asker", bus.TierPush, now)
+	q, err := b.Send(ctx, "claude", bus.SendInput{To: "eva", Content: "question", FromSession: "asker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-2 * bus.SessionTTL)
+	if err := st.UpsertSession(ctx, bus.Session{Agent: "claude", ID: "asker", Name: "asker", Tier: bus.TierPush, ActiveAt: old, LastSeen: old}); err != nil {
+		t.Fatal(err)
+	}
+	report(t, b, "claude", "fresh", "fresh", bus.TierPush, now)
+	a, err := b.Send(ctx, "eva", bus.SendInput{InReplyTo: q.ID, Content: "answer"})
+	if err != nil || !strings.Contains(a.Note, "no longer open") {
+		t.Fatalf("answer = %+v, %v", a, err)
+	}
+	if got := take(t, b, "claude", "fresh"); len(got) != 0 {
+		t.Fatalf("the default session took a lapsed session's answer: %+v", got)
+	}
+	if err := st.SetAgentConfig(ctx, "claude", "default_session", "fresh"); err != nil {
+		t.Fatal(err)
+	}
+	report(t, b, "claude", "asker", "asker", bus.TierPush, time.Now())
+	if got := take(t, b, "claude", "asker"); len(got) != 1 {
+		t.Fatalf("the asker came back and got %+v", got)
+	}
+}
+
+// A follow-up that names only the thread goes where an answer would.
+func TestThreadFollowUpsGoToTheSessionInTheThread(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	now := time.Now()
+	report(t, b, "claude", "asker", "asker", bus.TierPush, now.Add(-time.Hour))
+	report(t, b, "claude", "listener", "listener", bus.TierPush, now)
+
+	q, err := b.Send(ctx, "claude", bus.SendInput{To: "bot", Content: "question", FromSession: "asker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: q.ThreadID, Content: "and another thing"})
+	if err != nil || f.ToSession != "asker" {
+		t.Fatalf("follow-up = %+v, %v", f, err)
+	}
+	if got := take(t, b, "claude", "listener"); len(got) != 0 {
+		t.Fatalf("the default session took a follow-up: %+v", got)
+	}
+	if got := take(t, b, "claude", "asker"); len(got) != 1 {
+		t.Fatalf("asker got %+v", got)
+	}
+
+	// A thread no session of claude has been in yet is still a new conversation.
+	n, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_custom", Content: "hello"})
+	if err != nil || n.ToSession != "" {
+		t.Fatalf("new thread = %+v, %v", n, err)
+	}
 	if got := take(t, b, "claude", "listener"); len(got) != 1 {
-		t.Fatalf("listener got %+v", got)
+		t.Fatalf("default session got %+v", got)
 	}
 }
 
@@ -400,4 +523,66 @@ func TestAcceptedWorkRunsAgainAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitStatus(t, st, m.ID, bus.StatusDelivered)
+}
+
+// A follow-up goes to the session that took the last message in the thread,
+// even if it hasn't answered yet, and to the one that collected a held answer.
+func TestThreadFollowUpsGoToTheSessionThatTookTheLastMessage(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	now := time.Now()
+	report(t, b, "claude", "first", "first", bus.TierPush, now)
+
+	m, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_t", Content: "start"})
+	if err != nil || m.ToSession != "" {
+		t.Fatalf("m = %+v, %v", m, err)
+	}
+	if got := take(t, b, "claude", "first"); len(got) != 1 {
+		t.Fatalf("first got %+v", got)
+	}
+	report(t, b, "claude", "second", "second", bus.TierPush, now.Add(time.Second))
+	f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_t", Content: "more"})
+	if err != nil || f.ToSession != "first" {
+		t.Fatalf("follow-up = %+v, %v", f, err)
+	}
+
+	// first closes; second collects the follow-up by naming the thread, and
+	// becomes the session in it.
+	if err := b.EndSession(ctx, "claude", "first"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "second", Thread: "thr_t", Lease: time.Minute})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("thread wait got %+v, %v", got, err)
+	}
+	g, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_t", Content: "and more"})
+	if err != nil || g.ToSession != "second" {
+		t.Fatalf("follow-up after collecting = %+v, %v", g, err)
+	}
+}
+
+// A session that took a message and gave it back hasn't taken part.
+func TestAMessageGivenBackDoesntMakeASessionPartOfTheThread(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	now := time.Now()
+	report(t, b, "claude", "first", "first", bus.TierPush, now)
+	m, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_n", Content: "start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := take(t, b, "claude", "first"); len(got) != 1 {
+		t.Fatalf("first got %+v", got)
+	}
+	if err := b.Nack(ctx, "claude", m.ID); err != nil {
+		t.Fatal(err)
+	}
+	f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_n", Content: "more"})
+	if err != nil || f.ToSession != "" {
+		t.Fatalf("follow-up = %+v, %v", f, err)
+	}
 }
