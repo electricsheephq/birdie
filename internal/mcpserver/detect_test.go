@@ -47,9 +47,12 @@ func TestParsePSKeepsSpacesInThePath(t *testing.T) {
 	}{
 		{" 16419 " + app + "\n", app + " --output-format stream-json --dangerously-load-development-channels server:birdie\n",
 			16419, []string{app, "--output-format", "stream-json", "--dangerously-load-development-channels", "server:birdie"}},
+		// Where comm and args disagree (not macOS), args after the first word.
 		{"1 /usr/local/bin/node", "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js --resume",
 			1, []string{"/usr/local/bin/node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js", "--resume"}},
 		{"500 /bin/zsh", "/bin/zsh", 500, []string{"/bin/zsh"}},
+		// comm a prefix of a longer first word isn't argv[0].
+		{"9 /x/claude", "/x/claude-helper --y", 9, []string{"/x/claude", "--y"}},
 	}
 	for _, c := range cases {
 		ppid, argv, err := parsePS(7, c.head, c.args)

@@ -109,8 +109,8 @@ func procInfo(pid int) (ppid int, argv []string, err error) {
 	if runtime.GOOS == "windows" {
 		return 0, nil, fmt.Errorf("process info not supported on %s", runtime.GOOS)
 	}
-	// ps joins the arguments with spaces, so argv[0] comes from comm, the
-	// executable path on its own: on macOS it can contain a space, as in
+	// ps joins the arguments with spaces, so argv[0] comes from comm, which
+	// on macOS is argv[0] whole, untruncated. It can contain a space, as in
 	// ~/Library/Application Support, where the Claude desktop app keeps the
 	// Claude Code it runs.
 	head, err := exec.Command("ps", "-o", "ppid=", "-o", "comm=", "-p", strconv.Itoa(pid)).Output()
@@ -136,8 +136,9 @@ func parsePS(pid int, head, args string) (ppid int, argv []string, err error) {
 	}
 	args = strings.TrimSpace(args)
 	rest, ok := strings.CutPrefix(args, comm)
-	if !ok {
-		// argv[0] isn't the path, as for "node cli.js" started from PATH.
+	if !ok || (rest != "" && rest[0] != ' ') {
+		// comm isn't how args begins, which macOS doesn't do but other BSDs
+		// may: fall back to splitting on the first space.
 		_, rest, _ = strings.Cut(args, " ")
 	}
 	return ppid, append([]string{comm}, strings.Fields(rest)...), nil
