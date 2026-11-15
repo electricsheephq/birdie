@@ -113,6 +113,32 @@ func TestClaudePushWritesUserFrame(t *testing.T) {
 	}
 }
 
+func TestSlug(t *testing.T) {
+	long := strings.Repeat("a", 47) + " - b"
+	for in, want := range map[string]string{
+		"My Repo":            "my-repo",
+		"birdie-src":         "birdie-src",
+		"Web App - Docs: v2": "web-app-docs-v2",
+		"a -- b":             "a-b",
+		"a---b":              "a-b",
+		"--x--":              "x",
+		"v1.2_beta":          "v1.2_beta",
+		"日本語":                "",
+		"!!!":                "",
+		long:                 strings.Repeat("a", 47),
+	} {
+		got := slug(in)
+		if got != want {
+			t.Errorf("slug(%q) = %q, want %q", in, got, want)
+		}
+		if got != "" {
+			if _, err := bus.ParseAddress("claude/" + got); err != nil {
+				t.Errorf("slug(%q) = %q, which isn't a usable address: %v", in, got, err)
+			}
+		}
+	}
+}
+
 func TestClaudeSessionComesFromRegistry(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)

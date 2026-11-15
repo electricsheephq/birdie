@@ -75,7 +75,10 @@ func procSession() SessionInfo {
 // conversation.
 func procID() string { return fmt.Sprintf("proc-%d", os.Getpid()) }
 
-var slugBad = regexp.MustCompile(`[^a-z0-9._-]+`)
+// slugBad leaves dashes out of the kept characters, so a run of them and of
+// anything else becomes one dash: "Plugin - Birdie" is plugin-birdie, not
+// plugin---birdie.
+var slugBad = regexp.MustCompile(`[^a-z0-9._]+`)
 
 // slug turns a title or folder name into something usable in an address.
 func slug(s string) string {
