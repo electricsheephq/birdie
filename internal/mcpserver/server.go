@@ -517,7 +517,7 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 			}
 			msgs, err := s.c.Inbox(ctx, thread, min(remaining, bus.MaxWait-5*time.Second))
 			if err != nil || len(msgs) > 0 {
-				if ctx.Err() != nil {
+				if ctx.Err() != nil && len(msgs) == 0 {
 					return nil, nil
 				}
 				return msgs, err
@@ -552,16 +552,18 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 	defer tick.Stop()
 	for {
 		msgs, err := s.c.Inbox(ctx, thread, 0)
+		if err == nil && len(msgs) > 0 {
+			// Taken, even if the deadline passed meanwhile: keep them, or they
+			// sit leased to this session until the lease ends.
+			s.ackAll(ctx, msgs, nil)
+			return finish(msgs), nil
+		}
 		if ctx.Err() != nil {
 			return finish(nil), nil
 		}
-		if err != nil || len(msgs) > 0 {
-			s.ackAll(ctx, msgs, err)
-			if err != nil {
-				msgs = nil
-			}
+		if err != nil {
 			// What the pump routed here is confirmed, so it wins over an error.
-			if got := finish(msgs); len(got) > 0 || err == nil {
+			if got := finish(nil); len(got) > 0 {
 				return got, nil
 			}
 			return nil, err
