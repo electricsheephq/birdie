@@ -557,7 +557,14 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 		}
 		if err != nil || len(msgs) > 0 {
 			s.ackAll(ctx, msgs, err)
-			return finish(msgs), err
+			if err != nil {
+				msgs = nil
+			}
+			// What the pump routed here is confirmed, so it wins over an error.
+			if got := finish(msgs); len(got) > 0 || err == nil {
+				return got, nil
+			}
+			return nil, err
 		}
 		select {
 		case m := <-ch:
