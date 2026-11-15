@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -175,11 +177,19 @@ type fakeHost struct {
 	tier   string
 	pushed chan bus.Message
 	fail   atomic.Bool
+	// id, when set, replaces sess-1, as /clear does.
+	id atomic.Pointer[string]
 }
 
 func (h *fakeHost) Session() mcpserver.SessionInfo {
-	return mcpserver.SessionInfo{ID: "sess-1", Name: "api", Cwd: "/work/api"}
+	id := "sess-1"
+	if p := h.id.Load(); p != nil {
+		id = *p
+	}
+	return mcpserver.SessionInfo{ID: id, Name: "api", Cwd: "/work/api"}
 }
+
+func (h *fakeHost) setID(id string)         { h.id.Store(&id) }
 func (h *fakeHost) Tier() string            { return h.tier }
 func (h *fakeHost) Observe(json.RawMessage) {}
 func (h *fakeHost) Push(_ context.Context, m bus.Message) error {
@@ -323,5 +333,114 @@ func TestPullHostGetsUnreadNotice(t *testing.T) {
 	case m := <-h.pushed:
 		t.Fatalf("a pull host was pushed %+v", m)
 	default:
+	}
+}
+
+func send(t *testing.T, s *session, args map[string]any) bus.Message {
+	t.Helper()
+	out := toolJSON(t, s.call("tools/call", map[string]any{"name": "send_message", "arguments": args}))
+	return bus.Message{ID: out["message_id"].(string), ThreadID: out["thread_id"].(string), Note: out["note"].(string)}
+}
+
+func noPush(t *testing.T, h *fakeHost, within time.Duration) {
+	t.Helper()
+	select {
+	case m := <-h.pushed:
+		t.Fatalf("pushed %s (%q)", m.ID, m.Content)
+	case <-time.After(within):
+	}
+}
+
+// After /clear, answers to the old conversation must not be shown in the new
+// one, including by a poll that was already out when it changed.
+func TestClearKeepsTheOldConversationsAnswersOut(t *testing.T) {
+	ctx := context.Background()
+	h := &fakeHost{tier: bus.TierPush, pushed: make(chan bus.Message, 4)}
+	s, cursor, st := setupHost(t, h)
+	waitFor(t, "the session to register", sessionLive(cursor))
+
+	q1 := send(t, s, map[string]any{"to": "cursor", "content": "first question"})
+	h.setID("sess-2")
+	// The next call acts for the new conversation, without waiting for a report.
+	q2 := send(t, s, map[string]any{"to": "cursor", "content": "second question"})
+	if got, _ := st.GetMessage(ctx, q2.ID); got.FromSession != "sess-2" {
+		t.Fatalf("from_session = %q, want sess-2", got.FromSession)
+	}
+
+	a1, err := cursor.Send(ctx, bus.SendInput{InReplyTo: q1.ID, Content: "answer to the first"})
+	if err != nil || a1.ToSession != "sess-1" || !strings.Contains(a1.Note, "no longer open") {
+		t.Fatalf("a1 = %+v, %v", a1, err)
+	}
+	noPush(t, h, time.Second)
+	a2, err := cursor.Send(ctx, bus.SendInput{InReplyTo: q2.ID, Content: "answer to the second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-h.pushed:
+		if got.ID != a2.ID {
+			t.Fatalf("pushed %s (%q), want the second answer", got.ID, got.Content)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the new conversation's answer wasn't pushed")
+	}
+	waitFor(t, "the old answer to be back in the queue", func() bool {
+		got, _ := st.GetMessage(ctx, a1.ID)
+		return got.Status == bus.StatusQueued && got.ToSession == "sess-1"
+	})
+}
+
+// A push session can still collect an answer whose session has gone, by
+// waiting on its thread.
+func TestPushSessionCollectsAHeldAnswerFromItsThread(t *testing.T) {
+	ctx := context.Background()
+	h := &fakeHost{tier: bus.TierPush, pushed: make(chan bus.Message, 4)}
+	s, cursor, st := setupHost(t, h)
+	waitFor(t, "the session to register", sessionLive(cursor))
+
+	held := bus.Message{ID: "msg_held", ThreadID: "thr_held", From: "cursor", To: "claude", ToSession: "gone", Content: "held answer", Status: bus.StatusQueued, CreatedAt: time.Now()}
+	if err := st.InsertMessage(ctx, held); err != nil {
+		t.Fatal(err)
+	}
+	noPush(t, h, 500*time.Millisecond)
+
+	out := toolJSON(t, s.call("tools/call", map[string]any{"name": "wait_for_reply", "arguments": map[string]any{"thread_id": "thr_held", "timeout_seconds": 2}}))
+	msgs, _ := out["messages"].([]any)
+	if len(msgs) != 1 || msgs[0].(map[string]any)["id"] != "msg_held" {
+		t.Fatalf("wait_for_reply = %+v", out)
+	}
+	waitFor(t, "delivery to be confirmed", func() bool {
+		got, _ := st.GetMessage(ctx, "msg_held")
+		return got.Status == bus.StatusDelivered
+	})
+}
+
+// A bridge acts for a stand-in id until its host names the conversation;
+// what was pinned to the stand-in follows the conversation to its real id.
+func TestStandInSessionMovesToTheRealOne(t *testing.T) {
+	ctx := context.Background()
+	h := &fakeHost{tier: bus.TierPull, pushed: make(chan bus.Message, 1)}
+	h.setID(fmt.Sprintf("proc-%d", os.Getpid()))
+	s, cursor, st := setupHost(t, h)
+	waitFor(t, "the session to register", sessionLive(cursor))
+
+	q := send(t, s, map[string]any{"to": "cursor", "content": "question"})
+	direct, err := cursor.Send(ctx, bus.SendInput{To: "claude/api", Content: "for you"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.setID("real-1")
+	s.call("tools/call", map[string]any{"name": "list_agents"})
+
+	answer, err := cursor.Send(ctx, bus.SendInput{InReplyTo: q.ID, Content: "answer"})
+	if err != nil || answer.ToSession != "real-1" {
+		t.Fatalf("answer = %+v, %v", answer, err)
+	}
+	if got, _ := st.GetMessage(ctx, direct.ID); got.ToSession != "real-1" {
+		t.Fatalf("direct message still pinned to %q", got.ToSession)
+	}
+	out := toolJSON(t, s.call("tools/call", map[string]any{"name": "check_inbox", "arguments": map[string]any{}}))
+	if msgs, _ := out["messages"].([]any); len(msgs) != 2 {
+		t.Fatalf("check_inbox = %+v", out)
 	}
 }

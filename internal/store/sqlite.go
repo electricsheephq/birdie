@@ -264,6 +264,21 @@ func (s *SQLite) Thread(ctx context.Context, threadID, agent string) ([]bus.Mess
 		threadID, agent, agent))
 }
 
+func (s *SQLite) ThreadSession(ctx context.Context, threadID, from, agent string) (string, error) {
+	var id string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT CASE WHEN m.sender = ? THEN m.from_session WHEN m.taken_by != '' THEN m.taken_by ELSE m.to_session END
+		 FROM messages m WHERE m.thread_id = ?
+		   AND ((m.sender = ? AND m.recipient = ? AND (m.taken_by != '' OR m.to_session != ''))
+		     OR (m.sender = ? AND m.recipient = ? AND m.from_session != ''))
+		 ORDER BY m.seq DESC LIMIT 1`,
+		agent, threadID, from, agent, agent, from).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
 // inboxWhere is the condition for messages a ClaimFilter may take. It uses the
 // messages alias m.
 func inboxWhere(f bus.ClaimFilter, now time.Time) (string, []any) {
@@ -418,6 +433,24 @@ func (s *SQLite) UpsertSession(ctx context.Context, ses bus.Session) error {
 func (s *SQLite) EndSession(ctx context.Context, agent, id string, at time.Time) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET ended_at = ? WHERE agent = ? AND id = ?`, at.UnixMilli(), agent, id)
 	return err
+}
+
+func (s *SQLite) MoveSession(ctx context.Context, agent, from, to string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`UPDATE messages SET to_session = ? WHERE recipient = ? AND to_session = ?`,
+		`UPDATE messages SET taken_by = ? WHERE recipient = ? AND taken_by = ?`,
+		`UPDATE messages SET from_session = ? WHERE sender = ? AND from_session = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, to, agent, from); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *SQLite) LiveSessions(ctx context.Context, agent string, since time.Time) ([]bus.Session, error) {

@@ -188,6 +188,9 @@ func (b *Bus) ReportSession(ctx context.Context, agent, id string, in SessionInp
 	if in.Name != "" && !sessionPattern.MatchString(in.Name) {
 		return fmt.Errorf("%w: bad session name %q", ErrInvalid, in.Name)
 	}
+	if in.Replaces != "" && !sessionPattern.MatchString(in.Replaces) {
+		return fmt.Errorf("%w: bad session id %q", ErrInvalid, in.Replaces)
+	}
 	switch in.Tier {
 	case TierPush, TierTurn, TierPull:
 	case "":
@@ -212,6 +215,15 @@ func (b *Bus) ReportSession(ctx context.Context, agent, id string, in SessionInp
 	}
 	if err := b.store.UpsertSession(ctx, s); err != nil {
 		return err
+	}
+	if in.Replaces != "" && in.Replaces != id {
+		if err := b.store.MoveSession(ctx, agent, in.Replaces, id); err != nil {
+			return err
+		}
+		if err := b.store.EndSession(ctx, agent, in.Replaces, now); err != nil {
+			return err
+		}
+		b.emit(Event{Kind: "session", Type: "ended", Agent: agent, Session: in.Replaces})
 	}
 	b.notify(agent)
 	b.emit(Event{Kind: "session", Type: "reported", Agent: agent, Session: id, Name: s.Name, State: s.State})
@@ -311,7 +323,7 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		toSession = s.ID
 	} else if in.InReplyTo == "" && thread != "" {
 		// A follow-up in a thread goes where an answer would.
-		if toSession, err = b.threadSession(ctx, thread, from, to.Name); err != nil {
+		if toSession, err = b.store.ThreadSession(ctx, thread, from, to.Name); err != nil {
 			return Message{}, err
 		}
 	}
@@ -579,7 +591,7 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 	}
 	if target == nil {
 		if m.ToSession != "" {
-			return fmt.Sprintf("queued: %s is no longer open, so this waits for that session to come back; no other session takes it. To reach whichever %s session is open now, send a new message without in_reply_to or thread_id",
+			return fmt.Sprintf("queued: %s is no longer open, so this waits for that session to come back; other sessions don't get it unless one waits on this thread. To reach whichever %s session is open now, send a new message without in_reply_to or thread_id",
 				b.sessionLabel(ctx, to, m.ToSession), to.DisplayName())
 		}
 		return fmt.Sprintf("queued: %s has no open session; it gets this when it next checks or starts", to.DisplayName())
@@ -595,24 +607,6 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 		return fmt.Sprintf("queued: %s sees this at its next tool call or end of turn; if it's idle, it waits for its user", name)
 	}
 	return fmt.Sprintf("queued: %s only sees this when it checks its inbox", name)
-}
-
-// threadSession is the session of agent that last took part in thread, among
-// the messages from can see, or "" if none did.
-func (b *Bus) threadSession(ctx context.Context, thread, from, agent string) (string, error) {
-	msgs, err := b.store.Thread(ctx, thread, from)
-	if err != nil {
-		return "", err
-	}
-	for i := len(msgs) - 1; i >= 0; i-- {
-		switch m := msgs[i]; {
-		case m.From == agent && m.FromSession != "":
-			return m.FromSession, nil
-		case m.To == agent && m.ToSession != "":
-			return m.ToSession, nil
-		}
-	}
-	return "", nil
 }
 
 // sessionLabel names one of to's sessions as people see it: by its name if

@@ -135,6 +135,10 @@ func TestAnswersGoBackToTheSessionThatAsked(t *testing.T) {
 	if got := take(t, b, "claude", "listener"); len(got) != 0 {
 		t.Fatalf("the default session took a closed session's answer: %+v", got)
 	}
+	// The pin delivers it, not being the default: listener stays the default.
+	if err := st.SetAgentConfig(ctx, "claude", "default_session", "listener"); err != nil {
+		t.Fatal(err)
+	}
 	report(t, b, "claude", "asker", "asker", bus.TierPush, time.Now())
 	if got := take(t, b, "claude", "asker"); len(got) != 1 {
 		t.Fatalf("the asker came back and got %+v", got)
@@ -161,7 +165,7 @@ func TestAnswerToAClosedSessionWaitsForIt(t *testing.T) {
 	if err != nil || a.ToSession != "oneshot" {
 		t.Fatalf("answer = %+v, %v", a, err)
 	}
-	if !strings.Contains(a.Note, "oneshot is no longer open") || !strings.Contains(a.Note, "no other session takes it") {
+	if !strings.Contains(a.Note, "oneshot is no longer open") || !strings.Contains(a.Note, "unless one waits on this thread") {
 		t.Fatalf("note = %q", a.Note)
 	}
 
@@ -210,6 +214,9 @@ func TestAnswerToALapsedSessionWaitsForIt(t *testing.T) {
 	}
 	if got := take(t, b, "claude", "fresh"); len(got) != 0 {
 		t.Fatalf("the default session took a lapsed session's answer: %+v", got)
+	}
+	if err := st.SetAgentConfig(ctx, "claude", "default_session", "fresh"); err != nil {
+		t.Fatal(err)
 	}
 	report(t, b, "claude", "asker", "asker", bus.TierPush, time.Now())
 	if got := take(t, b, "claude", "asker"); len(got) != 1 {
@@ -516,4 +523,76 @@ func TestAcceptedWorkRunsAgainAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitStatus(t, st, m.ID, bus.StatusDelivered)
+}
+
+// A follow-up goes to the session that took the last message in the thread,
+// even if it hasn't answered yet, and to the one that collected a held answer.
+func TestThreadFollowUpsGoToTheSessionThatTookTheLastMessage(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	now := time.Now()
+	report(t, b, "claude", "first", "first", bus.TierPush, now)
+
+	m, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_t", Content: "start"})
+	if err != nil || m.ToSession != "" {
+		t.Fatalf("m = %+v, %v", m, err)
+	}
+	if got := take(t, b, "claude", "first"); len(got) != 1 {
+		t.Fatalf("first got %+v", got)
+	}
+	report(t, b, "claude", "second", "second", bus.TierPush, now.Add(time.Second))
+	f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_t", Content: "more"})
+	if err != nil || f.ToSession != "first" {
+		t.Fatalf("follow-up = %+v, %v", f, err)
+	}
+
+	// first closes; second collects the follow-up by naming the thread, and
+	// becomes the session in it.
+	if err := b.EndSession(ctx, "claude", "first"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "second", Thread: "thr_t", Lease: time.Minute})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("thread wait got %+v, %v", got, err)
+	}
+	g, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_t", Content: "and more"})
+	if err != nil || g.ToSession != "second" {
+		t.Fatalf("follow-up after collecting = %+v, %v", g, err)
+	}
+}
+
+// A stand-in id reported before the real one moves everything pinned to it.
+func TestReplacingAStandInMovesItsMessages(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	report(t, b, "claude", "proc-1", "api", bus.TierPush, time.Now())
+	q, err := b.Send(ctx, "claude", bus.SendInput{To: "bot", Content: "question", FromSession: "proc-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/api", Content: "for you"})
+	if err != nil || direct.ToSession != "proc-1" {
+		t.Fatalf("direct = %+v, %v", direct, err)
+	}
+	if err := b.ReportSession(ctx, "claude", "real", bus.SessionInput{Name: "api", Tier: bus.TierPush, Replaces: "proc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := b.Send(ctx, "bot", bus.SendInput{InReplyTo: q.ID, Content: "answer"})
+	if err != nil || a.ToSession != "real" {
+		t.Fatalf("answer = %+v, %v", a, err)
+	}
+	if got := take(t, b, "claude", "real"); len(got) != 2 {
+		t.Fatalf("real got %+v", got)
+	}
+	agent, _ := st.GetAgent(ctx, "claude")
+	if live, _ := b.Sessions(ctx, agent); len(live) != 1 || live[0].ID != "real" {
+		t.Fatalf("live = %+v", live)
+	}
+	if err := b.ReportSession(ctx, "claude", "x", bus.SessionInput{Replaces: "bad id"}); !errors.Is(err, bus.ErrInvalid) {
+		t.Fatalf("bad replaces: err = %v", err)
+	}
 }

@@ -68,8 +68,12 @@ func DetectHost(client string, opts HostOptions) Host {
 
 func procSession() SessionInfo {
 	cwd, _ := os.Getwd()
-	return SessionInfo{ID: fmt.Sprintf("proc-%d", os.Getpid()), Name: slug(filepath.Base(cwd)), Cwd: cwd}
+	return SessionInfo{ID: procID(), Name: slug(filepath.Base(cwd)), Cwd: cwd}
 }
+
+// procID is the stand-in session id a bridge uses until its host names the
+// conversation.
+func procID() string { return fmt.Sprintf("proc-%d", os.Getpid()) }
 
 var slugBad = regexp.MustCompile(`[^a-z0-9._-]+`)
 

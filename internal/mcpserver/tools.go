@@ -83,11 +83,14 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, *rpcEr
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, &rpcError{-32602, "invalid params"}
 	}
-	if h := s.currentHost(); h != nil && len(p.Meta) > 0 {
-		tier, id := h.Tier(), h.Session().ID
-		h.Observe(p.Meta)
-		// The call may be the first to name the conversation; act for it now.
-		if h.Tier() != tier || h.Session().ID != id {
+	if h := s.currentHost(); h != nil {
+		tier := h.Tier()
+		if len(p.Meta) > 0 {
+			h.Observe(p.Meta)
+		}
+		// The call may be the first to name the conversation, or the first
+		// since it changed (/clear); act for the conversation making it.
+		if h.Tier() != tier || h.Session().ID != s.c.Session() {
 			s.syncSession(ctx, h)
 		}
 	}

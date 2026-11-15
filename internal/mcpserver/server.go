@@ -58,6 +58,11 @@ type Server struct {
 	hostMu     sync.RWMutex
 	host       Host
 	beat       chan struct{}
+
+	// syncMu keeps session changes in order. replaces is a stand-in id whose
+	// move to the real one the bus hasn't confirmed yet.
+	syncMu   sync.Mutex
+	replaces string
 }
 
 func New(c *client.Client, name, version string, channel bool, logger *log.Logger) *Server {
@@ -259,21 +264,38 @@ func (s *Server) pushing() bool { return s.tier() == bus.TierPush }
 // syncSession makes the client act for the host's current conversation and
 // tells the bus about it.
 func (s *Server) syncSession(ctx context.Context, h Host) {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
 	info := h.Session()
 	if old := s.c.Session(); old != info.ID {
 		s.c.SetSession(info.ID)
-		if old != "" {
+		switch {
+		case old == procID():
+			// The same conversation, now known by its real id: what was
+			// pinned to the stand-in moves with it.
+			s.replaces = old
+		case old != "":
+			// A new conversation (/clear): what was pinned to the old one
+			// waits for it.
 			if err := s.c.EndSession(ctx, old); err != nil {
 				s.log.Printf("end session: %v", err)
 			}
 		}
 	}
+	if s.replaces == info.ID {
+		s.replaces = ""
+	}
 	err := s.c.ReportSession(ctx, info.ID, bus.SessionInput{
 		Name: info.Name, Cwd: info.Cwd, Branch: gitBranch(info.Cwd), Tier: s.tier(), State: info.State, ActiveAt: info.ActiveAt,
+		Replaces: s.replaces,
 	})
-	if err != nil && ctx.Err() == nil {
-		s.log.Printf("report session: %v", err)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.log.Printf("report session: %v", err)
+		}
+		return
 	}
+	s.replaces = ""
 }
 
 func (s *Server) reportLoop(ctx context.Context, h Host) {
@@ -311,6 +333,7 @@ func (s *Server) pump(ctx context.Context) {
 			pause(ctx, 5*time.Second)
 			continue
 		}
+		polled := s.c.Session()
 		msgs, err := s.c.Inbox(ctx, "", pollWait)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -318,6 +341,16 @@ func (s *Server) pump(ctx context.Context) {
 			}
 			s.log.Printf("inbox poll: %v", err)
 			pause(ctx, 5*time.Second)
+			continue
+		}
+		if s.c.Session() != polled {
+			// The conversation changed while the poll was out, so these are
+			// another conversation's: back to the queue to wait for it.
+			for _, m := range msgs {
+				if err := s.c.Nack(context.WithoutCancel(ctx), m.ID); err != nil {
+					s.log.Printf("nack %s: %v", m.ID, err)
+				}
+			}
 			continue
 		}
 		failed := false
@@ -494,6 +527,12 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 	s.waitMu.Unlock()
 	if len(already) > 0 {
 		return already, nil
+	}
+	// The pump only takes what this session is due. Naming the thread also
+	// collects what in it waits for a session that has gone.
+	if msgs, err := s.c.Inbox(ctx, thread, 0); err != nil || len(msgs) > 0 {
+		s.ackAll(ctx, msgs, err)
+		return msgs, err
 	}
 	select {
 	case m := <-ch:
