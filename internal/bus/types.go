@@ -209,8 +209,11 @@ type ReceiveInput struct {
 // ClaimFilter is ReceiveInput as the store needs it.
 type ClaimFilter struct {
 	Agent, Thread, Session string
-	// Unpinned also takes messages not pinned to a live session.
-	Unpinned  bool
+	// Unpinned also takes messages not pinned to any session.
+	Unpinned bool
+	// Orphans, with Unpinned, also takes messages pinned to a session that is
+	// no longer running: one closed, or not seen since LiveSince.
+	Orphans   bool
 	LiveSince time.Time
 	Limit     int
 	// LeaseUntil, when set, claims rather than delivers.

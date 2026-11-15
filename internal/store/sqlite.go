@@ -274,12 +274,16 @@ func inboxWhere(f bus.ClaimFilter, now time.Time) (string, []any) {
 		args = append(args, f.Thread)
 	}
 	if f.Session != "" {
-		if f.Unpinned {
+		switch {
+		case f.Unpinned && f.Orphans:
 			// Mail for a session that has gone falls to this one too.
 			q += ` AND (m.to_session = ? OR m.to_session = '' OR m.to_session NOT IN
 				(SELECT id FROM sessions WHERE agent = ? AND last_seen >= ? AND ended_at = 0))`
 			args = append(args, f.Session, f.Agent, f.LiveSince.UnixMilli())
-		} else {
+		case f.Unpinned:
+			q += ` AND (m.to_session = ? OR m.to_session = '')`
+			args = append(args, f.Session)
+		default:
 			q += ` AND m.to_session = ?`
 			args = append(args, f.Session)
 		}

@@ -218,8 +218,9 @@ func (b *Bus) ReportSession(ctx context.Context, agent, id string, in SessionInp
 	return nil
 }
 
-// EndSession records that a session closed, so its waiting messages move on
-// without delay.
+// EndSession records that a session closed, so new conversations go to the
+// default session without delay. Messages pinned to it wait for it to come
+// back; see claimFilter.
 func (b *Bus) EndSession(ctx context.Context, agent, id string) error {
 	if err := b.store.EndSession(ctx, agent, id, time.Now().UTC()); err != nil {
 		return err
@@ -308,6 +309,11 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 			return Message{}, err
 		}
 		toSession = s.ID
+	} else if in.InReplyTo == "" && thread != "" {
+		// A follow-up in a thread goes where an answer would.
+		if toSession, err = b.threadSession(ctx, thread, from, to.Name); err != nil {
+			return Message{}, err
+		}
 	}
 
 	id := randHex(12)
@@ -417,11 +423,14 @@ func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput) (ClaimFilter, er
 		return f, nil
 	}
 	// Waiting on a thread names what it wants, so it doesn't need to be the
-	// default session. Otherwise only the default takes new conversations.
+	// default session, and it may collect an answer whose session has gone.
 	if in.Thread != "" {
-		f.Unpinned = true
+		f.Unpinned, f.Orphans = true, true
 		return f, nil
 	}
+	// Otherwise only the default takes new conversations. It doesn't take
+	// answers meant for a session that has gone: what they answer was said in
+	// that session, so they wait for it to come back.
 	a, err := b.store.GetAgent(ctx, in.Agent)
 	if err != nil {
 		return f, err
@@ -570,15 +579,10 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 	}
 	if target == nil {
 		if m.ToSession != "" {
-			for i := range live {
-				if live[i].Default {
-					target = &live[i]
-				}
-			}
+			return fmt.Sprintf("queued: %s is no longer open, so this waits for that session to come back; no other session takes it. To reach whichever %s session is open now, send a new message without in_reply_to or thread_id",
+				b.sessionLabel(ctx, to, m.ToSession), to.DisplayName())
 		}
-		if target == nil {
-			return fmt.Sprintf("queued: %s has no open session; it gets this when it next checks or starts", to.DisplayName())
-		}
+		return fmt.Sprintf("queued: %s has no open session; it gets this when it next checks or starts", to.DisplayName())
 	}
 	name := to.DisplayName()
 	if target.Name != "" {
@@ -591,6 +595,38 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 		return fmt.Sprintf("queued: %s sees this at its next tool call or end of turn; if it's idle, it waits for its user", name)
 	}
 	return fmt.Sprintf("queued: %s only sees this when it checks its inbox", name)
+}
+
+// threadSession is the session of agent that last took part in thread, among
+// the messages from can see, or "" if none did.
+func (b *Bus) threadSession(ctx context.Context, thread, from, agent string) (string, error) {
+	msgs, err := b.store.Thread(ctx, thread, from)
+	if err != nil {
+		return "", err
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		switch m := msgs[i]; {
+		case m.From == agent && m.FromSession != "":
+			return m.FromSession, nil
+		case m.To == agent && m.ToSession != "":
+			return m.ToSession, nil
+		}
+	}
+	return "", nil
+}
+
+// sessionLabel names one of to's sessions as people see it: by its name if
+// birdie still knows it, else by its id.
+func (b *Bus) sessionLabel(ctx context.Context, to Agent, id string) string {
+	label := to.DisplayName() + " · " + id
+	if recent, err := b.store.RecentSessions(ctx, to.Name, time.Now().Add(-SessionRetention)); err == nil {
+		for _, s := range recent {
+			if s.ID == id && s.Name != "" {
+				label = to.DisplayName() + " · " + s.Name
+			}
+		}
+	}
+	return label
 }
 
 func (b *Bus) Thread(ctx context.Context, threadID, agent string) ([]Message, error) {
