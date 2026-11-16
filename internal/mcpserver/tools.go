@@ -79,7 +79,7 @@ type toolArgs struct {
 	TimeoutSeconds float64 `json:"timeout_seconds"`
 }
 
-func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
+func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus.Message) (any, *rpcError) {
 	var p callParams
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, &rpcError{-32602, "invalid params"}
@@ -135,7 +135,9 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, *rpcEr
 		}
 		var msgs []bus.Message
 		msgs, err = s.c.Inbox(ctx, "", seconds(a.WaitSeconds, 0, bus.MaxWait))
-		s.settle(ctx, msgs, err)
+		if err == nil {
+			*taken = msgs
+		}
 		out = map[string]any{"messages": msgs}
 	case "wait_for_reply":
 		if a.ThreadID == "" {
@@ -145,8 +147,7 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, *rpcEr
 		pushing := s.pushing()
 		// One decision for how to wait and whether to confirm what comes
 		// back: the tier can change while the call waits.
-		msgs, err = s.waitForReply(ctx, a.ThreadID, seconds(a.TimeoutSeconds, 120*time.Second, maxReplyWait), pushing)
-		s.settle(ctx, msgs, err)
+		msgs, *taken, err = s.waitForReply(ctx, a.ThreadID, seconds(a.TimeoutSeconds, 120*time.Second, maxReplyWait), pushing)
 		if err == nil && len(msgs) == 0 {
 			note := "No reply yet. Check again later with wait_for_reply or check_inbox."
 			if s.pushing() {
@@ -187,22 +188,6 @@ func (s *Server) unreadNotice(ctx context.Context) string {
 		return ""
 	}
 	return fmt.Sprintf("\n\n(%d unread birdie message(s) waiting; call check_inbox to read them.)", n)
-}
-
-// settle confirms what a tool call took, as it is about to answer with it.
-// If the call was cancelled, nobody sees the answer, so the messages go back
-// to the queue instead, for the next check or for the session's push.
-func (s *Server) settle(ctx context.Context, msgs []bus.Message, err error) {
-	if err != nil {
-		return
-	}
-	for _, m := range msgs {
-		if ctx.Err() != nil {
-			s.nack(ctx, m)
-		} else {
-			s.ack(ctx, m)
-		}
-	}
 }
 
 func seconds(v float64, def, max time.Duration) time.Duration {

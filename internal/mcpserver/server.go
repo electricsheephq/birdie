@@ -55,7 +55,7 @@ type Server struct {
 
 	// calls cancels requests in flight, by id, when the client cancels them.
 	callsMu sync.Mutex
-	calls   map[string]context.CancelFunc
+	calls   map[string]*call
 
 	// DetectHost picks the Host from the MCP client's name. Without it the
 	// bridge doesn't act as a session.
@@ -71,9 +71,12 @@ type Server struct {
 }
 
 func New(c *client.Client, name, version string, channel bool, logger *log.Logger) *Server {
+	// What a tool call takes is confirmed only once its answer is out, so
+	// it is always taken under a lease, session or not.
+	c.Leased = true
 	return &Server{c: c, name: name, version: version, channel: channel, log: logger,
 		waiters: map[string][]chan bus.Message{}, shown: map[string][]bus.Message{}, beat: make(chan struct{}, 1),
-		calls: map[string]context.CancelFunc{}}
+		calls: map[string]*call{}}
 }
 
 type request struct {
@@ -165,17 +168,22 @@ func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 	return sc.Err()
 }
 
+// call is a request in flight that the client can cancel.
+type call struct{ cancel context.CancelFunc }
+
 // trackCall gives request id a context the client can cancel, and done to
 // call when the request is finished.
 func (s *Server) trackCall(ctx context.Context, id json.RawMessage) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(ctx)
-	key := callKey(id)
+	c, key := &call{cancel}, callKey(id)
 	s.callsMu.Lock()
-	s.calls[key] = cancel
+	s.calls[key] = c
 	s.callsMu.Unlock()
 	return ctx, func() {
 		s.callsMu.Lock()
-		delete(s.calls, key)
+		if s.calls[key] == c { // not a later request with the same id
+			delete(s.calls, key)
+		}
 		s.callsMu.Unlock()
 		cancel()
 	}
@@ -183,25 +191,31 @@ func (s *Server) trackCall(ctx context.Context, id json.RawMessage) (context.Con
 
 func (s *Server) cancelCall(id json.RawMessage) {
 	s.callsMu.Lock()
-	cancel := s.calls[callKey(id)]
+	c := s.calls[callKey(id)]
 	s.callsMu.Unlock()
-	if cancel != nil {
-		cancel()
+	if c != nil {
+		c.cancel()
 	}
 }
 
-// callKey is a request id as it compares: the same JSON, however spaced.
+// callKey is a request id as it compares: the same JSON value, however it is
+// spaced or escaped.
 func callKey(id json.RawMessage) string {
-	var b bytes.Buffer
-	if json.Compact(&b, id) != nil {
+	var v any
+	if json.Unmarshal(id, &v) != nil {
 		return string(id)
 	}
-	return b.String()
+	b, err := json.Marshal(v)
+	if err != nil {
+		return string(id)
+	}
+	return string(b)
 }
 
 func (s *Server) handle(ctx context.Context, req request) {
 	var result any
 	var rerr *rpcError
+	var taken []bus.Message // claimed by a tool call, to confirm once answered
 	switch req.Method {
 	case "initialize":
 		result = s.initialize(req.Params)
@@ -210,13 +224,9 @@ func (s *Server) handle(ctx context.Context, req request) {
 	case "tools/list":
 		result = map[string]any{"tools": tools}
 	case "tools/call":
-		result, rerr = s.callTool(ctx, req.Params)
+		result, rerr = s.callTool(ctx, req.Params, &taken)
 	default:
 		rerr = &rpcError{-32601, "method not found: " + req.Method}
-	}
-	if ctx.Err() != nil {
-		// Cancelled, or the bridge is stopping: nobody reads an answer now.
-		return
 	}
 	resp := map[string]any{"jsonrpc": "2.0", "id": req.ID}
 	if rerr != nil {
@@ -224,7 +234,34 @@ func (s *Server) handle(ctx context.Context, req request) {
 	} else {
 		resp["result"] = result
 	}
-	s.write(resp)
+	// What the call took is confirmed only once its answer is out. A call
+	// that was cancelled, or cut off because the bridge is stopping, isn't
+	// answered, and gives back what it took.
+	written := s.writeLive(ctx, resp)
+	for _, m := range taken {
+		if written {
+			s.ack(ctx, m)
+		} else {
+			s.nack(ctx, m)
+		}
+	}
+}
+
+// writeLive writes v unless ctx is done, checked holding the output lock so
+// a cancellation can't slip in between. It reports whether v was written.
+func (s *Server) writeLive(ctx context.Context, v any) bool {
+	b, err := json.Marshal(v)
+	if err != nil {
+		s.log.Printf("marshal: %v", err)
+		return false
+	}
+	s.outMu.Lock()
+	defer s.outMu.Unlock()
+	if ctx.Err() != nil {
+		return false
+	}
+	_, err = s.out.Write(append(b, '\n'))
+	return err == nil
 }
 
 func (s *Server) write(v any) {
@@ -531,9 +568,6 @@ func (s *Server) show(ctx context.Context, session string, m bus.Message) error 
 }
 
 func (s *Server) ack(ctx context.Context, m bus.Message) {
-	if s.c.Session() == "" {
-		return // claimed without a lease: already delivered
-	}
 	if err := s.c.Ack(context.WithoutCancel(ctx), m.ID); err != nil {
 		s.log.Printf("ack %s: %v", m.ID, err)
 	}
@@ -637,24 +671,25 @@ func (s *Server) removeWaiter(thread string, ch chan bus.Message) {
 }
 
 // waitForReply blocks until a message arrives on thread or timeout passes.
-// pushing is whether the session counted as push when the call began. The
-// caller confirms what this returns, or gives it back if the call was
-// cancelled.
-func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.Duration, pushing bool) ([]bus.Message, error) {
+// pushing is whether the session counted as push when the call began. It
+// returns what arrived, and of that, what this call took: the caller confirms
+// those once it has answered, or gives them back. The rest the pump already
+// showed and confirmed.
+func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.Duration, pushing bool) (msgs, took []bus.Message, err error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if !pushing {
 		for {
 			remaining := time.Until(deadlineOf(ctx))
 			if remaining <= 0 {
-				return nil, nil
+				return nil, nil, nil
 			}
 			msgs, err := s.c.Inbox(ctx, thread, min(remaining, bus.MaxWait-5*time.Second))
 			if err != nil || len(msgs) > 0 {
 				if ctx.Err() != nil && len(msgs) == 0 {
-					return nil, nil
+					return nil, nil, nil
 				}
-				return msgs, err
+				return msgs, msgs, err
 			}
 		}
 	}
@@ -662,14 +697,20 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 	// finish stops the pump routing here, then takes what it already did:
 	// those are taken for this call, so dropping them would leave them
 	// leased.
-	finish := func(msgs []bus.Message) []bus.Message {
+	// mine says whether msgs were taken by this call.
+	finish := func(msgs []bus.Message, mine bool) ([]bus.Message, []bus.Message, error) {
 		s.removeWaiter(thread, ch)
+		var took []bus.Message
+		if mine {
+			took = append(took, msgs...)
+		}
 		for {
 			select {
 			case m := <-ch:
 				msgs = append(msgs, m)
+				took = append(took, m)
 			default:
-				return msgs
+				return msgs, took, nil
 			}
 		}
 	}
@@ -678,7 +719,7 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 	delete(s.shown, thread)
 	s.waitMu.Unlock()
 	if len(already) > 0 {
-		return finish(already), nil
+		return finish(already, false)
 	}
 	// The pump only takes what this session is due. Naming the thread also
 	// collects what in it waits for a session that has gone, so check the
@@ -690,24 +731,24 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 		if err == nil && len(msgs) > 0 {
 			// Taken, even if the deadline passed meanwhile: return them, or
 			// they sit leased to this session until the lease ends.
-			return finish(msgs), nil
+			return finish(msgs, true)
 		}
 		if ctx.Err() != nil {
-			return finish(nil), nil
+			return finish(nil, true)
 		}
 		if err != nil {
 			// What the pump routed here is taken, so it wins over an error.
-			if got := finish(nil); len(got) > 0 {
-				return got, nil
+			if got, took, _ := finish(nil, true); len(got) > 0 {
+				return got, took, nil
 			}
-			return nil, err
+			return nil, nil, err
 		}
 		select {
 		case m := <-ch:
-			return finish([]bus.Message{m}), nil
+			return finish([]bus.Message{m}, true)
 		case <-tick.C:
 		case <-ctx.Done():
-			return finish(nil), nil
+			return finish(nil, true)
 		}
 	}
 }
