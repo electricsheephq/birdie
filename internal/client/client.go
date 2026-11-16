@@ -128,9 +128,22 @@ func (c *Client) Send(ctx context.Context, in bus.SendInput) (bus.Message, error
 
 // Inbox claims queued messages, long-polling up to wait (the server caps it).
 func (c *Client) Inbox(ctx context.Context, threadID string, wait time.Duration) ([]bus.Message, error) {
+	return c.inbox(ctx, threadID, wait, false)
+}
+
+// PushInbox is Inbox for a delivery that puts what it gets into the
+// conversation on its own. A pull-only session gets nothing from it.
+func (c *Client) PushInbox(ctx context.Context, wait time.Duration) ([]bus.Message, error) {
+	return c.inbox(ctx, "", wait, true)
+}
+
+func (c *Client) inbox(ctx context.Context, threadID string, wait time.Duration, push bool) ([]bus.Message, error) {
 	ctx, cancel := context.WithTimeout(ctx, wait+30*time.Second)
 	defer cancel()
 	q := url.Values{"wait": {strconv.FormatFloat(wait.Seconds(), 'f', -1, 64)}}
+	if push {
+		q.Set("push", "1")
+	}
 	if threadID != "" {
 		q.Set("thread_id", threadID)
 	}
@@ -171,8 +184,15 @@ func (c *Client) Unread(ctx context.Context) (int, error) {
 }
 
 // ReportSession tells the bus this session is running.
-func (c *Client) ReportSession(ctx context.Context, id string, in bus.SessionInput) error {
-	return c.do(ctx, http.MethodPut, "/v1/sessions/"+url.PathEscape(id), in, nil)
+func (c *Client) ReportSession(ctx context.Context, id string, in bus.SessionInput) (pullOnly bool, err error) {
+	var out struct {
+		PullOnly bool `json:"pull_only"`
+	}
+	err = c.do(ctx, http.MethodPut, "/v1/sessions/"+url.PathEscape(id), in, &out)
+	if errors.Is(err, io.EOF) {
+		err = nil // a daemon from before pull-only answers with no body
+	}
+	return out.PullOnly, err
 }
 
 // EndSession tells the bus this session has stopped.

@@ -3,6 +3,7 @@ context. `go test ./cmd/birdie` runs this; no Hermes or model is needed."""
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -27,6 +28,7 @@ plugin.POLL_SECONDS = 1
 plugin.WAIT_STEP_SECONDS = 0.2
 
 URL = os.environ["BIRDIE_TEST_URL"]
+DB = os.environ["BIRDIE_TEST_DB"]
 TOKEN_FILE = os.environ["BIRDIE_TEST_TOKEN_FILE"]
 PEER_TOKEN = Path(os.environ["BIRDIE_TEST_PEER_TOKEN_FILE"]).read_text().strip()
 TOKEN = Path(TOKEN_FILE).read_text().strip()
@@ -40,6 +42,12 @@ def peer(method, path, body=None):
     with urllib.request.urlopen(request, timeout=15) as response:
         raw = response.read()
     return json.loads(raw) if raw else {}
+
+
+def pull_only(on):
+    """What `birdie session pull-only hermes/... on|off` does, from another process."""
+    with sqlite3.connect(DB, timeout=10) as db:
+        db.execute("UPDATE sessions SET pull_only = ? WHERE agent = 'hermes'", (int(on),))
 
 
 def peer_inbox(wait=0):
@@ -196,6 +204,20 @@ class PluginTest(unittest.TestCase):
         self.assertIn("not your user", ctx.injected[0][1])
         time.sleep(1.5)
         self.assertEqual(len(ctx.injected), 1, "an accepted message must not come again")
+
+    def test_a_pull_only_conversation_gets_nothing_pushed(self):
+        self.write_config(True)
+        ctx, _ = self.load()
+        self.turn(ctx)
+        pull_only(True)
+        peer("POST", "/v1/messages", {"to": "hermes", "content": "held for the tool"})
+        time.sleep(1.5)
+        self.assertEqual(ctx.injected, [], "pushed into a pull-only conversation")
+        self.assertIn("held for the tool", self.call(ctx, "birdie_check_inbox"))
+        pull_only(False)  # no new turn, no restart
+        peer("POST", "/v1/messages", {"to": "hermes", "content": "pushed again"})
+        self.assertTrue(wait_until(lambda: ctx.injected, 10), "not pushed once pull-only was off")
+        self.assertIn("pushed again", ctx.injected[0][1])
 
     def test_a_refused_message_stays_for_the_tool_and_the_next_turn_tries_again(self):
         self.write_config(True)

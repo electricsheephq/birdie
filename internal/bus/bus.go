@@ -630,10 +630,20 @@ func (b *Bus) ReceiveFor(ctx context.Context, in ReceiveInput) ([]Message, error
 	for {
 		// Subscribe before claiming so a send between the two isn't missed.
 		ch := b.subscribe(in.Agent)
-		f, err := b.claimFilter(ctx, in)
+		// A push to a pull-only session waits, looking again now and then,
+		// since the switch is flipped from another process.
+		held := false
+		var err error
+		if in.Push && in.Session != "" {
+			held, err = b.store.SessionPullOnly(ctx, in.Agent, in.Session)
+		}
 		var msgs []Message
-		if err == nil {
-			msgs, err = b.store.ClaimInbox(ctx, f, time.Now())
+		if err == nil && !held {
+			var f ClaimFilter
+			f, err = b.claimFilter(ctx, in)
+			if err == nil {
+				msgs, err = b.store.ClaimInbox(ctx, f, time.Now())
+			}
 		}
 		if err != nil || len(msgs) > 0 {
 			b.unsubscribe(in.Agent, ch)
@@ -649,6 +659,9 @@ func (b *Bus) ReceiveFor(ctx context.Context, in ReceiveInput) ([]Message, error
 			b.unsubscribe(in.Agent, ch)
 			return []Message{}, nil
 		}
+		if held {
+			remaining = min(remaining, PullOnlyCheck)
+		}
 		timer := time.NewTimer(remaining)
 		select {
 		case <-ch:
@@ -661,6 +674,45 @@ func (b *Bus) ReceiveFor(ctx context.Context, in ReceiveInput) ([]Message, error
 		timer.Stop()
 		b.unsubscribe(in.Agent, ch)
 	}
+}
+
+// PullOnly reports whether agent's session id is pull-only.
+func (b *Bus) PullOnly(ctx context.Context, agent, id string) (bool, error) {
+	return b.store.SessionPullOnly(ctx, agent, id)
+}
+
+// PullOnlyCheck is how often a waiting push delivery looks again at whether
+// its session is still pull-only.
+var PullOnlyCheck = 5 * time.Second
+
+// SetPullOnly turns pull-only on or off for the running session at addr
+// (agent/name, agent/id or agent/name#id). A pull-only session gets messages
+// only when it checks (check_inbox, wait_for_reply); nothing is pushed into it.
+func (b *Bus) SetPullOnly(ctx context.Context, addr string, on bool) (Session, error) {
+	a, err := ParseAddress(addr)
+	if err != nil {
+		return Session{}, err
+	}
+	if a.Session == "" {
+		return Session{}, fmt.Errorf("%w: %q names an agent, not one of its sessions (want agent/name, agent/id or agent/name#id)", ErrInvalid, addr)
+	}
+	agent, err := b.store.GetAgent(ctx, a.Agent)
+	if err != nil {
+		return Session{}, err
+	}
+	s, _, err := b.findSession(ctx, agent, a)
+	if err != nil {
+		return Session{}, err
+	}
+	if err := b.store.SetSessionPullOnly(ctx, agent.Name, s.ID, on); err != nil {
+		return Session{}, err
+	}
+	// Read back, for the tier it now has.
+	if s, _, err = b.findSession(ctx, agent, Address{Agent: agent.Name, Session: s.ID}); err != nil {
+		return Session{}, err
+	}
+	s.Address = addressOf(agent, s)
+	return s, nil
 }
 
 // Unread counts what the receiver would get from ReceiveFor right now.

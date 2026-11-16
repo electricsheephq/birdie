@@ -100,8 +100,10 @@ class Bus:
             raise BusError(f"can't reach birdie at {self.url}; is `birdie serve` running?") from None
         return json.loads(raw) if raw else {}
 
-    def inbox(self, session, wait=0, thread=None):
+    def inbox(self, session, wait=0, thread=None, push=False):
         query = {"wait": wait}
+        if push:
+            query["push"] = 1  # a pull-only session gets nothing pushed
         if session:
             query.update(session=session, lease=LEASE_SECONDS)
         if thread:
@@ -161,6 +163,9 @@ class Conversation:
         self.is_session = is_session
         self.route = ""
         self.wake = False
+        # Someone made this session pull-only (birdie session pull-only), as the
+        # bus said when it last reported: nothing is pushed in.
+        self.pull_only = False
         self.active_at = now()
         self.closed = threading.Event()
         self.poller = None
@@ -260,10 +265,17 @@ class Network:
             return conversation
 
     def report(self, conversation):
-        self.bus.call("PUT", "/v1/sessions/" + urllib.parse.quote(conversation.id, safe=""), {
+        reply = self.bus.call("PUT", "/v1/sessions/" + urllib.parse.quote(conversation.id, safe=""), {
             "name": conversation.name, "cwd": conversation.cwd,
             "tier": "push" if conversation.wake else "pull", "active_at": conversation.active_at,
         }, timeout=3)
+        conversation.pull_only = bool(reply.get("pull_only"))
+
+    def pushing(self, conversation):
+        """Whether messages come into this conversation on their own. Delivery keeps
+        running for a pull-only one, but the bus gives it nothing, so turning
+        pull-only off takes effect without a new turn."""
+        return conversation.wake and not conversation.pull_only
 
     def session_of(self, conversation):
         return conversation.id if conversation.is_session else ""
@@ -297,7 +309,7 @@ class Network:
                 conversation.wake = self.can_wake(conversation, platform or "")
                 self.report(conversation)
                 self.start_threads(conversation)
-                if not conversation.wake:
+                if not self.pushing(conversation):
                     count = self.bus.unread(conversation.id)
                     if count:
                         # Only a count: a hook's result can be dropped, so mail is taken by the tool.
@@ -376,7 +388,7 @@ class Network:
     def deliver_loop(self, conversation):
         while conversation.wake and not conversation.closed.is_set() and not self.closed.is_set():
             try:
-                messages = self.bus.inbox(conversation.id, wait=POLL_SECONDS)
+                messages = self.bus.inbox(conversation.id, wait=POLL_SECONDS, push=True)
             except BusError as err:
                 log.debug("birdie: inbox: %s", err)
                 conversation.closed.wait(RETRY_SECONDS)
@@ -450,7 +462,7 @@ class Network:
                 conversation.waiting.pop(thread, None)
 
     def unread_note(self, conversation):
-        if conversation.wake or not conversation.is_session:
+        if self.pushing(conversation) or not conversation.is_session:
             return ""
         try:
             count = self.bus.unread(conversation.id)
@@ -495,7 +507,9 @@ class Network:
         if not conversation.is_session:
             return ("This run has no inbox: new messages go to your user's conversations. "
                     "For the answer to a message you sent, use birdie_wait_for_reply.")
-        if conversation.wake:
+        if self.pushing(conversation):
+            self.report(conversation)  # it may have been made pull-only since
+        if self.pushing(conversation):
             return "New messages come to you on their own in this conversation, so there is nothing to fetch."
         wait = max(0, min(float(args.get("wait_seconds") or 0), MAX_CHECK_SECONDS))
         messages = self.take(conversation, wait)
@@ -504,7 +518,7 @@ class Network:
     def wait_for_reply(self, conversation, args):
         thread = args["thread_id"]
         seconds = max(0, min(float(args.get("timeout_seconds") or 120), MAX_REPLY_SECONDS))
-        if conversation.wake:
+        if self.pushing(conversation):
             messages, _ = self.wait_pushed(conversation, thread, seconds)
             if not messages:
                 return "No reply yet. It will come to you on its own when it arrives."

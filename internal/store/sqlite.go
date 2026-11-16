@@ -74,12 +74,14 @@ var addedColumns = []struct{ table, column, def string }{
 	// held_at is when the sender was told the message is held for a session
 	// that isn't running.
 	{"messages", "held_at", "INTEGER NOT NULL DEFAULT 0"},
+	// pull_only: the session gets messages only when it checks.
+	{"sessions", "pull_only", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 const (
 	msgCols     = `m.id, m.thread_id, m.in_reply_to, m.sender, m.recipient, m.from_session, m.to_session, m.content, m.meta, m.status, m.attempts, m.created_at`
 	agentCols   = `a.name, a.token_hash, a.delivery, a.config, a.created_at`
-	sessionCols = `agent, id, name, cwd, branch, tier, state, active_at, last_seen, ended_at`
+	sessionCols = `agent, id, name, cwd, branch, tier, state, active_at, last_seen, ended_at, pull_only`
 	// trackCols follow msgCols for the delivery details birdie's own commands show.
 	trackCols = `COALESCE(m.delivered_at, 0), m.taken_by, m.last_error, m.error_at, m.next_attempt_at`
 )
@@ -552,7 +554,34 @@ func (s *SQLite) MoveSession(ctx context.Context, agent, from, to string) error 
 			return err
 		}
 	}
+	// The same conversation: it stays pull-only if its stand-in was.
+	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET pull_only = 1 WHERE agent = ? AND id = ?
+		AND EXISTS (SELECT 1 FROM sessions WHERE agent = ? AND id = ? AND pull_only = 1)`, agent, to, agent, from); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+func (s *SQLite) SetSessionPullOnly(ctx context.Context, agent, id string, on bool) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET pull_only = ? WHERE agent = ? AND id = ?`, on, agent, id)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return fmt.Errorf("%w: session %s of %s", bus.ErrNotFound, id, agent)
+	}
+	return nil
+}
+
+func (s *SQLite) SessionPullOnly(ctx context.Context, agent, id string) (bool, error) {
+	var on bool
+	err := s.db.QueryRowContext(ctx, `SELECT pull_only FROM sessions WHERE agent = ? AND id = ?`, agent, id).Scan(&on)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return on, err
 }
 
 func (s *SQLite) LiveSessions(ctx context.Context, agent string, since time.Time) ([]bus.Session, error) {
@@ -574,8 +603,11 @@ func collectSessions(rows *sql.Rows, err error) ([]bus.Session, error) {
 	for rows.Next() {
 		var ses bus.Session
 		var active, seen, ended int64
-		if err := rows.Scan(&ses.Agent, &ses.ID, &ses.Name, &ses.Cwd, &ses.Branch, &ses.Tier, &ses.State, &active, &seen, &ended); err != nil {
+		if err := rows.Scan(&ses.Agent, &ses.ID, &ses.Name, &ses.Cwd, &ses.Branch, &ses.Tier, &ses.State, &active, &seen, &ended, &ses.PullOnly); err != nil {
 			return nil, err
+		}
+		if ses.PullOnly {
+			ses.Tier = bus.TierPull
 		}
 		ses.ActiveAt, ses.LastSeen = time.UnixMilli(active).UTC(), time.UnixMilli(seen).UTC()
 		ses.EndedAt = unixMilli(ended)

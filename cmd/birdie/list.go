@@ -32,7 +32,11 @@ func printSessions(w io.Writer, agents []bus.Agent, all bool, now time.Time) err
 			if s.Default {
 				def = "yes"
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", sessionLabel(a, s), sessionAddress(s), sessionState(s, now), s.Tier, def,
+			tier := s.Tier
+			if s.PullOnly {
+				tier = "pull-only"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", sessionLabel(a, s), sessionAddress(s), sessionState(s, now), tier, def,
 				printable(s.Branch, false), printable(homePath(s.Cwd), false))
 			shown++
 		}

@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"birdie/internal/bus"
@@ -36,11 +37,14 @@ const (
 var supportedProtocols = []string{"2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"}
 
 type Server struct {
-	c       *client.Client
-	name    string
-	channel bool
-	version string
-	log     *log.Logger
+	// pullOnly: someone made this session pull-only (birdie session
+	// pull-only), as the bus said when it last reported.
+	pullOnly atomic.Bool
+	c        *client.Client
+	name     string
+	channel  bool
+	version  string
+	log      *log.Logger
 
 	outMu sync.Mutex
 	out   io.Writer
@@ -340,6 +344,14 @@ func (s *Server) currentHost() Host {
 
 // tier says how soon this session sees a message right now.
 func (s *Server) tier() string {
+	if s.pullOnly.Load() {
+		return bus.TierPull
+	}
+	return s.canTier()
+}
+
+// canTier is how soon this session could see a message, pull-only or not.
+func (s *Server) canTier() string {
 	h := s.currentHost()
 	if h != nil && h.Tier() != bus.TierPull {
 		return h.Tier()
@@ -383,10 +395,13 @@ func (s *Server) syncSession(ctx context.Context, h Host) {
 	if s.replaces == info.ID {
 		s.replaces = ""
 	}
-	err := s.c.ReportSession(ctx, info.ID, bus.SessionInput{
-		Name: info.Name, Cwd: info.Cwd, Branch: gitBranch(info.Cwd), Tier: s.tier(), State: info.State, ActiveAt: info.ActiveAt,
+	pullOnly, err := s.c.ReportSession(ctx, info.ID, bus.SessionInput{
+		Name: info.Name, Cwd: info.Cwd, Branch: gitBranch(info.Cwd), Tier: s.canTier(), State: info.State, ActiveAt: info.ActiveAt,
 		Replaces: s.replaces,
 	})
+	if err == nil {
+		s.pullOnly.Store(pullOnly)
+	}
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Printf("report session: %v", err)
@@ -433,7 +448,7 @@ func (s *Server) pump(ctx context.Context) {
 			continue
 		}
 		polled := s.c.Session()
-		msgs, err := s.c.Inbox(ctx, "", pollWait)
+		msgs, err := s.c.PushInbox(ctx, pollWait)
 		if err != nil {
 			if ctx.Err() != nil {
 				return

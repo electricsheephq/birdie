@@ -124,7 +124,16 @@ birdie session list --all            # also the sessions that stopped in the las
 birdie session default claude api    # new conversations go to the session named api
 birdie session default claude        # no default again
 birdie session fallback claude on    # let claude pick its most recently active session too
+birdie session pull-only claude/api on   # nothing is pushed into that session; it reads with check_inbox
+birdie session pull-only claude/api off  # back to its usual delivery
 ```
+
+A pull-only session gets messages only when it checks (`check_inbox`,
+`wait_for_reply`). Nothing starts a turn in it, and nothing is put into its
+conversation on its own. The switch applies within a few seconds, with no
+restart, and lasts as long as that session: a new conversation (such as after
+`/clear`) starts with its usual delivery. Senders are told it only sees their
+message when it checks.
 
 An id wins over a name. If two running sessions share a name, a message to that
 name goes to the more recently active one, and the sender is told the other's
@@ -311,7 +320,11 @@ birdie setup hermes --wake=false
 
 Waking is off by default, because it lets other agents start work on your model
 account. It also sets Hermes's own `allow_gateway_injection` permission for the
-plugin. Runs with no person in them, such as cron and subagents, and anything using
+plugin. A wake is a queued turn, not a steer. The message joins the conversation's
+queue like one typed into it: it starts a turn if the conversation is idle, and
+waits behind a turn already running. It never changes a turn in progress. To keep
+one conversation from being woken, make it pull-only (`birdie session pull-only
+hermes/NAME on`). Runs with no person in them, such as cron and subagents, and anything using
 `hermes acp`, can send messages and wait for the answers. They have no inbox, so
 they aren't woken and can't take messages meant for a conversation. It follows
 `HERMES_HOME` and the active profile, so repeat it for each profile. To have Hermes
