@@ -12,9 +12,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: test-${{ github.ref }}
-  # A newer push to a pull request replaces its run; every commit on main
-  # keeps its own result.
+  # A newer push to a pull request replaces its run. Each run on main gets a
+  # group of its own, so none waits behind another or is cancelled, and every
+  # commit there keeps its own result.
+  group: test-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
