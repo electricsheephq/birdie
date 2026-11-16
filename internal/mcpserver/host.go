@@ -32,12 +32,22 @@ type Host interface {
 	Session() SessionInfo
 	// Tier says how soon the session sees a message right now.
 	Tier() string
-	// Push shows the message to the model. It is only called at TierPush.
-	Push(ctx context.Context, m bus.Message) error
+	// Push shows the message to the model of conversation session, the one
+	// it was taken for. If the host now serves another conversation (after
+	// /clear), it returns ErrOtherConversation and shows nothing. It is only
+	// called at TierPush.
+	Push(ctx context.Context, session string, m bus.Message) error
 	// Observe sees the _meta of each tool call, which is the only place some
 	// agents name their conversation.
 	Observe(meta json.RawMessage)
 }
+
+// ErrOtherConversation is Push refusing a message taken for a conversation
+// the host no longer serves.
+var ErrOtherConversation = errors.New("the session has moved to another conversation")
+
+// errUnsure is a host that can't tell which conversation it serves right now.
+var errUnsure = errors.New("can't tell which conversation the session serves right now")
 
 // HostOptions configure DetectHost.
 type HostOptions struct {
@@ -68,8 +78,12 @@ func DetectHost(client string, opts HostOptions) Host {
 
 func procSession() SessionInfo {
 	cwd, _ := os.Getwd()
-	return SessionInfo{ID: fmt.Sprintf("proc-%d", os.Getpid()), Name: slug(filepath.Base(cwd)), Cwd: cwd}
+	return SessionInfo{ID: procID(), Name: slug(filepath.Base(cwd)), Cwd: cwd}
 }
+
+// procID is the stand-in session id a bridge uses until its host names the
+// conversation.
+func procID() string { return fmt.Sprintf("proc-%d", os.Getpid()) }
 
 // slugBad leaves dashes out of the kept characters, so a run of them and of
 // anything else becomes one dash: "Plugin - Birdie" is plugin-birdie, not
@@ -91,7 +105,7 @@ type plainHost struct{ info SessionInfo }
 func (h *plainHost) Session() SessionInfo    { return h.info }
 func (h *plainHost) Tier() string            { return bus.TierPull }
 func (h *plainHost) Observe(json.RawMessage) {}
-func (h *plainHost) Push(context.Context, bus.Message) error {
+func (h *plainHost) Push(context.Context, string, bus.Message) error {
 	return errors.New("this agent can't be pushed to")
 }
 
@@ -104,7 +118,26 @@ type claudeHost struct {
 
 	once sync.Once
 	pid  int
+
+	mu   sync.Mutex
+	last *claudeEntry // the last entry read whole
+	// failingSince is when reads started failing one after another, each
+	// soon after the last (lastFailure), since the last whole read.
+	failingSince, lastFailure time.Time
 }
+
+// registryGrace is how long whole reads of the registry may fail before the
+// session stops counting as push. A read cut short by a rewrite fails for a
+// moment; one failing for longer means the registry can't be read, and then
+// nothing says which conversation the process serves, so messages wait, for
+// check_inbox too, until a whole read does (see conversation).
+const registryGrace = 10 * time.Second
+
+// failureGap is how close failed reads must come to count as one run. It is
+// longer than the pump's slowest retry (5 s) while it can't tell, so an outage
+// stays one run, and shorter than the 30 s between an idle session's reports,
+// so two reads cut short by unrelated rewrites don't make one.
+const failureGap = 6 * time.Second
 
 type claudeEntry struct {
 	SessionID       string `json:"sessionId"`
@@ -124,22 +157,64 @@ func claudeDir() string {
 	return filepath.Join(home, ".claude")
 }
 
-func (h *claudeHost) entry() (claudeEntry, bool) {
+// entry reads the process's registry entry. When the read fails or is cut
+// short, as while Claude Code rewrites the entry at /clear, e is the last
+// whole entry, if there was one. That keeps the session's identity steady:
+// the environment would name the conversation the process started with. But
+// a remembered entry can't say the conversation hasn't changed since, so sure
+// is false then (see conversation).
+func (h *claudeHost) entry() (e claudeEntry, ok, sure bool) {
 	h.once.Do(func() { h.pid = claudeAncestor() })
-	var e claudeEntry
 	if h.pid == 0 {
-		return e, false
+		return claudeEntry{}, false, true
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	b, err := os.ReadFile(filepath.Join(claudeDir(), "sessions", fmt.Sprintf("%d.json", h.pid)))
 	if err != nil || json.Unmarshal(b, &e) != nil {
-		return claudeEntry{}, false
+		if h.last == nil {
+			return claudeEntry{}, false, true
+		}
+		// A failure long after the last one starts a new run: a read cut
+		// short a while ago says nothing about the registry now.
+		now := time.Now()
+		if h.failingSince.IsZero() || now.Sub(h.lastFailure) > failureGap {
+			h.failingSince = now
+		}
+		h.lastFailure = now
+		return *h.last, true, false
 	}
-	return e, true
+	h.last, h.failingSince, h.lastFailure = &e, time.Time{}, time.Time{}
+	return e, true, true
+}
+
+// unreadable reports whether whole reads of the registry have failed for
+// longer than registryGrace.
+func (h *claudeHost) unreadable() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return !h.failingSince.IsZero() && time.Since(h.failingSince) >= registryGrace
+}
+
+// conversation is the session's conversation as the registry says right now,
+// or errUnsure when only a remembered entry says (see entry). With no
+// registry entry at all, it is the conversation in the environment.
+func (h *claudeHost) conversation() (string, error) {
+	e, ok, sure := h.entry()
+	if !sure {
+		return "", errUnsure
+	}
+	return h.info(e, ok).ID, nil
 }
 
 func (h *claudeHost) Session() SessionInfo {
+	e, ok, _ := h.entry()
+	return h.info(e, ok)
+}
+
+// info is the session as registry entry e describes it.
+func (h *claudeHost) info(e claudeEntry, ok bool) SessionInfo {
 	info := h.fallback
-	e, ok := h.entry()
 	if id := os.Getenv("CLAUDE_CODE_SESSION_ID"); id != "" {
 		info.ID = id
 	}
@@ -172,15 +247,19 @@ func (h *claudeHost) Session() SessionInfo {
 var claudeStates = map[string]string{"busy": bus.StateBusy, "idle": bus.StateIdle, "waiting": bus.StateWaiting}
 
 func (h *claudeHost) socket() string {
+	e, _, _ := h.entry()
+	return socketOf(e)
+}
+
+func socketOf(e claudeEntry) string {
 	if s := os.Getenv("CLAUDE_CODE_MESSAGING_SOCKET"); s != "" {
 		return s
 	}
-	e, _ := h.entry()
 	return e.Socket
 }
 
 func (h *claudeHost) Tier() string {
-	if h.noPush || runtime.GOOS == "windows" || h.socket() == "" {
+	if h.noPush || runtime.GOOS == "windows" || h.socket() == "" || h.unreadable() {
 		return bus.TierPull
 	}
 	return bus.TierPush
@@ -190,8 +269,18 @@ func (h *claudeHost) Tier() string {
 // between tool calls, or starts a turn if the session is idle, and marks it as
 // coming from a peer. No token is sent on purpose, so a session that skips
 // permission prompts still holds the message for its user to review.
-func (h *claudeHost) Push(ctx context.Context, m bus.Message) error {
-	path := h.socket()
+func (h *claudeHost) Push(ctx context.Context, session string, m bus.Message) error {
+	// The socket belongs to the process, not the conversation, and stays the
+	// same through /clear. So the conversation is checked against the same
+	// read of the registry the socket comes from, just before writing.
+	e, ok, sure := h.entry()
+	if !sure {
+		return errUnsure
+	}
+	if h.info(e, ok).ID != session {
+		return ErrOtherConversation
+	}
+	path := socketOf(e)
 	if path == "" {
 		return errors.New("no inbox socket")
 	}
@@ -271,14 +360,18 @@ func (h *codexHost) Tier() string {
 	return bus.TierPush
 }
 
-func (h *codexHost) Push(ctx context.Context, m bus.Message) error {
+func (h *codexHost) Push(ctx context.Context, session string, m bus.Message) error {
+	thread := h.current()
+	if thread == "" || thread != session {
+		return ErrOtherConversation
+	}
 	text := MessageText(m)
 	if len(text) > maxArgBytes {
 		text = fmt.Sprintf("<birdie-message from=%q message_id=%q thread_id=%q>\nThis message is too long to show here. Read it with the birdie get_thread tool, and answer with send_message, in_reply_to %q.\n</birdie-message>", m.From, m.ID, m.ThreadID, m.ID)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "codex", "queue", "--thread", h.current(), "--message", text)
+	cmd := exec.CommandContext(ctx, "codex", "queue", "--thread", thread, "--message", text)
 	cmd.Dir = h.fallback.Cwd
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("codex queue: %w: %s", err, strings.TrimSpace(string(out)))
@@ -339,6 +432,6 @@ func (h *grokHost) Tier() string {
 }
 
 func (h *grokHost) Observe(json.RawMessage) {}
-func (h *grokHost) Push(context.Context, bus.Message) error {
+func (h *grokHost) Push(context.Context, string, bus.Message) error {
 	return errors.New("grok sessions get messages through hooks")
 }

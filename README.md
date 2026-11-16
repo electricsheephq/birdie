@@ -130,7 +130,8 @@ show as `live`, because birdie can't tell what they're doing.
 If a session closes, new conversations waiting for it go to the default
 session; if none is open, they wait for one. Answers and follow-ups for a closed
 session wait for that session to come back, because what they answer was said
-there; the sender is told so when it sends.
+there; the sender is told so when it sends. A session can still collect one by
+waiting on its thread.
 
 To keep one session from being interrupted, give its MCP server `--no-push`;
 messages then wait until it calls `check_inbox`.

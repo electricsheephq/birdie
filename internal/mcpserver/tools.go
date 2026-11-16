@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -83,11 +84,14 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, *rpcEr
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, &rpcError{-32602, "invalid params"}
 	}
-	if h := s.currentHost(); h != nil && len(p.Meta) > 0 {
-		tier, id := h.Tier(), h.Session().ID
-		h.Observe(p.Meta)
-		// The call may be the first to name the conversation; act for it now.
-		if h.Tier() != tier || h.Session().ID != id {
+	if h := s.currentHost(); h != nil {
+		tier := h.Tier()
+		if len(p.Meta) > 0 {
+			h.Observe(p.Meta)
+		}
+		// The call may be the first to name the conversation, or the first
+		// since it changed (/clear); act for the conversation making it.
+		if h.Tier() != tier || h.Session().ID != s.c.Session() {
 			s.syncSession(ctx, h)
 		}
 	}
@@ -122,6 +126,13 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, *rpcEr
 		if s.pushing() {
 			return toolText("New messages come to you on their own in this session, so there is nothing to fetch.", false), nil
 		}
+		if h := s.currentHost(); h != nil {
+			if _, err := hostConversation(h); errors.Is(err, errUnsure) {
+				// Taking messages for the conversation last seen could show
+				// another conversation's here.
+				return toolText("Birdie can't tell which conversation this is right now (it can't read Claude Code's session registry), so messages wait until it can. Try again shortly.", true), nil
+			}
+		}
 		var msgs []bus.Message
 		msgs, err = s.c.Inbox(ctx, "", seconds(a.WaitSeconds, 0, bus.MaxWait))
 		s.ackAll(ctx, msgs, err)
@@ -132,7 +143,9 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, *rpcEr
 		}
 		var msgs []bus.Message
 		pushing := s.pushing()
-		msgs, err = s.waitForReply(ctx, a.ThreadID, seconds(a.TimeoutSeconds, 120*time.Second, maxReplyWait))
+		// One decision for how to wait and whether to confirm what comes
+		// back: the tier can change while the call waits.
+		msgs, err = s.waitForReply(ctx, a.ThreadID, seconds(a.TimeoutSeconds, 120*time.Second, maxReplyWait), pushing)
 		if !pushing {
 			s.ackAll(ctx, msgs, err)
 		}

@@ -160,6 +160,9 @@ type SessionInput struct {
 	Tier     string    `json:"tier,omitempty"`
 	State    string    `json:"state,omitempty"`
 	ActiveAt time.Time `json:"active_at,omitzero"`
+	// Replaces is a stand-in id the same conversation reported before its real
+	// one was known. What was pinned to it moves to this session.
+	Replaces string `json:"replaces,omitempty"`
 }
 
 type Message struct {
@@ -271,6 +274,9 @@ type Store interface {
 	// EndSession records that a session closed. Until it reports again, it no
 	// longer counts as running.
 	EndSession(ctx context.Context, agent, id string, at time.Time) error
+	// MoveSession points everything that names agent's session from at the
+	// session to instead.
+	MoveSession(ctx context.Context, agent, from, to string) error
 	// LiveSessions returns the agent's running sessions: seen since a time,
 	// and not closed.
 	LiveSessions(ctx context.Context, agent string, since time.Time) ([]Session, error)
