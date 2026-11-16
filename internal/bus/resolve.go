@@ -144,7 +144,10 @@ func (b *Bus) findSession(ctx context.Context, to Agent, addr Address) (Session,
 		if addr.ID != "" && s.Name != addr.Session {
 			return fail(RecipientNotFound, fmt.Sprintf("%s has no session %s: %s is the id of %s", to.DisplayName(), addr, addr.ID, addressOf(to, s)))
 		}
-		if s.Live(now) {
+		// Just after birdie starts or the machine wakes, sessions haven't
+		// reported yet. One that didn't say it closed may still be open, and
+		// a whole id can only mean it; if it has gone, the message is held.
+		if s.Live(now) || (s.EndedAt.IsZero() && b.quiet(now)) {
 			return s, nil, nil
 		}
 		return ended(s)
