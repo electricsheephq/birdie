@@ -92,7 +92,9 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 		// The call may be the first to name the conversation, or the first
 		// since it changed (/clear); act for the conversation making it.
 		if h.Tier() != tier || h.Session().ID != s.c.Session() {
-			s.syncSession(ctx, h)
+			// Not cut short if the call is cancelled: the old conversation
+			// must still be ended, or nothing will end it.
+			s.syncSession(context.WithoutCancel(ctx), h)
 		}
 	}
 	var a toolArgs
