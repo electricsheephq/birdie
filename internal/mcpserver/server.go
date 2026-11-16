@@ -95,7 +95,7 @@ func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 	}()
 
 	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 64<<10), 32<<20)
+	sc.Buffer(make([]byte, 64<<10), bus.MaxRequestBytes)
 	var wg, pumpWG sync.WaitGroup
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())

@@ -16,7 +16,10 @@ import (
 )
 
 const (
-	MaxContentBytes = 1 << 20
+	// MaxRequestBytes bounds one request to the bus, so a runaway sender
+	// can't exhaust its memory. Messages themselves have no size limit; this
+	// is far beyond any an agent writes.
+	MaxRequestBytes = 256 << 20
 	MaxWait         = 2 * time.Minute
 	inboxBatch      = 50
 	maxAttempts     = 8
@@ -290,9 +293,6 @@ func (b *Bus) EndSession(ctx context.Context, agent, id string) error {
 func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, error) {
 	if strings.TrimSpace(in.Content) == "" {
 		return Message{}, fmt.Errorf("%w: content is required", ErrInvalid)
-	}
-	if len(in.Content) > MaxContentBytes {
-		return Message{}, fmt.Errorf("%w: content exceeds %d bytes", ErrInvalid, MaxContentBytes)
 	}
 
 	thread := in.ThreadID

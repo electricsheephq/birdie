@@ -268,7 +268,7 @@ func (s *server) thread(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) send(w http.ResponseWriter, r *http.Request) {
 	var in struct{ To, Content string }
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, bus.MaxContentBytes+4096)).Decode(&in); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, bus.MaxRequestBytes)).Decode(&in); err != nil {
 		s.fail(w, http.StatusBadRequest, "the request isn't valid JSON")
 		return
 	}

@@ -16,7 +16,7 @@ import (
 	"birdie/internal/bus"
 )
 
-const maxBody = 2 << 20
+const maxBody = bus.MaxRequestBytes
 
 type server struct {
 	b   *bus.Bus

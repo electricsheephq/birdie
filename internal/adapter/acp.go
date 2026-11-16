@@ -170,9 +170,6 @@ func (a *ACP) handle(to bus.Agent, m bus.Message) {
 			text = fmt.Sprintf("(%s finished without a text reply; stop reason: %s)", to.Name, stop)
 		}
 	}
-	if len(text) > bus.MaxContentBytes {
-		text = text[:bus.MaxContentBytes-64] + "\n\n[truncated by birdie]"
-	}
 	if _, err := a.Bus.Send(a.ctx, to.Name, bus.SendInput{To: m.From, InReplyTo: m.ID, Content: text, Meta: meta}); err != nil {
 		log.Error("acp: post reply", "err", err)
 		if err := a.Bus.Notice(a.ctx, m, "reply_failed", fmt.Sprintf("%s answered your message %s, but the answer couldn't be posted: %v", to.Name, m.ID, err)); err != nil {
