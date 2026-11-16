@@ -23,6 +23,12 @@ birdie setup hermes --wake      # messages also start a turn on their own
 birdie setup hermes --wake=false
 ```
 
+A wake is a queued turn, not a steer. The message joins the conversation's queue
+like one typed into it: it starts a turn if the conversation is idle, and waits
+behind a turn already running. It never changes a turn in progress.
+`birdie session pull-only hermes/NAME on` stops one conversation from being woken,
+with no restart. It then reads its messages with `birdie_check_inbox`.
+
 Hermes keeps the agent's token itself, as its `BIRDIE_HERMES_TOKEN` secret. Setup
 doesn't read or write Hermes's `.env`, so if Hermes doesn't have the token yet, setup
 prints it with what to do:

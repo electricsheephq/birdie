@@ -142,6 +142,9 @@ type Session struct {
 	LastSeen time.Time `json:"last_seen"`
 	// EndedAt is when it said it was closing.
 	EndedAt time.Time `json:"ended_at,omitzero"`
+	// PullOnly: someone chose that this session gets messages only when it
+	// checks, never pushed in. Its Tier then reads TierPull.
+	PullOnly bool `json:"pull_only,omitempty"`
 }
 
 // Live reports whether the session counts as running at now.
@@ -221,6 +224,9 @@ type ReceiveInput struct {
 	// Lease, when set, keeps claimed messages for the receiver only this long
 	// unless it confirms them with Ack. Without it they count as delivered at once.
 	Lease time.Duration
+	// Push marks a claim by a delivery that puts messages into the session's
+	// conversation on its own. A pull-only session gets nothing from one.
+	Push bool
 }
 
 // ClaimFilter is ReceiveInput as the store needs it.
@@ -296,6 +302,12 @@ type Store interface {
 	// MoveSession points everything that names agent's session from at the
 	// session to instead.
 	MoveSession(ctx context.Context, agent, from, to string) error
+	// SetSessionPullOnly turns pull-only on or off for one of agent's
+	// sessions. ErrNotFound if birdie doesn't know it.
+	SetSessionPullOnly(ctx context.Context, agent, id string, on bool) error
+	// SessionPullOnly reports whether the session is pull-only; false for one
+	// birdie doesn't know.
+	SessionPullOnly(ctx context.Context, agent, id string) (bool, error)
 	// LiveSessions returns the agent's running sessions: seen since a time,
 	// and not closed.
 	LiveSessions(ctx context.Context, agent string, since time.Time) ([]Session, error)

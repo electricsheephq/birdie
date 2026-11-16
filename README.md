@@ -124,7 +124,16 @@ birdie session list --all            # also the sessions that stopped in the las
 birdie session default claude api    # new conversations go to the session named api
 birdie session default claude        # no default again
 birdie session fallback claude on    # let claude pick its most recently active session too
+birdie session pull-only claude/api on   # nothing is pushed into that session; it reads with check_inbox
+birdie session pull-only claude/api off  # back to its usual delivery
 ```
+
+A pull-only session gets messages only when it checks (`check_inbox`,
+`wait_for_reply`). Nothing starts a turn in it, and nothing is put into its
+conversation on its own. The switch applies within a few seconds, with no
+restart, and lasts as long as that session: a new conversation (such as after
+`/clear`) starts with its usual delivery. Senders are told it only sees their
+message when it checks.
 
 An id wins over a name. If two running sessions share a name, a message to that
 name goes to the more recently active one, and the sender is told the other's
@@ -154,6 +163,15 @@ messages then wait until it calls `check_inbox`.
 
 A session that skips permission prompts holds incoming messages for you to
 review rather than acting on them. birdie leaves this in place on purpose.
+
+**Asking first.** An agent that gets a new request it isn't sure about replies
+in its thread before acting, starting `(question / not a steer)`, with up to 3
+numbered questions. Until the sender answers, the sender's `wait_for_reply`
+shows `thread_status: awaiting_clarification`, and `get_thread`,
+`GET /v1/threads/{id}` and `birdie thread` show the thread as awaiting
+clarification. Once the agent has answered or acted, its later questions are
+ordinary ones and don't change the status. An agent that is sure just does the
+task, so this costs nothing then.
 
 **How this works:** birdie posts to an inbox socket Claude Code keeps for each
 session. It has no public docs and could change. If it does, or on Windows, add
@@ -311,7 +329,11 @@ birdie setup hermes --wake=false
 
 Waking is off by default, because it lets other agents start work on your model
 account. It also sets Hermes's own `allow_gateway_injection` permission for the
-plugin. Runs with no person in them, such as cron and subagents, and anything using
+plugin. A wake is a queued turn, not a steer. The message joins the conversation's
+queue like one typed into it: it starts a turn if the conversation is idle, and
+waits behind a turn already running. It never changes a turn in progress. To keep
+one conversation from being woken, make it pull-only (`birdie session pull-only
+hermes/NAME on`). Runs with no person in them, such as cron and subagents, and anything using
 `hermes acp`, can send messages and wait for the answers. They have no inbox, so
 they aren't woken and can't take messages meant for a conversation. It follows
 `HERMES_HOME` and the active profile, so repeat it for each profile. To have Hermes
@@ -409,9 +431,34 @@ that way come back unless confirmed with `ack`.
 | Headless Grok doesn't answer | The service log shows `acp: turn failed`; the sender also gets a reply explaining why |
 | `too many messages` | Two agents sent 12 messages in 10 minutes, which looks like a loop. Change it with `serve --loop-limit` (`0` = off) |
 
+## Known limits
+
+- **One machine.** Agents elsewhere can only be webhook agents. They answer
+  through a tunnel you set up (`serve --public-url`). Addresses with `@node`
+  are refused for now.
+- **Plain HTTP on 127.0.0.1.** There's no TLS. A non-loopback `--addr` only
+  logs a warning, so keep the default (see [SECURITY.md](SECURITY.md)).
+- **History isn't pruned.** Messages stay in `bus.db` until you delete them.
+  Sessions are forgotten 30 days after they last reported.
+- **Held mail expires.** A message for a session that stopped waits up to 7
+  days for it to come back (`serve --hold-for`), then expires, and the sender
+  is told.
+- **Session state.** A session counts as running while it reports at least
+  every 90 seconds. Only Claude Code sessions show `busy`, `idle` or
+  `waiting`; other agents' sessions show as `live`.
+- **Claude Code delivery** uses an undocumented inbox socket that could
+  change. On Windows, use `--channel` instead.
+- **Long messages** (over 100 KiB) are pushed as a pointer for the agent to
+  read with `get_thread`.
+- **Loops:** one agent may send another 12 messages in 10 minutes
+  (`serve --loop-limit`).
+
 ## Security
 
-- Listens on 127.0.0.1 only. Each agent has its own token; only a hash is stored.
+See [SECURITY.md](SECURITY.md) for what birdie trusts, what it stores and for
+how long, and how to report a vulnerability.
+
+- Listens on 127.0.0.1 by default. Each agent has its own token; only a hash is stored.
 - The sender of every message is set by the bus from the token, so it can't be faked.
 - Only the agents in a thread can read it or post to it.
 - The web app answers only on 127.0.0.1 or localhost, after you sign in with a

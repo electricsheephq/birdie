@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"birdie/internal/bus"
@@ -125,6 +126,10 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 		}
 		out = map[string]string{"message_id": m.ID, "thread_id": m.ThreadID, "status": m.Status, "note": m.Note}
 	case "check_inbox":
+		if h := s.currentHost(); h != nil && s.pushing() {
+			// It may have been made pull-only since it last reported.
+			s.syncSession(context.WithoutCancel(ctx), h)
+		}
 		if s.pushing() {
 			return toolText("New messages come to you on their own in this session, so there is nothing to fetch.", false), nil
 		}
@@ -157,11 +162,21 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 			}
 			return toolText(note, false), nil
 		}
-		out = map[string]any{"messages": msgs}
+		reply := map[string]any{"messages": msgs}
+		if err == nil && slices.ContainsFunc(msgs, bus.AsksQuestions) {
+			if status := s.threadStatus(ctx, a.ThreadID); status != "" {
+				reply["thread_status"] = status
+			}
+		}
+		out = reply
 	case "get_thread":
 		var msgs []bus.Message
 		msgs, err = s.c.Thread(ctx, a.ThreadID)
-		out = map[string]any{"messages": msgs}
+		thread := map[string]any{"messages": msgs}
+		if status := bus.ThreadStatus(msgs); status != "" {
+			thread["status"] = status
+		}
+		out = thread
 	case "list_agents":
 		var agents []bus.Agent
 		agents, err = s.c.Agents(ctx)
@@ -204,4 +219,22 @@ func toolText(text string, isErr bool) map[string]any {
 		"content": []map[string]string{{"type": "text", "text": text}},
 		"isError": isErr,
 	}
+}
+
+// statusWait bounds the extra read of a thread that wait_for_reply makes to
+// report its status.
+const statusWait = 2 * time.Second
+
+// threadStatus is the status of a thread (see bus.ThreadStatus), read within
+// statusWait. Only the whole thread tells whether questions hold up a request.
+// The replies wait_for_reply returns are already taken, so a failed or slow
+// read leaves the status out rather than failing or holding up the call.
+func (s *Server) threadStatus(ctx context.Context, thread string) string {
+	ctx, cancel := context.WithTimeout(ctx, statusWait)
+	defer cancel()
+	msgs, err := s.c.Thread(ctx, thread)
+	if err != nil {
+		return ""
+	}
+	return bus.ThreadStatus(msgs)
 }
