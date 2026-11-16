@@ -7,7 +7,7 @@ PLATFORMS := linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows
 build:
 	CGO_ENABLED=0 go build -ldflags '$(LDFLAGS)' -o bin/birdie ./cmd/birdie
 
-# test is the gate CI and releases run, so it never reuses cached results:
+# test is the gate CI and releases run, so it never reuses cached test results:
 # Go's test cache can't see files a test's subprocess reads, such as the
 # Hermes plugin's Python tests.
 test:
