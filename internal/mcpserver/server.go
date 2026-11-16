@@ -50,6 +50,10 @@ type Server struct {
 	// shown holds messages pushed to the session per thread, so a
 	// wait_for_reply that starts just after doesn't wait for what already came.
 	shown map[string][]bus.Message
+	// pushed holds the ids of the messages shown most recently, oldest
+	// first, so one that comes back is confirmed, not shown again.
+	pushed      map[string]bool
+	pushedOrder []string
 
 	pumpOnce sync.Once
 
@@ -75,7 +79,7 @@ func New(c *client.Client, name, version string, channel bool, logger *log.Logge
 	// it is always taken under a lease, session or not.
 	c.Leased = true
 	return &Server{c: c, name: name, version: version, channel: channel, log: logger,
-		waiters: map[string][]chan bus.Message{}, shown: map[string][]bus.Message{}, beat: make(chan struct{}, 1),
+		waiters: map[string][]chan bus.Message{}, shown: map[string][]bus.Message{}, pushed: map[string]bool{}, beat: make(chan struct{}, 1),
 		calls: map[string]*call{}}
 }
 
@@ -242,6 +246,7 @@ func (s *Server) handle(ctx context.Context, req request) {
 	written := s.writeLive(ctx, resp)
 	for _, m := range taken {
 		if written {
+			s.markShown(m.ID) // if this confirmation is lost, it isn't pushed again
 			s.ack(ctx, m)
 		} else {
 			s.nack(ctx, m)
@@ -457,6 +462,12 @@ func (s *Server) pump(ctx context.Context) {
 				s.nack(ctx, m)
 				continue
 			}
+			if s.wasPushed(m.ID) {
+				// Shown already, but its confirmation was lost and its lease
+				// ran out: confirm it, and don't show it again.
+				s.ack(ctx, m)
+				continue
+			}
 			if s.route(m) {
 				continue // the waiter confirms it, or gives it back
 			}
@@ -588,6 +599,36 @@ func (s *Server) remember(m bus.Message) {
 		clear(s.shown)
 	}
 	s.shown[m.ThreadID] = append(s.shown[m.ThreadID], m)
+	s.markShownLocked(m.ID)
+}
+
+// markShown records that a tool call's answer showed the message with id.
+func (s *Server) markShown(id string) {
+	s.waitMu.Lock()
+	defer s.waitMu.Unlock()
+	s.markShownLocked(id)
+}
+
+func (s *Server) markShownLocked(id string) {
+	if !s.pushed[id] {
+		s.pushed[id] = true
+		s.pushedOrder = append(s.pushedOrder, id)
+		if len(s.pushedOrder) > maxPushed {
+			delete(s.pushed, s.pushedOrder[0])
+			s.pushedOrder = s.pushedOrder[1:]
+		}
+	}
+}
+
+// maxPushed is how many shown message ids the bridge remembers: far more than
+// come back before their lease runs out.
+const maxPushed = 1024
+
+// wasPushed reports whether the message with id was shown already.
+func (s *Server) wasPushed(id string) bool {
+	s.waitMu.Lock()
+	defer s.waitMu.Unlock()
+	return s.pushed[id]
 }
 
 const messageTag = "birdie-message"

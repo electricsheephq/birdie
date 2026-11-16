@@ -206,6 +206,39 @@ class PluginTest(unittest.TestCase):
         self.assertIn("birdie_get_thread", ctx.injected[0][1])
         self.assertLess(len(ctx.injected[0][1]), 1000)
 
+    def test_a_message_that_comes_back_is_not_put_in_again(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        self.turn(ctx)
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "once"})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        # Its confirmation was lost and its lease ran out, so it comes again.
+        network.deliver(network.conversation("s1"), {"id": sent["id"], "thread_id": sent["thread_id"], "from": "peer", "content": "once"})
+        self.assertEqual(len(ctx.injected), 1, "a message put in once must not be put in again")
+
+    def test_a_reply_handed_to_a_wait_that_is_ending_is_still_shown(self):
+        # The wait's last look comes just before the reply is handed to it, so
+        # the wait never returns it. It must come back and be shown, not be lost.
+        class Late(plugin.queue.Queue):
+            def get(self, block=True, timeout=None):
+                if not block:
+                    return super().get(block, timeout)
+                time.sleep(timeout or 0)
+                raise plugin.queue.Empty
+        self.write_config(True)
+        ctx, network = self.load()
+        self.turn(ctx)
+        sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}))
+        conversation = network.conversation("s1")
+        with mock.patch.object(plugin.queue, "Queue", Late):
+            waiting = threading.Thread(target=network.wait_pushed, args=(conversation, sent["thread_id"], 1.5))
+            waiting.start()
+            self.assertTrue(wait_until(lambda: sent["thread_id"] in conversation.waiting))
+            peer("POST", "/v1/messages", {"in_reply_to": peer_inbox(5)[0]["id"], "content": "the late reply"})
+            waiting.join()
+        self.assertTrue(wait_until(lambda: ctx.injected, 6), "the reply was lost")
+        self.assertIn("the late reply", ctx.injected[0][1])
+
     def test_a_refused_message_stays_for_the_tool_and_the_next_turn_tries_again(self):
         self.write_config(True)
         ctx, _ = self.load(accept=False)
