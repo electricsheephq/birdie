@@ -54,6 +54,8 @@ func TestSettleHeldPicksMessagesHeldForAStoppedSession(t *testing.T) {
 		{ID: "unpinned", To: "claude"},
 		{ID: "outbound", To: "hook", ToSession: "closed"},
 		{ID: "notice", From: bus.SystemSender, To: "claude", ToSession: "closed"},
+		{ID: "old-notice", From: bus.LegacySystemSender, To: "claude", ToSession: "closed"},
+		{ID: "told", To: "claude", ToSession: "closed", Held: bus.RecipientSessionEnded},
 		{ID: "delivered", To: "claude", ToSession: "closed", Status: bus.StatusDelivered},
 	} {
 		if m.From == "" {
@@ -107,14 +109,16 @@ func TestSettleHeldPicksMessagesHeldForAStoppedSession(t *testing.T) {
 			t.Fatalf("got %v, want %v", got, want)
 		}
 	}
-	// Told they're held: closed sessions, and with Lapsed, silent ones. Once.
+	// Told they're held: closed sessions, and with Lapsed, silent ones. Once,
+	// and not if the send said so.
 	want(settle(bus.HoldQuery{}), "closed", "just-closed")
 	want(settle(bus.HoldQuery{}))
 	want(settle(bus.HoldQuery{Lapsed: true}), "lapsed", "never-seen")
 	// Expired: held longer than an hour since the session stopped.
-	want(settle(bus.HoldQuery{Expire: true, Lapsed: true, Before: now.Add(-time.Hour)}), "closed", "lapsed", "never-seen")
+	want(settle(bus.HoldQuery{Expire: true, Lapsed: true, Before: now.Add(-time.Hour)}), "closed", "lapsed", "never-seen", "told")
 	for id, status := range map[string]string{"closed": bus.StatusExpired, "just-closed": bus.StatusQueued, "live": bus.StatusQueued,
-		"unpinned": bus.StatusQueued, "outbound": bus.StatusQueued, "notice": bus.StatusQueued, "delivered": bus.StatusDelivered} {
+		"unpinned": bus.StatusQueued, "outbound": bus.StatusQueued, "notice": bus.StatusQueued, "old-notice": bus.StatusQueued,
+		"delivered": bus.StatusDelivered} {
 		if m, err := st.GetMessage(ctx, id); err != nil || m.Status != status {
 			t.Fatalf("%s: status %q, %v; want %s", id, m.Status, err, status)
 		}

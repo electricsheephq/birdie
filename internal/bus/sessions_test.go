@@ -1192,3 +1192,63 @@ func TestAMessageGivenBackAfterItsSessionClosedIsHeld(t *testing.T) {
 		t.Fatalf("after it was given back: %+v, %v", got, err)
 	}
 }
+
+// While the bus listens after a start, a send to a session that hasn't
+// reported yet isn't called held; one to a session that closed is. A close
+// tells senders only about sessions that closed; the sweep, once the bus has
+// listened, also about sessions that went silent.
+func TestASendWhileListeningDoesntCallASessionStopped(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st, err := store.Open(filepath.Join(t.TempDir(), "bus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	stale := time.Now().Add(-10 * time.Minute)
+	for _, id := range []string{"s1", "s2"} {
+		if err := st.UpsertSession(ctx, bus.Session{Agent: "claude", ID: id, Name: id, Tier: bus.TierPush, ActiveAt: stale, LastSeen: stale}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.InsertMessage(ctx, bus.Message{ID: "msg_q" + id, ThreadID: "thr_" + id, From: "claude", FromSession: id, To: "bot", Content: "question", Status: bus.StatusDelivered, CreatedAt: stale}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.EndSession(ctx, "claude", "s2", stale); err != nil {
+		t.Fatal(err)
+	}
+	b := bus.New(st, slog.New(slog.NewTextHandler(io.Discard, nil))) // listening for SessionTTL
+	silent, err := b.Send(ctx, "bot", bus.SendInput{InReplyTo: "msg_qs1", Content: "answer"})
+	if err != nil || silent.Held != "" {
+		t.Fatalf("to a session that hasn't reported yet: held %q, %v", silent.Held, err)
+	}
+	closed, err := b.Send(ctx, "bot", bus.SendInput{InReplyTo: "msg_qs2", Content: "answer"})
+	if err != nil || closed.Held != bus.RecipientSessionEnded {
+		t.Fatalf("to a closed session: held %q, %v", closed.Held, err)
+	}
+	none := func(when string) {
+		t.Helper()
+		for _, thread := range []string{"thr_s1", "thr_s2"} {
+			if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: thread}); err != nil || len(got) != 0 {
+				t.Fatalf("%s: notice on %s: %+v, %v", when, thread, got, err)
+			}
+		}
+	}
+	report(t, b, "claude", "s3", "other", bus.TierPush, time.Now())
+	if err := b.EndSession(ctx, "claude", "s3"); err != nil {
+		t.Fatal(err)
+	}
+	none("a close while listening")
+	b.QuietFor = -1
+	if err := b.EndSession(ctx, "claude", "s3"); err != nil {
+		t.Fatal(err)
+	}
+	none("a close")
+	go b.RunDelivery(ctx)
+	got := notices(t, b, "thr_s1", "held")
+	if len(got) != 1 || got[0].Meta["messages"] != silent.ID {
+		t.Fatalf("sweep: %+v", got)
+	}
+}

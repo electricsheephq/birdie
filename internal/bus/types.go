@@ -293,8 +293,6 @@ type Store interface {
 	// sender told they are held, or expired; see HoldQuery), and inserts the
 	// notices build makes for them. build must not use the store.
 	SettleHeld(ctx context.Context, q HoldQuery, build func([]HeldMessage) []Message) ([]HeldMessage, []Message, error)
-	// MarkHeld records that the sender of message id knows it is held.
-	MarkHeld(ctx context.Context, id string, at time.Time) error
 	// MoveSession points everything that names agent's session from at the
 	// session to instead.
 	MoveSession(ctx context.Context, agent, from, to string) error

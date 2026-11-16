@@ -250,10 +250,14 @@ func insertMessage(ctx context.Context, db execer, m bus.Message) error {
 			return err
 		}
 	}
+	var held int64 // the sender, told at send that the message is held, needs no notice
+	if m.Held != "" {
+		held = m.CreatedAt.UnixMilli()
+	}
 	_, err := db.ExecContext(ctx,
-		`INSERT INTO messages (id, thread_id, in_reply_to, sender, recipient, from_session, to_session, content, meta, status, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.ID, m.ThreadID, m.InReplyTo, m.From, m.To, m.FromSession, m.ToSession, m.Content, string(meta), m.Status, m.CreatedAt.UnixMilli())
+		`INSERT INTO messages (id, thread_id, in_reply_to, sender, recipient, from_session, to_session, content, meta, status, created_at, held_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, m.ThreadID, m.InReplyTo, m.From, m.To, m.FromSession, m.ToSession, m.Content, string(meta), m.Status, m.CreatedAt.UnixMilli(), held)
 	return err
 }
 
@@ -360,9 +364,9 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 const waiting = `(m.status = 'queued' OR (m.status = 'claimed' AND m.lease_until > 0 AND m.lease_until <= ?))`
 
 func (s *SQLite) SettleHeld(ctx context.Context, q bus.HoldQuery, build func([]bus.HeldMessage) []bus.Message) ([]bus.HeldMessage, []bus.Message, error) {
-	where := `m.to_session != '' AND m.sender != ? AND ` + waiting + `
+	where := `m.to_session != '' AND m.sender NOT IN (?, ?) AND ` + waiting + `
 		AND m.recipient IN (SELECT name FROM agents WHERE delivery = 'pull')`
-	args := []any{bus.SystemSender, q.Now.UnixMilli()}
+	args := []any{bus.SystemSender, bus.LegacySystemSender, q.Now.UnixMilli()}
 	if q.Lapsed {
 		where += ` AND (s.id IS NULL OR s.ended_at > 0 OR s.last_seen < ?)`
 		args = append(args, q.LiveSince.UnixMilli())
@@ -431,11 +435,6 @@ type withName struct {
 }
 
 func (w withName) Scan(dest ...any) error { return w.r.Scan(append(dest, w.name)...) }
-
-func (s *SQLite) MarkHeld(ctx context.Context, id string, at time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE messages SET held_at = ? WHERE id = ? AND held_at = 0`, at.UnixMilli(), id)
-	return err
-}
 
 func (s *SQLite) CountInbox(ctx context.Context, f bus.ClaimFilter, now time.Time) (int, error) {
 	where, args := inboxWhere(f, now)
