@@ -350,3 +350,58 @@ func TestABridgeThatCantTellItsConversationPushesNothing(t *testing.T) {
 		t.Fatalf("the bridge moved to %s", c.Session())
 	}
 }
+
+// pullUnsureHost is a session without push that can't tell which
+// conversation it serves.
+type pullUnsureHost struct{ unsureHost }
+
+func (pullUnsureHost) Tier() string { return bus.TierPull }
+
+// check_inbox would take messages for the conversation last seen, which may
+// not be the one asking, so it refuses while the host can't tell.
+func TestCheckInboxWaitsWhileTheConversationIsUnknown(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "bus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(st, logger)
+	for _, name := range []string{"claude", "peer"} {
+		if err := st.CreateAgent(ctx, bus.Agent{Name: name, TokenHash: bus.HashToken(name + "-tok"), Delivery: bus.DeliveryPull, CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.ReportSession(ctx, "claude", "old", bus.SessionInput{Name: "review", Tier: bus.TierPull}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := b.Send(ctx, "claude", bus.SendInput{To: "peer", Content: "old question", FromSession: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer, err := b.Send(ctx, "peer", bus.SendInput{InReplyTo: q.ID, Content: "answer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := httptest.NewServer(httpapi.New(b, logger))
+	defer api.Close()
+	c := client.New(api.URL, "claude-tok")
+	c.SetSession("old")
+	h := pullUnsureHost{unsureHost{&refusingHost{pushed: make(chan string, 1)}, make(chan struct{}, 1)}}
+	h.id.Store("old")
+	srv := New(c, "claude", "test", false, log.New(io.Discard, "", 0))
+	srv.host = h
+
+	res, rerr := srv.callTool(ctx, json.RawMessage(`{"name":"check_inbox","arguments":{}}`))
+	if rerr != nil {
+		t.Fatal(rerr.Message)
+	}
+	out, _ := json.Marshal(res)
+	if !bytes.Contains(out, []byte(`"isError":true`)) || !bytes.Contains(out, []byte("can't tell which conversation")) {
+		t.Fatalf("check_inbox = %s", out)
+	}
+	if got, err := st.GetMessage(ctx, answer.ID); err != nil || got.Status != bus.StatusQueued {
+		t.Fatalf("answer: %+v, %v; want queued", got.Status, err)
+	}
+}

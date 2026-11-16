@@ -125,10 +125,11 @@ type claudeHost struct {
 	failingSince time.Time
 }
 
-// registryGrace is how long a remembered registry entry is not enough to show
-// a message. A read cut short by a rewrite fails for a moment; one failing for
-// longer means the registry is unavailable, and the session then goes by the
-// remembered entry, as it goes by the environment when there never was one.
+// registryGrace is how long whole reads of the registry may fail before the
+// session stops counting as push. A read cut short by a rewrite fails for a
+// moment; one failing for longer means the registry can't be read, and then
+// nothing says which conversation the process serves, so messages wait, for
+// check_inbox too, until a whole read does (see conversation).
 const registryGrace = 10 * time.Second
 
 type claudeEntry struct {
@@ -154,7 +155,7 @@ func claudeDir() string {
 // whole entry, if there was one. That keeps the session's identity steady:
 // the environment would name the conversation the process started with. But
 // a remembered entry can't say the conversation hasn't changed since, so sure
-// is false until reads have failed for registryGrace (see conversation).
+// is false then (see conversation).
 func (h *claudeHost) entry() (e claudeEntry, ok, sure bool) {
 	h.once.Do(func() { h.pid = claudeAncestor() })
 	if h.pid == 0 {
@@ -170,15 +171,23 @@ func (h *claudeHost) entry() (e claudeEntry, ok, sure bool) {
 		if h.failingSince.IsZero() {
 			h.failingSince = time.Now()
 		}
-		return *h.last, true, time.Since(h.failingSince) >= registryGrace
+		return *h.last, true, false
 	}
 	h.last, h.failingSince = &e, time.Time{}
 	return e, true, true
 }
 
+// unreadable reports whether whole reads of the registry have failed for
+// longer than registryGrace.
+func (h *claudeHost) unreadable() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return !h.failingSince.IsZero() && time.Since(h.failingSince) >= registryGrace
+}
+
 // conversation is the session's conversation as the registry says right now,
-// or errUnsure while it can't tell (see entry). With no registry entry, it is
-// the conversation in the environment.
+// or errUnsure when only a remembered entry says (see entry). With no
+// registry entry at all, it is the conversation in the environment.
 func (h *claudeHost) conversation() (string, error) {
 	e, ok, sure := h.entry()
 	if !sure {
@@ -239,7 +248,7 @@ func socketOf(e claudeEntry) string {
 }
 
 func (h *claudeHost) Tier() string {
-	if h.noPush || runtime.GOOS == "windows" || h.socket() == "" {
+	if h.noPush || runtime.GOOS == "windows" || h.socket() == "" || h.unreadable() {
 		return bus.TierPull
 	}
 	return bus.TierPush

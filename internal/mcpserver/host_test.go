@@ -327,27 +327,30 @@ func TestClaudeHostDoesntPushOnACutShortRegistryRead(t *testing.T) {
 		t.Fatalf("push for the old conversation: %v", err)
 	}
 
-	// Failing for longer than a rewrite takes, the registry counts as
-	// unavailable, and the remembered entry is what the session goes by, so
-	// messages aren't held for good.
+	// Failing for longer than a rewrite takes, the registry can't be read:
+	// still nothing is pushed, and the session stops counting as push, so
+	// the pump stops taking messages. A whole read brings it back.
 	write(`{"sessionId":"thi`)
-	if _, err := h.conversation(); !errors.Is(err, errUnsure) {
-		t.Fatalf("conversation on a cut-short read: %v", err)
+	if tier := h.Tier(); tier != bus.TierPush {
+		t.Fatalf("tier on a cut-short read = %s", tier)
 	}
 	h.mu.Lock()
 	h.failingSince = time.Now().Add(-registryGrace)
 	h.mu.Unlock()
-	if id, err := h.conversation(); err != nil || id != "third" {
-		t.Fatalf("conversation once the registry is unavailable = %q, %v", id, err)
-	}
-	if err := h.Push(context.Background(), "third", m); err == nil || errors.Is(err, errUnsure) || errors.Is(err, ErrOtherConversation) {
-		t.Fatalf("push once the registry is unavailable: %v; want it to try the socket", err)
-	}
-	// A whole read starts the grace over.
-	write(`{"sessionId":"third","messagingSocketPath":"/nonexistent.sock"}`)
-	h.conversation()
-	write(`{"sessionId":"fou`)
 	if _, err := h.conversation(); !errors.Is(err, errUnsure) {
-		t.Fatalf("conversation on a cut-short read after a whole one: %v", err)
+		t.Fatalf("conversation once the registry can't be read: %v", err)
+	}
+	if err := h.Push(context.Background(), "third", m); !errors.Is(err, errUnsure) {
+		t.Fatalf("push once the registry can't be read: %v", err)
+	}
+	if tier := h.Tier(); tier != bus.TierPull {
+		t.Fatalf("tier once the registry can't be read = %s", tier)
+	}
+	write(`{"sessionId":"third","messagingSocketPath":"/nonexistent.sock"}`)
+	if id, err := h.conversation(); err != nil || id != "third" {
+		t.Fatalf("conversation after a whole read = %q, %v", id, err)
+	}
+	if tier := h.Tier(); tier != bus.TierPush {
+		t.Fatalf("tier after a whole read = %s", tier)
 	}
 }

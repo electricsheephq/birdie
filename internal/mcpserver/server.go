@@ -330,6 +330,7 @@ func (s *Server) endSession() {
 // unless a wait_for_reply call is waiting on that thread. It takes nothing
 // while the session can't be pushed to, so messages stay for check_inbox.
 func (s *Server) pump(ctx context.Context) {
+	unsure := 0 // batches in a row given back because the host couldn't tell
 	for ctx.Err() == nil {
 		if !s.pushing() {
 			pause(ctx, 5*time.Second)
@@ -389,13 +390,21 @@ func (s *Server) pump(ctx context.Context) {
 			}
 			continue
 		}
+		if stop == nil {
+			unsure = 0
+		}
 		switch {
 		case failed:
 			pause(ctx, 5*time.Second)
 		case stop != nil:
 			// Can't tell which conversation: most often a registry read that
 			// met a rewrite, which is over in a moment.
-			pause(ctx, unsureRetry)
+			unsure++
+			if time.Duration(unsure)*unsureRetry < registryGrace {
+				pause(ctx, unsureRetry)
+			} else {
+				pause(ctx, 5*time.Second)
+			}
 		}
 	}
 }
@@ -415,17 +424,23 @@ func (s *Server) check(session string) error {
 	if h == nil {
 		return nil
 	}
-	id := h.Session().ID
-	if c, ok := h.(interface{ conversation() (string, error) }); ok {
-		var err error
-		if id, err = c.conversation(); err != nil {
-			return err
-		}
+	id, err := hostConversation(h)
+	if err != nil {
+		return err
 	}
 	if id != session {
 		return ErrOtherConversation
 	}
 	return nil
+}
+
+// hostConversation is the conversation h serves right now, by a fresh look
+// where h has one, or errUnsure if it can't tell.
+func hostConversation(h Host) (string, error) {
+	if c, ok := h.(interface{ conversation() (string, error) }); ok {
+		return c.conversation()
+	}
+	return h.Session().ID, nil
 }
 
 func pause(ctx context.Context, d time.Duration) {

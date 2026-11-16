@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -124,6 +125,13 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, *rpcEr
 	case "check_inbox":
 		if s.pushing() {
 			return toolText("New messages come to you on their own in this session, so there is nothing to fetch.", false), nil
+		}
+		if h := s.currentHost(); h != nil {
+			if _, err := hostConversation(h); errors.Is(err, errUnsure) {
+				// Taking messages for the conversation last seen could show
+				// another conversation's here.
+				return toolText("Birdie can't tell which conversation this is right now (it can't read Claude Code's session registry), so messages wait until it can. Try again shortly.", true), nil
+			}
 		}
 		var msgs []bus.Message
 		msgs, err = s.c.Inbox(ctx, "", seconds(a.WaitSeconds, 0, bus.MaxWait))
