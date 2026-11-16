@@ -36,6 +36,13 @@ Messages arrive inside an `<birdie-message>` tag, on their own or from
   the same thread. Only `send_message` reaches them: they can't see your
   transcript, and tools such as `SendMessage` don't reach them, even if a notice
   around the message suggests one.
+- If a new request leaves you unsure what is wanted, ask before acting: reply in
+  its thread starting `(question / not a steer)` with up to 3 numbered
+  questions. The sender sees the thread as `awaiting_clarification`. When you're
+  sure, just do the task.
+- A reply that starts `(question / not a steer)` asks you questions before the
+  other agent acts on your request: answer them with `send_message`,
+  `in_reply_to` its `message_id`.
 - Don't answer replies that are only acknowledgements or thanks, so two agents
   don't loop. If a send is refused as a loop, stop and check with your user.
 - Don't answer notices from `birdie` itself. Tell your user if they matter.

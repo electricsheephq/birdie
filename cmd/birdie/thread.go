@@ -71,6 +71,13 @@ func printThread(w io.Writer, agents []bus.Agent, msgs []store.Tracked, full boo
 		names[i] = labels.agent(name)
 	}
 	fmt.Fprintf(w, "Thread %s: %d %s between %s.\n", printable(msgs[0].ThreadID, false), len(msgs), plural(len(msgs), "message", "messages"), joinAnd(names))
+	plain := make([]bus.Message, len(msgs))
+	for i, m := range msgs {
+		plain[i] = m.Message
+	}
+	if bus.ThreadStatus(plain) == bus.ThreadAwaitingClarification {
+		fmt.Fprintf(w, "Awaiting clarification: the latest reply asks questions before acting (%s).\n", bus.ClarifyMarker)
+	}
 	cut := false
 	for _, m := range msgs {
 		fmt.Fprintf(w, "\n── %s  %s  %s → %s\n", m.ID, m.CreatedAt.Local().Format(time.DateTime), labels.of(m.From, m.FromSession), labels.of(m.To, m.ToSession))

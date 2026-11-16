@@ -157,11 +157,19 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 			}
 			return toolText(note, false), nil
 		}
-		out = map[string]any{"messages": msgs}
+		reply := map[string]any{"messages": msgs}
+		if status := bus.ThreadStatus(msgs); status != "" {
+			reply["thread_status"] = status // it asks you questions before acting
+		}
+		out = reply
 	case "get_thread":
 		var msgs []bus.Message
 		msgs, err = s.c.Thread(ctx, a.ThreadID)
-		out = map[string]any{"messages": msgs}
+		thread := map[string]any{"messages": msgs}
+		if status := bus.ThreadStatus(msgs); status != "" {
+			thread["status"] = status
+		}
+		out = thread
 	case "list_agents":
 		var agents []bus.Agent
 		agents, err = s.c.Agents(ctx)

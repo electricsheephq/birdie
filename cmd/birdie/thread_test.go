@@ -49,9 +49,25 @@ func TestPrintThread(t *testing.T) {
 			t.Errorf("missing %q in:\n%s", want, text)
 		}
 	}
+	if strings.Contains(text, "Awaiting clarification") {
+		t.Errorf("an answered thread isn't awaiting clarification:\n%s", text)
+	}
 	out.Reset()
 	printThread(&out, agents, msgs, true, time.Now())
 	if strings.Contains(out.String(), "--full") || !strings.Contains(out.String(), strings.Repeat("long ", 199)) {
 		t.Errorf("--full should show everything:\n%s", out.String())
+	}
+
+	// A reply asking questions first leaves the thread awaiting clarification.
+	if _, err := b.Send(ctx, "claude", bus.SendInput{InReplyTo: q.ID, Content: bus.ClarifyMarker + "\n1. Which file?", FromSession: "s-api"}); err != nil {
+		t.Fatal(err)
+	}
+	if msgs, err = st.TrackThread(ctx, q.ThreadID); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	printThread(&out, agents, msgs, false, time.Now())
+	if !strings.Contains(out.String(), "Awaiting clarification") {
+		t.Errorf("missing the clarification status in:\n%s", out.String())
 	}
 }

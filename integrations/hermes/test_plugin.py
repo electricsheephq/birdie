@@ -343,6 +343,32 @@ class PluginTest(unittest.TestCase):
         peer("POST", "/v1/messages", {"in_reply_to": peer_inbox(5)[0]["id"], "content": "a"})
         self.assertIn("is answering", self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 5}))
 
+    def test_a_new_request_says_how_to_ask_first_and_a_question_says_it_asks(self):
+        new = plugin.frame({"from": "peer", "id": "m1", "thread_id": "t1", "content": "tidy the repo"})
+        self.assertIn(f'ask first: reply starting "{plugin.CLARIFY}"', new)
+        reply = {"from": "peer", "id": "m2", "thread_id": "t1", "in_reply_to": "m1", "content": "done"}
+        self.assertNotIn(plugin.CLARIFY, plugin.frame(reply))
+        reply["content"] = "  (Question / not a steer)\n1. Which repo?"
+        self.assertIn("asks you these questions before it acts", plugin.frame(reply))
+        del reply["in_reply_to"]
+        self.assertNotIn("asks you these questions", plugin.frame(reply))
+
+    def test_a_reply_asking_first_leaves_the_thread_awaiting_clarification(self):
+        ctx, _ = self.load()
+        self.turn(ctx)
+        sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "tidy the repo"}))
+        thread = sent["thread_id"]
+        asked = peer("POST", "/v1/messages", {"in_reply_to": peer_inbox(5)[0]["id"],
+                                              "content": plugin.CLARIFY + "\n1. Which repo?"})
+        waited = self.call(ctx, "birdie_wait_for_reply", {"thread_id": thread, "timeout_seconds": 5})
+        self.assertIn("asks you these questions before it acts", waited)
+        self.assertIn("awaiting_clarification", waited)
+        self.assertIn("awaiting_clarification", self.call(ctx, "birdie_get_thread", {"thread_id": thread}))
+        answered = json.loads(self.call(ctx, "birdie_send_message",
+                                        {"in_reply_to": asked.get("message_id") or asked["id"], "content": "1. birdie"}))
+        self.assertEqual(answered["thread_id"], thread)
+        self.assertNotIn("awaiting_clarification", self.call(ctx, "birdie_get_thread", {"thread_id": thread}))
+
     def test_wait_for_reply_with_wake_gets_it_once(self):
         self.write_config(True)
         ctx, _ = self.load()
