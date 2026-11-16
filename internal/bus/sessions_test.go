@@ -822,6 +822,7 @@ func TestAnAddressReachesOnlyItsSession(t *testing.T) {
 func TestAnOldIdIsNotTakenForAName(t *testing.T) {
 	ctx := context.Background()
 	b, st := newBus(t)
+	b.QuietFor = -1 // a bus that has been running a while (see TestAWholeIdIsntRefusedJustAfterARestart)
 	addAgent(t, st, "bot", nil)
 	addAgent(t, st, "claude", nil)
 	old := time.Now().Add(-48 * time.Hour)

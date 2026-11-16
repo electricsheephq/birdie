@@ -144,10 +144,9 @@ func (b *Bus) findSession(ctx context.Context, to Agent, addr Address) (Session,
 		if addr.ID != "" && s.Name != addr.Session {
 			return fail(RecipientNotFound, fmt.Sprintf("%s has no session %s: %s is the id of %s", to.DisplayName(), addr, addr.ID, addressOf(to, s)))
 		}
-		// Just after birdie starts or the machine wakes, sessions haven't
-		// reported yet. One that didn't say it closed may still be open, and
-		// a whole id can only mean it; if it has gone, the message is held.
-		if s.Live(now) || (s.EndedAt.IsZero() && b.quiet(now)) {
+		// A whole id can only mean this session, so one that may still be
+		// open gets it; if it has gone, the message is held.
+		if s.Live(now) || b.mayStillRun(ctx, s, now) {
 			return s, nil, nil
 		}
 		return ended(s)
@@ -188,6 +187,20 @@ func (b *Bus) findSession(ctx context.Context, to Agent, addr Address) (Session,
 		}
 	}
 	return fail(RecipientNotFound, fmt.Sprintf("%s has no running session %s", to.DisplayName(), addr))
+}
+
+// mayStillRun reports whether s, silent but never closed, may still be open
+// because birdie has only just started or woken and s hasn't reported yet: it
+// was running when birdie last heard from any session before that.
+func (b *Bus) mayStillRun(ctx context.Context, s Session, now time.Time) bool {
+	if !s.EndedAt.IsZero() || !b.quiet(now) {
+		return false
+	}
+	heard, err := b.store.LastSeenBefore(ctx, time.UnixMilli(b.listening.Load()))
+	if err != nil || heard.IsZero() {
+		return false
+	}
+	return !s.LastSeen.Before(heard.Add(-SessionTTL))
 }
 
 // othersNote tells the sender that name reached one of several sessions.

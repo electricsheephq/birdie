@@ -30,6 +30,11 @@ func TestAWholeIdIsntRefusedJustAfterARestart(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// gone was silent long before birdie stopped, while s1 still reported.
+	gone := stale.Add(-48 * time.Hour)
+	if err := st.UpsertSession(ctx, bus.Session{Agent: "claude", ID: "gone", Name: "old", Tier: bus.TierPush, ActiveAt: gone, LastSeen: gone}); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.EndSession(ctx, "claude", "closed", stale); err != nil {
 		t.Fatal(err)
 	}
@@ -43,6 +48,9 @@ func TestAWholeIdIsntRefusedJustAfterARestart(t *testing.T) {
 	}
 	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/closed", Content: "hi"}); !isAddressError(err, bus.RecipientSessionEnded) {
 		t.Fatalf("a session that said it closed: %v", err)
+	}
+	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/gone", Content: "hi"}); !isAddressError(err, bus.RecipientSessionEnded) {
+		t.Fatalf("a session gone before birdie stopped: %v", err)
 	}
 	time.Sleep(400 * time.Millisecond)
 	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/s1", Content: "hi"}); !isAddressError(err, bus.RecipientSessionEnded) {

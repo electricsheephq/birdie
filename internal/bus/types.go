@@ -296,6 +296,9 @@ type Store interface {
 	// MoveSession points everything that names agent's session from at the
 	// session to instead.
 	MoveSession(ctx context.Context, agent, from, to string) error
+	// LastSeenBefore is when birdie last heard from any session before t;
+	// zero if never.
+	LastSeenBefore(ctx context.Context, t time.Time) (time.Time, error)
 	// LiveSessions returns the agent's running sessions: seen since a time,
 	// and not closed.
 	LiveSessions(ctx context.Context, agent string, since time.Time) ([]Session, error)
