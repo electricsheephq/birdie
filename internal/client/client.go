@@ -26,6 +26,9 @@ type Client struct {
 	BaseURL string
 	Token   string
 	HTTP    *http.Client
+	// Leased claims messages under a lease even without a session, so each
+	// must be confirmed with Ack or given back with Nack. Set it before use.
+	Leased bool
 
 	mu      sync.RWMutex
 	session string
@@ -131,8 +134,11 @@ func (c *Client) Inbox(ctx context.Context, threadID string, wait time.Duration)
 	if threadID != "" {
 		q.Set("thread_id", threadID)
 	}
-	if id := c.Session(); id != "" {
+	id := c.Session()
+	if id != "" {
 		q.Set("session", id)
+	}
+	if id != "" || c.Leased {
 		q.Set("lease", strconv.FormatFloat(Lease.Seconds(), 'f', -1, 64))
 	}
 	var out struct{ Messages []bus.Message }
