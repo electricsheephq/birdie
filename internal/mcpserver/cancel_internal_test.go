@@ -104,6 +104,19 @@ func TestACallCancelledBeforeItsAnswerIsWrittenGivesBackWhatItTook(t *testing.T)
 	if got := status(t, st, m.ID); got != bus.StatusQueued {
 		t.Fatalf("status %s, want queued", got)
 	}
+	if srv.wasPushed(m.ID) {
+		t.Fatal("a message nobody saw counts as shown")
+	}
+}
+
+// What a call returned counts as shown, so if its confirmation is lost it
+// isn't pushed again when it comes back.
+func TestWhatACallReturnedIsntPushedAgain(t *testing.T) {
+	srv, _, m, _ := bridge(t)
+	srv.handle(context.Background(), checkInbox)
+	if !srv.wasPushed(m.ID) {
+		t.Fatal("a message a call returned can be pushed again")
+	}
 }
 
 // What the pump already showed and confirmed is returned to a wait, but not
