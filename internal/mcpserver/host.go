@@ -293,7 +293,7 @@ func (h *claudeHost) Push(ctx context.Context, session string, m bus.Message) er
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	frame, err := json.Marshal(map[string]any{
 		"type":    "user",
-		"message": map[string]string{"role": "user", "content": pushText(m)},
+		"message": map[string]string{"role": "user", "content": PushText(m)},
 	})
 	if err != nil {
 		return err
@@ -325,8 +325,8 @@ func claudeAncestor() int {
 // after it), floods the conversation, and doesn't fit on a command line.
 const maxPushBytes = 100 << 10
 
-// pushText is what a push puts into a conversation for m.
-func pushText(m bus.Message) string {
+// PushText is what a push puts into a conversation for m.
+func PushText(m bus.Message) string {
 	text := MessageText(m)
 	if len(text) > maxPushBytes {
 		return fmt.Sprintf("<birdie-message from=%q message_id=%q thread_id=%q>\nThis message is too long to show here (%d bytes). Read it with the birdie get_thread tool, and answer with send_message, in_reply_to %q.\n</birdie-message>", m.From, m.ID, m.ThreadID, len(m.Content), m.ID)
@@ -377,7 +377,7 @@ func (h *codexHost) Push(ctx context.Context, session string, m bus.Message) err
 	if thread == "" || thread != session {
 		return ErrOtherConversation
 	}
-	text := pushText(m)
+	text := PushText(m)
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "codex", "queue", "--thread", thread, "--message", text)

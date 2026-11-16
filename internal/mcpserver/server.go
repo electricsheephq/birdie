@@ -458,7 +458,7 @@ func (s *Server) show(ctx context.Context, session string, m bus.Message) error 
 	b, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"method":  "notifications/claude/channel",
-		"params":  map[string]any{"content": pushText(m), "meta": channelMeta(m)},
+		"params":  map[string]any{"content": PushText(m), "meta": channelMeta(m)},
 	})
 	if err != nil {
 		return err
