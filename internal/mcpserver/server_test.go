@@ -93,7 +93,7 @@ func setup(t *testing.T, channel bool) (*session, *client.Client) {
 	}
 	t.Cleanup(func() { st.Close() })
 	for _, n := range []string{"claude", "cursor"} {
-		st.CreateAgent(context.Background(), bus.Agent{Name: n, TokenHash: bus.HashToken(n + "-tok"), Delivery: bus.DeliveryPull, CreatedAt: time.Now()})
+		st.CreateAgent(context.Background(), bus.Agent{Name: n, TokenHash: bus.HashToken(n + "-tok"), Delivery: bus.DeliveryPull, CreatedAt: time.Now(), Config: picksSession})
 	}
 	b := bus.New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	api := httptest.NewServer(httpapi.New(b, slog.New(slog.NewTextHandler(io.Discard, nil))))
@@ -190,6 +190,10 @@ func (h *fakeHost) Push(_ context.Context, m bus.Message) error {
 	return nil
 }
 
+// picksSession has an agent pick one of its sessions for a message
+// addressed to it alone, so tests can send to "claude" (see bus.PicksSession).
+var picksSession = map[string]string{"fallback": "on"}
+
 func setupHost(t *testing.T, h *fakeHost) (*session, *client.Client, *store.SQLite) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "bus.db"))
@@ -198,7 +202,7 @@ func setupHost(t *testing.T, h *fakeHost) (*session, *client.Client, *store.SQLi
 	}
 	t.Cleanup(func() { st.Close() })
 	for _, n := range []string{"claude", "cursor"} {
-		st.CreateAgent(context.Background(), bus.Agent{Name: n, TokenHash: bus.HashToken(n + "-tok"), Delivery: bus.DeliveryPull, CreatedAt: time.Now()})
+		st.CreateAgent(context.Background(), bus.Agent{Name: n, TokenHash: bus.HashToken(n + "-tok"), Delivery: bus.DeliveryPull, CreatedAt: time.Now(), Config: picksSession})
 	}
 	b := bus.New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	api := httptest.NewServer(httpapi.New(b, slog.New(slog.NewTextHandler(io.Discard, nil))))
@@ -323,5 +327,38 @@ func TestPullHostGetsUnreadNotice(t *testing.T) {
 	case m := <-h.pushed:
 		t.Fatalf("a pull host was pushed %+v", m)
 	default:
+	}
+}
+
+// A sender that addresses claude alone hears, over the API, why it was
+// refused and which sessions it can address instead; one it addresses by
+// name and id gets it.
+func TestSenderLearnsWhichSessionsToAddress(t *testing.T) {
+	h := &fakeHost{tier: bus.TierPush, pushed: make(chan bus.Message, 4)}
+	_, cursor, st := setupHost(t, h)
+	waitFor(t, "the session to register", sessionLive(cursor))
+	if err := st.SetAgentConfig(context.Background(), "claude", "fallback", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := cursor.Send(context.Background(), bus.SendInput{To: "claude", Content: "hello"})
+	var e *client.APIError
+	if !errors.As(err, &e) || e.Status != 400 || e.Code != bus.SessionRequired {
+		t.Fatalf("err = %v", err)
+	}
+	if len(e.Sessions) != 1 || e.Sessions[0].Address != "claude/api#sess-1" || !strings.Contains(e.Message, "claude/api#sess-1") {
+		t.Fatalf("sessions = %+v, message %q", e.Sessions, e.Message)
+	}
+	m, err := cursor.Send(context.Background(), bus.SendInput{To: e.Sessions[0].Address, Content: "hello"})
+	if err != nil || m.ToSession != "sess-1" {
+		t.Fatalf("m = %+v, %v", m, err)
+	}
+	select {
+	case got := <-h.pushed:
+		if got.ID != m.ID {
+			t.Fatalf("pushed %s", got.ID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("message never pushed")
 	}
 }

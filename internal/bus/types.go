@@ -120,7 +120,10 @@ type Session struct {
 	Agent string `json:"agent"`
 	// Name is how other agents address it: agent/name.
 	Name string `json:"name,omitempty"`
-	Cwd  string `json:"cwd,omitempty"`
+	// Address reaches only this session, as agent/name#id or agent/id. It is
+	// set on lists of an agent's sessions, not stored.
+	Address string `json:"address,omitempty"`
+	Cwd     string `json:"cwd,omitempty"`
 	// Branch is the git branch checked out in Cwd, or the commit when no
 	// branch is.
 	Branch string `json:"branch,omitempty"`
@@ -179,6 +182,10 @@ type Message struct {
 	// Note says when the recipient will see the message. Only set on the
 	// result of a send.
 	Note string `json:"note,omitempty"`
+	// OtherSessions, on the result of a send to a name several running
+	// sessions share, lists the ones that didn't get it, so the sender can
+	// address one of them instead.
+	OtherSessions []SessionRef `json:"other_sessions,omitempty"`
 
 	Attempts int `json:"-"`
 }

@@ -12,6 +12,9 @@ import (
 
 // sessionAddress is how other agents reach a session.
 func sessionAddress(s bus.Session) string {
+	if s.Address != "" {
+		return s.Address
+	}
 	if s.Name != "" {
 		return s.Agent + "/" + s.Name
 	}

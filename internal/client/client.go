@@ -54,6 +54,10 @@ func New(baseURL, token string) *Client {
 type APIError struct {
 	Status  int
 	Message string
+	// Code, for a recipient that names no running session, says why (see
+	// bus.AddressError), and Sessions lists the running ones.
+	Code     string
+	Sessions []bus.SessionRef
 }
 
 func (e *APIError) Error() string { return fmt.Sprintf("%s (HTTP %d)", e.Message, e.Status) }
@@ -84,12 +88,16 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		var e struct{ Error string }
+		var e struct {
+			Error    string
+			Code     string
+			Sessions []bus.SessionRef
+		}
 		json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&e)
 		if e.Error == "" {
 			e.Error = resp.Status
 		}
-		return &APIError{Status: resp.StatusCode, Message: e.Error}
+		return &APIError{Status: resp.StatusCode, Message: e.Error, Code: e.Code, Sessions: e.Sessions}
 	}
 	if out == nil {
 		return nil

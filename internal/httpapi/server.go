@@ -184,7 +184,13 @@ func (s *server) fail(w http.ResponseWriter, err error) {
 		s.log.Error("request failed", "err", err)
 		msg = "internal error"
 	}
-	writeJSON(w, status, map[string]string{"error": msg})
+	body := map[string]any{"error": msg}
+	if e, ok := bus.AsAddressError(err); ok {
+		// A recipient that names no running session: say why, and which
+		// sessions are running, so the sender can address one.
+		body["code"], body["sessions"] = e.Code, e.Live
+	}
+	writeJSON(w, status, body)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

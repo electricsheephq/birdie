@@ -533,7 +533,7 @@ TOOLS = (
      "Message another AI agent or bot on this machine (for example Grok Bot, Claude or Codex): ask it something, "
      "hand it a task, or answer it. Returns message_id, thread_id and a note on when the recipient will see it. "
      "To answer a message, set in_reply_to to its message_id; to can then be left out.",
-     {"to": text("Recipient from birdie_list_agents, or agent/session for one running session."),
+     {"to": text("Recipient from birdie_list_agents, or one running session by its address from birdie_list_agents (agent/name#id, or agent/name when only one session has it). Claude sessions must be addressed one by one."),
       "content": text("The message. For requests, make it self-contained: the recipient has none of your context."),
       "in_reply_to": text("message_id being answered; the reply joins that thread."),
       "thread_id": text("Continue an existing thread without replying to a specific message."),

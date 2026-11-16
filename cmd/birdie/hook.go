@@ -90,9 +90,9 @@ func grokHookOutput(event, text string) (string, error) {
 }
 
 // sessionCmd looks at running sessions and chooses which takes new conversations.
-func sessionCmd(ctx context.Context, b *bus.Bus, setDefault func(agent, name string) error, args []string) error {
+func sessionCmd(ctx context.Context, b *bus.Bus, setDefault func(agent, name string) error, setFallback func(agent, value string) error, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: birdie session list [--all] | default AGENT [NAME]")
+		return errors.New("usage: birdie session list [--all] | default AGENT [NAME] | fallback AGENT [on|off]")
 	}
 	switch args[0] {
 	case "list":
@@ -115,6 +115,15 @@ func sessionCmd(ctx context.Context, b *bus.Bus, setDefault func(agent, name str
 			name = args[2]
 		}
 		return setDefault(args[1], name)
+	case "fallback":
+		if len(args) < 2 || len(args) > 3 || (len(args) == 3 && args[2] != "on" && args[2] != "off") {
+			return errors.New("usage: birdie session fallback AGENT [on|off] (on: a message addressed to AGENT alone goes to its most recently active session; off: it needs a session's address unless you chose a default; neither goes back to the agent's usual)")
+		}
+		value := ""
+		if len(args) == 3 {
+			value = args[2]
+		}
+		return setFallback(args[1], value)
 	}
 	return fmt.Errorf("unknown session subcommand %q", args[0])
 }

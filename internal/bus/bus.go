@@ -123,8 +123,11 @@ func (b *Bus) Sessions(ctx context.Context, a Agent) ([]Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	if d := defaultSession(live, a.Config["default_session"]); d != nil {
+	if d := defaultSession(live, a); d != nil {
 		d.Default = true
+	}
+	for i := range live {
+		live[i].Address = addressOf(a, live[i])
 	}
 	return live, nil
 }
@@ -145,22 +148,32 @@ func (b *Bus) RecentSessions(ctx context.Context, a Agent) ([]Session, error) {
 			stopped = append(stopped, s)
 		}
 	}
-	if d := defaultSession(live, a.Config["default_session"]); d != nil {
+	if d := defaultSession(live, a); d != nil {
 		d.Default = true
 	}
 	slices.SortStableFunc(stopped, func(x, y Session) int { return y.StoppedAt().Compare(x.StoppedAt()) })
-	return append(live, stopped...), nil
+	all = append(live, stopped...)
+	for i := range all {
+		all[i].Address = addressOf(a, all[i])
+	}
+	return all, nil
 }
 
-// defaultSession picks the session that takes new conversations: the one with
-// the name the user chose, else the one that can see messages soonest, most
-// recently active first. It returns nil if there are none.
-func defaultSession(live []Session, chosen string) *Session {
+// defaultSession picks the session of a that takes new conversations: the
+// one with the name the user chose, else, if the agent picks one itself (see
+// PicksSession), the one that can see messages soonest, most recently active
+// first. It returns nil if there are none.
+func defaultSession(live []Session, a Agent) *Session {
+	chosen := a.Config["default_session"]
+	auto := PicksSession(a)
 	var best *Session
 	for i := range live {
 		s := &live[i]
 		if chosen != "" && s.Name == chosen {
 			return s
+		}
+		if !auto {
+			continue
 		}
 		if best == nil || tierRank(s.Tier) > tierRank(best.Tier) ||
 			(tierRank(s.Tier) == tierRank(best.Tier) && s.ActiveAt.After(best.ActiveAt)) {
@@ -168,6 +181,27 @@ func defaultSession(live []Session, chosen string) *Session {
 		}
 	}
 	return best
+}
+
+// noAutoDefault lists agents that, unless told otherwise, don't pick a session
+// for a message addressed to the agent alone. Their sessions are unrelated
+// conversations, often many at once, and a message landing in the wrong one
+// interrupts it and costs it context.
+var noAutoDefault = map[string]bool{"claude": true}
+
+// PicksSession reports whether a message addressed to agent a alone, not to
+// one of its sessions, may go to the session a picks itself: the most
+// recently active one. Config["fallback"] "on" or "off" says; the default is
+// on, except for the agents in noAutoDefault. A session the user chose with
+// `birdie session default` takes such messages either way.
+func PicksSession(a Agent) bool {
+	switch a.Config["fallback"] {
+	case "on":
+		return true
+	case "off":
+		return false
+	}
+	return !noAutoDefault[a.Name]
 }
 
 func tierRank(tier string) int {
@@ -303,15 +337,21 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		return Message{}, err
 	}
 	toSession := pinned
+	var others []SessionRef
 	if addr.Session != "" {
-		s, err := b.findSession(ctx, to, addr.Session)
+		s, more, err := b.findSession(ctx, to, addr)
 		if err != nil {
 			return Message{}, err
 		}
-		toSession = s.ID
+		toSession, others = s.ID, more
 	} else if in.InReplyTo == "" && thread != "" {
 		// A follow-up in a thread goes where an answer would.
 		if toSession, err = b.store.ThreadSession(ctx, thread, from, to.Name); err != nil {
+			return Message{}, err
+		}
+	}
+	if toSession == "" && to.Delivery == DeliveryPull && !PicksSession(to) {
+		if err := b.needsDefault(ctx, to); err != nil {
 			return Message{}, err
 		}
 	}
@@ -345,6 +385,10 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		}
 	}
 	m.Note = b.deliveryNote(ctx, to, m)
+	if len(others) > 0 {
+		m.OtherSessions = others
+		m.Note += "; " + othersNote(to, addr.Session, others)
+	}
 	if to.Delivery == DeliveryPull {
 		b.notify(to.Name)
 	} else {
@@ -439,7 +483,7 @@ func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput) (ClaimFilter, er
 	if err != nil {
 		return f, err
 	}
-	d := defaultSession(live, a.Config["default_session"])
+	d := defaultSession(live, a)
 	f.Unpinned = d != nil && d.ID == in.Session
 	return f, nil
 }
@@ -526,33 +570,6 @@ func (b *Bus) admit(ctx context.Context, from, to string) error {
 			ErrLoop, from, to, n, LoopWindow)
 	}
 	return nil
-}
-
-func (b *Bus) findSession(ctx context.Context, to Agent, want string) (Session, error) {
-	live, err := b.store.LiveSessions(ctx, to.Name, time.Now().Add(-SessionTTL))
-	if err != nil {
-		return Session{}, err
-	}
-	var match []Session
-	for _, s := range live {
-		if s.ID == want {
-			return s, nil
-		}
-		if s.Name == want {
-			match = append(match, s)
-		}
-	}
-	switch len(match) {
-	case 1:
-		return match[0], nil
-	case 0:
-		return Session{}, fmt.Errorf("%w: %s has no running session %q", ErrNotFound, to.Name, want)
-	}
-	ids := make([]string, len(match))
-	for i, s := range match {
-		ids[i] = to.Name + "/" + s.ID
-	}
-	return Session{}, fmt.Errorf("%w: %s has %d sessions named %q; use one of %s", ErrInvalid, to.Name, len(match), want, strings.Join(ids, ", "))
 }
 
 // deliveryNote tells the sender when the recipient will see m, naming it by
