@@ -398,9 +398,13 @@ func (s *SQLite) SettleHeld(ctx context.Context, q bus.HoldQuery, build func([]b
 		session = `m.to_session != '' AND (s.id IS NULL OR s.ended_at > 0 OR s.last_seen < ?)`
 		args = append(args, q.LiveSince.UnixMilli())
 		if len(q.Unrouted) > 0 {
-			// Before sessions were required, bare mail could be queued with no
-			// session able to take it. Give its sender the same hold deadline.
-			session = `(` + session + `) OR (m.to_session = '' AND m.recipient IN (?` + strings.Repeat(", ?", len(q.Unrouted)-1) + `))`
+			// Before sessions were required, a new conversation could be
+			// queued for the agent alone, and no session takes it now. Mail
+			// in a thread the recipient spoke in is left alone: it answers
+			// or follows up what the recipient said outside a session, and
+			// whoever waits on that thread takes it (see Bus.Send).
+			session = `(` + session + `) OR (m.to_session = '' AND m.recipient IN (?` + strings.Repeat(", ?", len(q.Unrouted)-1) + `)
+				AND NOT EXISTS (SELECT 1 FROM messages p WHERE p.thread_id = m.thread_id AND p.seq < m.seq AND p.sender = m.recipient))`
 			for _, agent := range q.Unrouted {
 				args = append(args, agent)
 			}
@@ -408,8 +412,12 @@ func (s *SQLite) SettleHeld(ctx context.Context, q bus.HoldQuery, build func([]b
 	}
 	where += ` AND (` + session + `)`
 	if q.Expire {
-		where += ` AND MAX(m.created_at, COALESCE(CASE WHEN s.ended_at > 0 THEN s.ended_at ELSE s.last_seen END, 0)) < ?`
-		args = append(args, q.Before.UnixMilli())
+		// Mail for no session counts from when its sender was told it is
+		// held, so it never expires untold, and an upgrade leaves time to
+		// choose a default before mail sent long ago expires.
+		where += ` AND CASE WHEN m.to_session = '' THEN m.held_at > 0 AND m.held_at < ?
+			ELSE MAX(m.created_at, COALESCE(CASE WHEN s.ended_at > 0 THEN s.ended_at ELSE s.last_seen END, 0)) < ? END`
+		args = append(args, q.Before.UnixMilli(), q.Before.UnixMilli())
 	} else {
 		where += ` AND m.held_at = 0`
 	}

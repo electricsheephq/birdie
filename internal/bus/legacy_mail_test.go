@@ -2,6 +2,7 @@ package bus_test
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -9,7 +10,12 @@ import (
 	"birdie/internal/bus"
 )
 
-func TestLegacyBareMailExpiresOrReachesTheChosenSession(t *testing.T) {
+// Mail queued for claude alone before sessions were required: no session
+// takes it unless the user picks a default or turns fallback on. Its sender
+// is told it is held, and it expires only after the hold time counted from
+// then. An answer to what claude asked outside a session isn't such mail: it
+// waits on its thread, as before.
+func TestLegacyBareMailIsHeldThenExpiresOrReachesTheChosenSession(t *testing.T) {
 	for _, choice := range []string{"none", "default", "fallback"} {
 		t.Run(choice, func(t *testing.T) {
 			ctx := context.Background()
@@ -27,25 +33,41 @@ func TestLegacyBareMailExpiresOrReachesTheChosenSession(t *testing.T) {
 			} else if choice == "fallback" {
 				picksSession(t, st, "claude")
 			}
-			// Insert directly because new bare sends already require a session.
-			for _, id := range []string{"old", "recent"} {
-				created := time.Now()
-				if id == "old" {
-					created = created.Add(-2 * time.Hour)
+			now := time.Now()
+			// Inserted directly, because new bare sends already require a
+			// session. Held sets held_at to the creation time.
+			for _, m := range []bus.Message{
+				// Told it is held longer ago than the hold time: expires.
+				{ID: "told", CreatedAt: now.Add(-2 * time.Hour), Held: "held"},
+				// Sent as long ago, but never told: held now, not expired,
+				// so an upgrade leaves time to choose a default.
+				{ID: "untold", CreatedAt: now.Add(-2 * time.Hour)},
+				// Told recently: neither told again nor expired yet.
+				{ID: "fresh", CreatedAt: now.Add(-10 * time.Minute), Held: "held"},
+			} {
+				m.ThreadID, m.From, m.FromSession, m.To = "legacy", "bot", "sender", "claude"
+				m.Content, m.Status = "before the upgrade", bus.StatusQueued
+				if err := st.InsertMessage(ctx, m); err != nil {
+					t.Fatal(err)
 				}
-				if err := st.InsertMessage(ctx, bus.Message{
-					ID: id, ThreadID: "legacy", From: "bot", FromSession: "sender",
-					To: "claude", Content: "before the upgrade", Status: bus.StatusQueued, CreatedAt: created,
-				}); err != nil {
+			}
+			// claude asked outside a session, long ago; the answer waits for
+			// whoever waits on that thread, however old it is.
+			for _, m := range []bus.Message{
+				{ID: "asked", From: "claude", To: "bot", Status: bus.StatusDelivered, CreatedAt: now.Add(-3 * time.Hour)},
+				{ID: "answer", InReplyTo: "asked", From: "bot", FromSession: "sender", To: "claude", Status: bus.StatusQueued, CreatedAt: now.Add(-2 * time.Hour)},
+			} {
+				m.ThreadID, m.Content = "asked", "a question and its answer"
+				if err := st.InsertMessage(ctx, m); err != nil {
 					t.Fatal(err)
 				}
 			}
 			b.HoldFor, b.QuietFor = time.Hour, -1
-			// Its expiry notice proves the sweep ran before a chosen session
-			// takes the legacy mail, so delivery cannot hide an expiry bug.
+			// Its expiry notice proves the expiry pass ran before any session
+			// takes the legacy mail, so delivery can't hide an expiry bug.
 			if err := st.InsertMessage(ctx, bus.Message{
 				ID: "sweep", ThreadID: "sweep", From: "bot", To: "claude", ToSession: "gone",
-				Content: "for a stopped session", Status: bus.StatusQueued, CreatedAt: time.Now().Add(-2 * time.Hour),
+				Content: "for a stopped session", Status: bus.StatusQueued, CreatedAt: now.Add(-2 * time.Hour),
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -71,28 +93,44 @@ func TestLegacyBareMailExpiresOrReachesTheChosenSession(t *testing.T) {
 					}
 					for _, n := range got {
 						kind := n.Meta["notice"]
-						wantID := "recent"
-						if kind == "expired" {
-							wantID = "old"
-						}
-						if (kind != "held" && kind != "expired") || seen[kind] || n.From != bus.SystemSender || n.ToSession != "sender" || n.InReplyTo != wantID || n.Meta["messages"] != wantID || !strings.Contains(n.Content, bus.SessionRequired) || !strings.Contains(n.Content, "birdie session default") {
+						wantID := map[string]string{"expired": "told", "held": "untold"}[kind]
+						if wantID == "" || seen[kind] || n.From != bus.SystemSender || n.ToSession != "sender" || n.InReplyTo != wantID || n.Meta["messages"] != wantID || !strings.Contains(n.Content, bus.SessionRequired) || !strings.Contains(n.Content, "birdie session default") {
 							t.Fatalf("legacy notice: %+v", n)
 						}
 						seen[kind] = true
 					}
 				}
-				for id, want := range map[string]string{"old": bus.StatusExpired, "recent": bus.StatusQueued} {
+				// The held notice for "untold" came from the same pass that
+				// decided on every other message, so nothing more is coming.
+				for _, thread := range []string{"legacy", "asked"} {
+					if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: thread}); err != nil || len(got) != 0 {
+						t.Fatalf("extra notices on %s: %+v, %v", thread, got, err)
+					}
+				}
+				for id, want := range map[string]string{"told": bus.StatusExpired, "untold": bus.StatusQueued, "fresh": bus.StatusQueued, "answer": bus.StatusQueued} {
 					if m, err := st.GetMessage(ctx, id); err != nil || m.Status != want {
 						t.Fatalf("%s status = %s, err %v; want %s", id, m.Status, err, want)
 					}
 				}
+				got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s1", Thread: "asked"})
+				if err != nil || len(got) != 1 || got[0].ID != "answer" {
+					t.Fatalf("waiting on the thread claude asked in: %+v, %v", got, err)
+				}
 				return
 			}
-			if got := take(t, b, "claude", "s1"); len(got) != 2 {
-				t.Fatalf("chosen session took %+v; want both legacy messages", got)
+			got := take(t, b, "claude", "s1")
+			var ids []string
+			for _, m := range got {
+				ids = append(ids, m.ID)
 			}
-			if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: "legacy"}); err != nil || len(got) != 0 {
-				t.Fatalf("deliverable mail got notices: %+v, %v", got, err)
+			sort.Strings(ids)
+			if strings.Join(ids, ",") != "answer,fresh,told,untold" {
+				t.Fatalf("chosen session took %v; want all four", ids)
+			}
+			for _, thread := range []string{"legacy", "asked"} {
+				if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: thread}); err != nil || len(got) != 0 {
+					t.Fatalf("deliverable mail on %s got notices: %+v, %v", thread, got, err)
+				}
 			}
 		})
 	}
