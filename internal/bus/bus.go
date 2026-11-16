@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 )
@@ -29,8 +30,9 @@ const (
 	SessionBeat = 30 * time.Second
 	// SessionRetention is how long a session is listed after it stops.
 	SessionRetention = 24 * time.Hour
-	// DefaultHoldFor is how long after it was sent a message waits for a
-	// session that closed to come back, before it expires.
+	// DefaultHoldFor is how long a message waits for a session that stopped
+	// to come back, before it expires: counted from when the session stopped,
+	// or from the send if that was later.
 	DefaultHoldFor = 7 * 24 * time.Hour
 	// expireEvery is how often the bus looks for held messages to expire.
 	expireEvery = time.Minute
@@ -54,9 +56,14 @@ type Bus struct {
 	log        *slog.Logger
 	// LoopLimit overrides DefaultLoopLimit; negative turns the check off.
 	LoopLimit int
-	// HoldFor overrides DefaultHoldFor: how long after it was sent a message
-	// waits for a session that closed before it expires.
-	HoldFor    time.Duration
+	// HoldFor overrides DefaultHoldFor.
+	HoldFor time.Duration
+	// QuietFor overrides how long the bus listens, after it starts or the
+	// machine wakes, before it takes a session it hasn't heard from as
+	// stopped or expires anything: SessionTTL, long enough for every running
+	// session to report. Negative means not at all.
+	QuietFor   time.Duration
+	listening  atomic.Int64 // since when, in Unix ms
 	lastExpire time.Time
 
 	mu      sync.Mutex
@@ -73,6 +80,7 @@ func New(s Store, log *slog.Logger, ds ...Deliverer) *Bus {
 		waiters:    make(map[string]map[chan struct{}]struct{}),
 		kick:       make(chan struct{}, 1),
 	}
+	b.listening.Store(time.Now().UnixMilli())
 	for _, d := range ds {
 		b.deliverers[d.Kind()] = d
 	}
@@ -293,26 +301,7 @@ func (b *Bus) EndSession(ctx context.Context, agent, id string) error {
 	b.emit(Event{Kind: "session", Type: "ended", Agent: agent, Session: id})
 	// Tell whoever sent what it hadn't taken yet: it waits for the session to
 	// come back, and isn't given to another one.
-	held, err := b.store.Pinned(ctx, agent, id, now)
-	if err != nil {
-		b.log.Error("messages held for a closed session", "agent", agent, "session", id, "err", err)
-		return nil
-	}
-	if len(held) == 0 {
-		return nil
-	}
-	to, err := b.store.GetAgent(ctx, agent)
-	if err != nil {
-		return nil
-	}
-	label := b.sessionLabel(ctx, to, id)
-	for _, m := range held {
-		text := fmt.Sprintf("%s: your message %s to %s is held. That session closed before taking it, so it waits for that session to come back, for up to %s after you sent it; then it expires and you'll be told. No other session gets it. To reach one that is running, send a new message to its address (list_agents shows them).",
-			RecipientSessionEnded, m.ID, label, days(b.holdFor()))
-		if err := b.Notice(ctx, m, "held", text); err != nil {
-			b.log.Error("send notice", "id", m.ID, "err", err)
-		}
-	}
+	b.noticeHeld(ctx)
 	return nil
 }
 
@@ -335,38 +324,136 @@ func days(d time.Duration) string {
 	return d.String()
 }
 
-// expireHeld expires messages that waited longer than HoldFor for a session
-// that closed, and tells their senders.
+// quiet reports whether the bus has listened for too short a time, since it
+// started or the machine woke, to tell that a session it hasn't heard from
+// has stopped.
+func (b *Bus) quiet(now time.Time) bool {
+	q := b.QuietFor
+	if q == 0 {
+		q = SessionTTL
+	}
+	return q > 0 && now.UnixMilli()-b.listening.Load() < q.Milliseconds()
+}
+
+// noticeHeld tells the senders of messages held for a session that isn't
+// running, once each, that they are held.
+func (b *Bus) noticeHeld(ctx context.Context) {
+	now := time.Now()
+	b.settleHeld(ctx, HoldQuery{Lapsed: !b.quiet(now), LiveSince: now.Add(-SessionTTL), Now: now, Limit: inboxBatch})
+}
+
+// expireHeld expires messages held longer than HoldFor for a session that
+// isn't running, and tells their senders.
 func (b *Bus) expireHeld(ctx context.Context) {
 	now := time.Now()
-	if now.Sub(b.lastExpire) < expireEvery {
+	if b.quiet(now) {
 		return
 	}
-	b.lastExpire = now
+	b.settleHeld(ctx, HoldQuery{Expire: true, Lapsed: true, LiveSince: now.Add(-SessionTTL), Before: now.Add(-b.holdFor()), Now: now, Limit: inboxBatch})
+}
+
+func (b *Bus) settleHeld(ctx context.Context, q HoldQuery) {
+	agents := map[string]Agent{}
+	if list, err := b.store.ListAgents(ctx); err == nil {
+		for _, a := range list {
+			agents[a.Name] = a
+		}
+	}
 	for {
-		msgs, err := b.store.ExpireHeld(ctx, now.Add(-b.holdFor()), now.Add(-SessionTTL), now, inboxBatch)
+		held, notices, err := b.store.SettleHeld(ctx, q, func(held []HeldMessage) []Message {
+			return heldNotices(held, q.Expire, agents, b.holdFor(), q.Now)
+		})
 		if err != nil {
 			if ctx.Err() == nil {
-				b.log.Error("expire held messages", "err", err)
+				b.log.Error("settle held messages", "expire", q.Expire, "err", err)
 			}
 			return
 		}
-		for _, m := range msgs {
-			b.emitMessage(StatusExpired, m, "", "")
-			to := Agent{Name: m.To}
-			if a, err := b.store.GetAgent(ctx, m.To); err == nil {
-				to = a
-			}
-			text := fmt.Sprintf("%s: your message %s to %s expired. That session closed and didn't come back within %s, so it was never delivered, and no other session got it. To reach one that is running, send a new message to its address (list_agents shows them).",
-				RecipientSessionEnded, m.ID, b.sessionLabel(ctx, to, m.ToSession), days(b.holdFor()))
-			if err := b.Notice(ctx, m, "expired", text); err != nil {
-				b.log.Error("send notice", "id", m.ID, "err", err)
+		if q.Expire {
+			for _, m := range held {
+				b.emitMessage(StatusExpired, m.Message, "", "")
 			}
 		}
-		if len(msgs) < inboxBatch {
+		for _, n := range notices {
+			b.emitMessage(StatusQueued, n, "", "")
+			b.notify(n.To)
+		}
+		if len(notices) > 0 {
+			select {
+			case b.kick <- struct{}{}:
+			default:
+			}
+		}
+		if len(held) < q.Limit {
 			return
 		}
 	}
+}
+
+// plural is one for a single message, else many.
+func plural(n int, one, many string) string {
+	if n > 1 {
+		return many
+	}
+	return one
+}
+
+// heldNotices tells each sender about its messages in held, one notice per
+// thread and pair of sessions, naming every message.
+func heldNotices(held []HeldMessage, expired bool, agents map[string]Agent, hold time.Duration, now time.Time) []Message {
+	type key struct{ thread, from, fromSession, to, toSession string }
+	var order []key
+	groups := map[key][]HeldMessage{}
+	for _, h := range held {
+		k := key{h.ThreadID, h.From, h.FromSession, h.To, h.ToSession}
+		if _, ok := groups[k]; !ok {
+			order = append(order, k)
+		}
+		groups[k] = append(groups[k], h)
+	}
+	kind := "held"
+	if expired {
+		kind = "expired"
+	}
+	var out []Message
+	for _, k := range order {
+		g := groups[k]
+		ids := make([]string, len(g))
+		for i, h := range g {
+			ids[i] = h.ID
+		}
+		to, ok := agents[k.to]
+		if !ok {
+			to = Agent{Name: k.to}
+		}
+		label := to.DisplayName() + " · " + k.toSession
+		if g[0].SessionName != "" {
+			label = to.DisplayName() + " · " + g[0].SessionName
+		}
+		subject := plural(len(ids), "your message ", "your messages ") + strings.Join(ids, ", ")
+		verb := plural(len(ids), "is", "are")
+		var text string
+		if expired {
+			text = fmt.Sprintf("%s: %s to %s expired. That session stopped and didn't come back within %s, so %s never delivered, and no other session got %s. To reach a session that is running, send a new message to its address (list_agents shows them).",
+				RecipientSessionEnded, subject, label, days(hold), plural(len(ids), "it was", "they were"), plural(len(ids), "it", "them"))
+		} else {
+			text = fmt.Sprintf("%s: %s to %s %s held. That session isn't running, so %s for that session to come back, for up to %s after it stopped; after that %s and you'll be told. No other session gets %s. To reach a session that is running, send a new message to its address (list_agents shows them).",
+				RecipientSessionEnded, subject, label, verb, plural(len(ids), "it waits", "they wait"), days(hold), plural(len(ids), "it expires", "they expire"), plural(len(ids), "it", "them"))
+		}
+		out = append(out, Message{
+			ID:        "msg_" + randHex(12),
+			ThreadID:  k.thread,
+			InReplyTo: ids[0],
+			From:      SystemSender,
+			To:        k.from,
+			ToSession: k.fromSession,
+			Content:   text,
+			Meta:      map[string]string{noticeKey: kind, "messages": strings.Join(ids, ",")},
+			Status:    StatusQueued,
+			CreatedAt: now.UTC(),
+		})
+	}
+	return out
 }
 
 // Send queues a message from the authenticated agent from. Replies inherit
@@ -509,6 +596,10 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	m.Note = b.deliveryNote(ctx, to, m)
 	if m.ToSession != "" && to.Delivery == DeliveryPull && !b.running(ctx, to.Name, m.ToSession) {
 		m.Held = RecipientSessionEnded
+		// The sender knows; no notice says it again.
+		if err := b.store.MarkHeld(ctx, m.ID, time.Now()); err != nil {
+			b.log.Error("mark held", "id", m.ID, "err", err)
+		}
 	}
 	if len(others) > 0 {
 		m.OtherSessions = others
@@ -633,6 +724,11 @@ func (b *Bus) Nack(ctx context.Context, agent, id string) error {
 	changed, err := b.store.Settle(ctx, id, agent, false, time.Now())
 	if changed {
 		b.notify(agent)
+		// Given back by a session that has since closed (a /clear while it
+		// held the message): it is held now, and its sender is told.
+		if m, err := b.store.GetMessage(ctx, id); err == nil && m.ToSession != "" && !b.running(ctx, agent, m.ToSession) {
+			b.noticeHeld(ctx)
+		}
 	}
 	return err
 }
@@ -823,12 +919,26 @@ func (b *Bus) RunDelivery(ctx context.Context) {
 	defer t.Stop()
 	for {
 		b.deliverDue(ctx)
-		b.expireHeld(ctx)
+		if now := time.Now(); !b.quiet(now) && now.Sub(b.lastExpire) >= expireEvery {
+			b.lastExpire = now
+			// Expiring first spares a message that is already too old a
+			// notice that it is held.
+			b.expireHeld(ctx)
+			b.noticeHeld(ctx)
+		}
+		// Wall-clock time, which goes on while the machine sleeps: a gap far
+		// longer than a tick means the sessions may not have reported, so
+		// listen again before taking silence as stopping.
+		waited := time.Now()
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		case <-b.kick:
+		}
+		if time.Now().UnixMilli()-waited.UnixMilli() > SessionBeat.Milliseconds() {
+			b.listening.Store(time.Now().UnixMilli())
+			b.lastExpire = time.Time{}
 		}
 	}
 }

@@ -3,7 +3,11 @@ package bus_test
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -959,6 +963,7 @@ func TestHeldMessagesExpireAndTheSenderIsTold(t *testing.T) {
 	}
 
 	b.HoldFor = time.Millisecond
+	b.QuietFor = -1
 	time.Sleep(5 * time.Millisecond)
 	go b.RunDelivery(ctx)
 	if n := notice("expired"); !strings.Contains(n.Content, "expired") {
@@ -1002,10 +1007,188 @@ func TestAHeldMessageReachesItsSessionWhenItComesBack(t *testing.T) {
 	if a.Held != bus.RecipientSessionEnded || !strings.Contains(a.Note, "7 days") {
 		t.Fatalf("held = %q, note %q", a.Held, a.Note)
 	}
-	go b.RunDelivery(ctx) // expiry runs, and must leave it
-	time.Sleep(50 * time.Millisecond)
+	// The sender was told when it sent; no notice says it again.
+	if err := b.EndSession(ctx, "claude", "s1"); err != nil { // looks for held messages
+		t.Fatal(err)
+	}
+	if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: q.ThreadID}); err != nil || len(got) != 0 {
+		t.Fatalf("notice after a send that said it is held: %+v, %v", got, err)
+	}
 	report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
 	if got := take(t, b, "claude", "s1"); len(got) != 1 || got[0].ID != a.ID {
 		t.Fatalf("back in time: %+v", got)
+	}
+}
+
+// notices returns what bot gets on thread, waiting until it has got a notice
+// of kind.
+func notices(t *testing.T, b *bus.Bus, thread, kind string) []bus.Message {
+	t.Helper()
+	var all []bus.Message
+	for range 3 {
+		got, err := b.ReceiveFor(context.Background(), bus.ReceiveInput{Agent: "bot", Thread: thread, Wait: 10 * time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, got...)
+		for _, n := range got {
+			if n.Meta["notice"] == kind {
+				return all
+			}
+		}
+	}
+	t.Fatalf("no %s notice in %+v", kind, all)
+	return nil
+}
+
+// Every held message is named, once, however many share a thread and however
+// often its session is closed.
+func TestEveryHeldMessageIsNamedOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
+	first, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/api", Content: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/api", ThreadID: first.ThreadID, Content: "two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := b.EndSession(ctx, "claude", "s1"); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	both := first.ID + "," + second.ID
+	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: first.ThreadID})
+	if err != nil || len(got) != 1 || got[0].Meta["notice"] != "held" || got[0].Meta["messages"] != both ||
+		!strings.Contains(got[0].Content, first.ID) || !strings.Contains(got[0].Content, second.ID) {
+		t.Fatalf("held notices: %+v, %v", got, err)
+	}
+
+	b.HoldFor, b.QuietFor = time.Millisecond, -1
+	time.Sleep(5 * time.Millisecond)
+	run, stop := context.WithCancel(ctx)
+	go b.RunDelivery(run)
+	if got := notices(t, b, first.ThreadID, "expired"); len(got) != 1 || got[0].Meta["messages"] != both {
+		t.Fatalf("expired notices: %+v", got)
+	}
+	stop()
+
+	// The session comes back, takes a third message too late, and closes
+	// again: the third is named on its own, though the thread has notices.
+	report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
+	third, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/api", ThreadID: first.ThreadID, Content: "three"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.EndSession(ctx, "claude", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := notices(t, b, first.ThreadID, "held"); len(got) != 1 || got[0].Meta["messages"] != third.ID {
+		t.Fatalf("held again: %+v", got)
+	}
+	again := bus.New(st, slog.New(slog.NewTextHandler(io.Discard, nil))) // a fresh sweep
+	again.HoldFor, again.QuietFor = time.Millisecond, -1
+	time.Sleep(5 * time.Millisecond)
+	go again.RunDelivery(ctx)
+	if got := notices(t, again, first.ThreadID, "expired"); len(got) != 1 || got[0].Meta["messages"] != third.ID {
+		t.Fatalf("expired again: %+v", got)
+	}
+}
+
+// After a restart or a sleep, nothing is taken as stopped, or expired, until
+// the running sessions have had time to report.
+func TestNothingExpiresBeforeSessionsReport(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st, err := store.Open(filepath.Join(t.TempDir(), "bus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	now := time.Now()
+	stale, old := now.Add(-10*time.Minute), now.Add(-10*24*time.Hour) // the daemon was down
+	msgs := map[string]bus.Message{}
+	for _, id := range []string{"s1", "s2", "s3"} {
+		if err := st.UpsertSession(ctx, bus.Session{Agent: "claude", ID: id, Name: id, Tier: bus.TierPush, ActiveAt: stale, LastSeen: stale}); err != nil {
+			t.Fatal(err)
+		}
+		m := bus.Message{ID: "msg_" + id, ThreadID: "thr_" + id, From: "bot", To: "claude", ToSession: id, Content: "x", Status: bus.StatusQueued, CreatedAt: old}
+		if err := st.InsertMessage(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+		msgs[id] = m
+	}
+	b := bus.New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	b.HoldFor, b.QuietFor = 5*time.Minute, 300*time.Millisecond // held since they stopped, 10 minutes ago
+	// s3's message is out with a session, under a lease.
+	if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s3", Lease: time.Hour}); err != nil || len(got) != 1 {
+		t.Fatalf("lease: %+v, %v", got, err)
+	}
+	go b.RunDelivery(ctx)
+	time.Sleep(100 * time.Millisecond)
+	status := func(id string) string {
+		got, err := st.GetMessage(ctx, msgs[id].ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.Status
+	}
+	if status("s1") != bus.StatusQueued || status("s2") != bus.StatusQueued {
+		t.Fatal("expired while listening")
+	}
+	report(t, b, "claude", "s1", "s1", bus.TierPush, time.Now())
+	// s2 never reports: once the bus has listened, its message expires.
+	if got := notices(t, b, "thr_s2", "expired"); len(got) != 1 {
+		t.Fatalf("s2: %+v", got)
+	}
+	if status("s1") != bus.StatusQueued {
+		t.Fatalf("message for a session that reported: %s", status("s1"))
+	}
+	if status("s3") != bus.StatusClaimed {
+		t.Fatalf("message under a lease: %s", status("s3"))
+	}
+}
+
+// A message given back by a session that closed while it held it (a /clear
+// with a batch out) is held, and its sender is told.
+func TestAMessageGivenBackAfterItsSessionClosedIsHeld(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
+	m, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/api", Content: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := take(t, b, "claude", "s1"); len(got) != 1 {
+		t.Fatalf("take: %+v", got)
+	}
+	if err := b.EndSession(ctx, "claude", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: m.ThreadID}); err != nil || len(got) != 0 {
+		t.Fatalf("notice while the session held it: %+v, %v", got, err)
+	}
+	if err := b.Nack(ctx, "claude", m.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: m.ThreadID})
+	if err != nil || len(got) != 1 || got[0].Meta["notice"] != "held" || got[0].Meta["messages"] != m.ID {
+		t.Fatalf("after it was given back: %+v, %v", got, err)
 	}
 }

@@ -141,8 +141,11 @@ session; if none is open, they wait for one. For `claude`, they wait for the
 session you chose. Answers and follow-ups for a closed
 session wait for that session to come back, because what they answer was said
 there; the sender is told so when it sends, or when the session closes before
-taking them. If the session doesn't come back within 7 days of the send
-(`birdie serve --hold-for`), the message expires and the sender is told. No
+taking them, with one notice naming every such message. If the session
+doesn't come back within 7 days of stopping, or of the send if that was later
+(`birdie serve --hold-for`), the message expires and the sender is told. After
+`birdie serve` starts, or the machine wakes, nothing is taken as stopped or
+expired until running sessions have had 90 seconds to report. No
 other session gets it. A session can still collect one by
 waiting on its thread.
 

@@ -71,6 +71,9 @@ var addedColumns = []struct{ table, column, def string }{
 	{"sessions", "branch", "TEXT NOT NULL DEFAULT ''"},
 	{"sessions", "state", "TEXT NOT NULL DEFAULT ''"},
 	{"sessions", "ended_at", "INTEGER NOT NULL DEFAULT 0"},
+	// held_at is when the sender was told the message is held for a session
+	// that isn't running.
+	{"messages", "held_at", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 const (
@@ -232,6 +235,14 @@ func (s *SQLite) ListAgents(ctx context.Context) ([]bus.Agent, error) {
 }
 
 func (s *SQLite) InsertMessage(ctx context.Context, m bus.Message) error {
+	return insertMessage(ctx, s.db, m)
+}
+
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func insertMessage(ctx context.Context, db execer, m bus.Message) error {
 	meta := []byte("{}")
 	if len(m.Meta) > 0 {
 		var err error
@@ -239,7 +250,7 @@ func (s *SQLite) InsertMessage(ctx context.Context, m bus.Message) error {
 			return err
 		}
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := db.ExecContext(ctx,
 		`INSERT INTO messages (id, thread_id, in_reply_to, sender, recipient, from_session, to_session, content, meta, status, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.ThreadID, m.InReplyTo, m.From, m.To, m.FromSession, m.ToSession, m.Content, string(meta), m.Status, m.CreatedAt.UnixMilli())
@@ -348,33 +359,82 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 // or claimed with the lease run out.
 const waiting = `(m.status = 'queued' OR (m.status = 'claimed' AND m.lease_until > 0 AND m.lease_until <= ?))`
 
-func (s *SQLite) Pinned(ctx context.Context, agent, id string, now time.Time) ([]bus.Message, error) {
-	return collectMessages(s.db.QueryContext(ctx,
-		`SELECT `+msgCols+` FROM messages m WHERE m.recipient = ? AND m.to_session = ? AND `+waiting+` ORDER BY m.seq`,
-		agent, id, now.UnixMilli()))
-}
-
-func (s *SQLite) ExpireHeld(ctx context.Context, sentBefore, liveSince, now time.Time, limit int) ([]bus.Message, error) {
+func (s *SQLite) SettleHeld(ctx context.Context, q bus.HoldQuery, build func([]bus.HeldMessage) []bus.Message) ([]bus.HeldMessage, []bus.Message, error) {
+	where := `m.to_session != '' AND m.sender != ? AND ` + waiting + `
+		AND m.recipient IN (SELECT name FROM agents WHERE delivery = 'pull')`
+	args := []any{bus.SystemSender, q.Now.UnixMilli()}
+	if q.Lapsed {
+		where += ` AND (s.id IS NULL OR s.ended_at > 0 OR s.last_seen < ?)`
+		args = append(args, q.LiveSince.UnixMilli())
+	} else {
+		where += ` AND s.ended_at > 0`
+	}
+	if q.Expire {
+		where += ` AND MAX(m.created_at, COALESCE(CASE WHEN s.ended_at > 0 THEN s.ended_at ELSE s.last_seen END, 0)) < ?`
+		args = append(args, q.Before.UnixMilli())
+	} else {
+		where += ` AND m.held_at = 0`
+	}
+	args = append(args, q.Limit)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer tx.Rollback()
-	msgs, err := collectMessages(tx.QueryContext(ctx,
-		`SELECT `+msgCols+` FROM messages m WHERE m.to_session != '' AND m.created_at < ? AND `+waiting+`
-		   AND m.to_session NOT IN (SELECT id FROM sessions WHERE agent = m.recipient AND last_seen >= ? AND ended_at = 0)
-		 ORDER BY m.seq LIMIT ?`,
-		sentBefore.UnixMilli(), now.UnixMilli(), liveSince.UnixMilli(), limit))
-	if err != nil || len(msgs) == 0 {
-		return msgs, err
+	rows, err := tx.QueryContext(ctx, `SELECT `+msgCols+`, COALESCE(s.name, '') FROM messages m
+		LEFT JOIN sessions s ON s.agent = m.recipient AND s.id = m.to_session
+		WHERE `+where+` ORDER BY m.seq LIMIT ?`, args...)
+	if err != nil {
+		return nil, nil, err
 	}
-	for i := range msgs {
-		if _, err := tx.ExecContext(ctx, `UPDATE messages SET status = 'expired', lease_until = 0 WHERE id = ?`, msgs[i].ID); err != nil {
-			return nil, err
+	var held []bus.HeldMessage
+	for rows.Next() {
+		var h bus.HeldMessage
+		var name string
+		m, err := scanMessage(withName{rows, &name})
+		if err != nil {
+			rows.Close()
+			return nil, nil, err
 		}
-		msgs[i].Status = bus.StatusExpired
+		h.Message, h.SessionName = m, name
+		held = append(held, h)
 	}
-	return msgs, tx.Commit()
+	rows.Close()
+	if err := rows.Err(); err != nil || len(held) == 0 {
+		return nil, nil, err
+	}
+	for i := range held {
+		var err error
+		if q.Expire {
+			_, err = tx.ExecContext(ctx, `UPDATE messages SET status = 'expired', lease_until = 0 WHERE id = ?`, held[i].ID)
+			held[i].Status = bus.StatusExpired
+		} else {
+			_, err = tx.ExecContext(ctx, `UPDATE messages SET held_at = ? WHERE id = ?`, q.Now.UnixMilli(), held[i].ID)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	notices := build(held)
+	for _, n := range notices {
+		if err := insertMessage(ctx, tx, n); err != nil {
+			return nil, nil, err
+		}
+	}
+	return held, notices, tx.Commit()
+}
+
+// withName scans msgCols followed by one more column into name.
+type withName struct {
+	r    scanner
+	name *string
+}
+
+func (w withName) Scan(dest ...any) error { return w.r.Scan(append(dest, w.name)...) }
+
+func (s *SQLite) MarkHeld(ctx context.Context, id string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET held_at = ? WHERE id = ? AND held_at = 0`, at.UnixMilli(), id)
+	return err
 }
 
 func (s *SQLite) CountInbox(ctx context.Context, f bus.ClaimFilter, now time.Time) (int, error) {

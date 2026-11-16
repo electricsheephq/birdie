@@ -288,13 +288,13 @@ type Store interface {
 	// EndSession records that a session closed. Until it reports again, it no
 	// longer counts as running.
 	EndSession(ctx context.Context, agent, id string, at time.Time) error
-	// Pinned returns the messages waiting for agent's session id: queued, or
-	// claimed with the lease run out.
-	Pinned(ctx context.Context, agent, id string, now time.Time) ([]Message, error)
-	// ExpireHeld marks expired, and returns, up to limit messages sent before
-	// sentBefore that wait for a session that isn't running: closed, or not
-	// seen since liveSince.
-	ExpireHeld(ctx context.Context, sentBefore, liveSince, now time.Time, limit int) ([]Message, error)
+	// SettleHeld finds, in one transaction, up to q.Limit messages for pull
+	// agents that wait for a session that isn't running, marks them (their
+	// sender told they are held, or expired; see HoldQuery), and inserts the
+	// notices build makes for them. build must not use the store.
+	SettleHeld(ctx context.Context, q HoldQuery, build func([]HeldMessage) []Message) ([]HeldMessage, []Message, error)
+	// MarkHeld records that the sender of message id knows it is held.
+	MarkHeld(ctx context.Context, id string, at time.Time) error
 	// MoveSession points everything that names agent's session from at the
 	// session to instead.
 	MoveSession(ctx context.Context, agent, from, to string) error
@@ -313,4 +313,27 @@ type Store interface {
 type Deliverer interface {
 	Kind() string
 	Deliver(ctx context.Context, to Agent, m Message) error
+}
+
+// HoldQuery picks messages held for a session of a pull agent that isn't
+// running. A session isn't running once it closed; with Lapsed, also once it
+// hasn't been heard from since LiveSince, or was never heard from.
+type HoldQuery struct {
+	// Expire picks messages to expire: held since before Before, counted from
+	// when they were sent or their session stopped, whichever is later.
+	// Otherwise SettleHeld picks those whose sender hasn't been told they are
+	// held.
+	Expire    bool
+	Lapsed    bool
+	LiveSince time.Time
+	Before    time.Time
+	Now       time.Time
+	Limit     int
+}
+
+// HeldMessage is a message held for a session that isn't running, with that
+// session's name, if it has one.
+type HeldMessage struct {
+	Message
+	SessionName string
 }
