@@ -133,9 +133,11 @@ type claudeHost struct {
 // check_inbox too, until a whole read does (see conversation).
 const registryGrace = 10 * time.Second
 
-// failureGap is how close failed reads must come to count as one run. The
-// pump retries every unsureRetry while it can't tell, well inside it.
-const failureGap = 2 * time.Second
+// failureGap is how close failed reads must come to count as one run. It is
+// longer than the pump's slowest retry (5 s) while it can't tell, so an outage
+// stays one run, and shorter than the 30 s between an idle session's reports,
+// so two reads cut short by unrelated rewrites don't make one.
+const failureGap = 6 * time.Second
 
 type claudeEntry struct {
 	SessionID       string `json:"sessionId"`

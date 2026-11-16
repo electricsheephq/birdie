@@ -342,9 +342,10 @@ func TestClaudeHostDoesntPushOnACutShortRegistryRead(t *testing.T) {
 	if tier := h.Tier(); tier != bus.TierPush {
 		t.Fatalf("tier after a stray old failure = %s", tier)
 	}
-	// Failures one after another for registryGrace are.
+	// Failures one after another for registryGrace are, even 5 s apart, as
+	// the pump retries once it has backed off.
 	h.mu.Lock()
-	h.failingSince, h.lastFailure = time.Now().Add(-registryGrace), time.Now().Add(-failureGap/2)
+	h.failingSince, h.lastFailure = time.Now().Add(-registryGrace), time.Now().Add(-5*time.Second)
 	h.mu.Unlock()
 	if _, err := h.conversation(); !errors.Is(err, errUnsure) {
 		t.Fatalf("conversation once the registry can't be read: %v", err)
