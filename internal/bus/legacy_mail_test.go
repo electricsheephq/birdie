@@ -51,13 +51,16 @@ func TestLegacyBareMailIsHeldThenExpiresOrReachesTheChosenSession(t *testing.T) 
 					t.Fatal(err)
 				}
 			}
-			// claude asked outside a session, long ago; the answer waits for
-			// whoever waits on that thread, however old it is.
+			// Threads claude knows, long ago: it asked outside a session, or
+			// read a message without being a session. What follows waits for
+			// whoever waits on the thread, however old it is.
 			for _, m := range []bus.Message{
-				{ID: "asked", From: "claude", To: "bot", Status: bus.StatusDelivered, CreatedAt: now.Add(-3 * time.Hour)},
-				{ID: "answer", InReplyTo: "asked", From: "bot", FromSession: "sender", To: "claude", Status: bus.StatusQueued, CreatedAt: now.Add(-2 * time.Hour)},
+				{ID: "asked", ThreadID: "asked", From: "claude", To: "bot", Status: bus.StatusDelivered, CreatedAt: now.Add(-3 * time.Hour)},
+				{ID: "answer", ThreadID: "asked", InReplyTo: "asked", From: "bot", FromSession: "sender", To: "claude", Status: bus.StatusQueued, CreatedAt: now.Add(-2 * time.Hour)},
+				{ID: "read", ThreadID: "read", From: "bot", FromSession: "sender", To: "claude", Status: bus.StatusDelivered, CreatedAt: now.Add(-3 * time.Hour)},
+				{ID: "followup", ThreadID: "read", From: "bot", FromSession: "sender", To: "claude", Status: bus.StatusQueued, CreatedAt: now.Add(-2 * time.Hour)},
 			} {
-				m.ThreadID, m.Content = "asked", "a question and its answer"
+				m.Content = "a thread claude knows"
 				if err := st.InsertMessage(ctx, m); err != nil {
 					t.Fatal(err)
 				}
@@ -102,19 +105,21 @@ func TestLegacyBareMailIsHeldThenExpiresOrReachesTheChosenSession(t *testing.T) 
 				}
 				// The held notice for "untold" came from the same pass that
 				// decided on every other message, so nothing more is coming.
-				for _, thread := range []string{"legacy", "asked"} {
+				for _, thread := range []string{"legacy", "asked", "read"} {
 					if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: thread}); err != nil || len(got) != 0 {
 						t.Fatalf("extra notices on %s: %+v, %v", thread, got, err)
 					}
 				}
-				for id, want := range map[string]string{"told": bus.StatusExpired, "untold": bus.StatusQueued, "fresh": bus.StatusQueued, "answer": bus.StatusQueued} {
+				for id, want := range map[string]string{"told": bus.StatusExpired, "untold": bus.StatusQueued, "fresh": bus.StatusQueued, "answer": bus.StatusQueued, "followup": bus.StatusQueued} {
 					if m, err := st.GetMessage(ctx, id); err != nil || m.Status != want {
 						t.Fatalf("%s status = %s, err %v; want %s", id, m.Status, err, want)
 					}
 				}
-				got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s1", Thread: "asked"})
-				if err != nil || len(got) != 1 || got[0].ID != "answer" {
-					t.Fatalf("waiting on the thread claude asked in: %+v, %v", got, err)
+				for thread, want := range map[string]string{"asked": "answer", "read": "followup"} {
+					got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s1", Thread: thread})
+					if err != nil || len(got) != 1 || got[0].ID != want {
+						t.Fatalf("waiting on thread %s: %+v, %v", thread, got, err)
+					}
 				}
 				return
 			}
@@ -124,13 +129,55 @@ func TestLegacyBareMailIsHeldThenExpiresOrReachesTheChosenSession(t *testing.T) 
 				ids = append(ids, m.ID)
 			}
 			sort.Strings(ids)
-			if strings.Join(ids, ",") != "answer,fresh,told,untold" {
-				t.Fatalf("chosen session took %v; want all four", ids)
+			if strings.Join(ids, ",") != "answer,followup,fresh,told,untold" {
+				t.Fatalf("chosen session took %v; want all five", ids)
 			}
-			for _, thread := range []string{"legacy", "asked"} {
+			for _, thread := range []string{"legacy", "asked", "read"} {
 				if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: thread}); err != nil || len(got) != 0 {
 					t.Fatalf("deliverable mail on %s got notices: %+v, %v", thread, got, err)
 				}
+			}
+		})
+	}
+}
+
+// SettleHeld checks the route again in its own transaction: a default chosen,
+// or fallback turned on, after the sweep listed the agent as unrouted keeps
+// its mail from being held or expired.
+func TestHeldBareMailRechecksItsRouteWhenSettled(t *testing.T) {
+	for _, choice := range []string{"none", "default", "fallback"} {
+		t.Run(choice, func(t *testing.T) {
+			ctx := context.Background()
+			b, st := newBus(t)
+			addAgent(t, st, "bot", nil)
+			addAgent(t, st, "claude", nil)
+			if err := st.SetAgentConfig(ctx, "claude", "fallback", "off"); err != nil {
+				t.Fatal(err)
+			}
+			report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
+			now := time.Now()
+			if err := st.InsertMessage(ctx, bus.Message{ID: "told", ThreadID: "legacy", From: "bot", FromSession: "sender",
+				To: "claude", Content: "before the upgrade", Status: bus.StatusQueued, CreatedAt: now.Add(-2 * time.Hour), Held: "held"}); err != nil {
+				t.Fatal(err)
+			}
+			switch choice {
+			case "default":
+				if err := st.SetAgentConfig(ctx, "claude", "default_session", "api"); err != nil {
+					t.Fatal(err)
+				}
+			case "fallback":
+				picksSession(t, st, "claude")
+			}
+			// Unrouted is stale for "default" and "fallback": it was made
+			// before the route was chosen.
+			held, _, err := st.SettleHeld(ctx, bus.HoldQuery{Expire: true, Lapsed: true, Unrouted: []string{"claude"},
+				LiveSince: now.Add(-bus.SessionTTL), Before: now.Add(-time.Hour), Now: now, Limit: 50},
+				func([]bus.HeldMessage) []bus.Message { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := map[string]int{"none": 1, "default": 0, "fallback": 0}[choice]; len(held) != want {
+				t.Fatalf("expired %d messages, want %d", len(held), want)
 			}
 		})
 	}

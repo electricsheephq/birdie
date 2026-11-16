@@ -400,14 +400,22 @@ func (s *SQLite) SettleHeld(ctx context.Context, q bus.HoldQuery, build func([]b
 		if len(q.Unrouted) > 0 {
 			// Before sessions were required, a new conversation could be
 			// queued for the agent alone, and no session takes it now. Mail
-			// in a thread the recipient spoke in is left alone: it answers
-			// or follows up what the recipient said outside a session, and
-			// whoever waits on that thread takes it (see Bus.Send).
+			// in a thread the recipient spoke in, or took a message in, is
+			// left alone: the recipient knows that thread, and whoever waits
+			// on it or reads without a session takes it (see Bus.Send). The
+			// route is checked again here, in the same transaction, so a
+			// default chosen or fallback turned on since Unrouted was made
+			// keeps the mail for the session that can now take it.
 			session = `(` + session + `) OR (m.to_session = '' AND m.recipient IN (?` + strings.Repeat(", ?", len(q.Unrouted)-1) + `)
-				AND NOT EXISTS (SELECT 1 FROM messages p WHERE p.thread_id = m.thread_id AND p.seq < m.seq AND p.sender = m.recipient))`
+				AND NOT EXISTS (SELECT 1 FROM messages p WHERE p.thread_id = m.thread_id AND p.seq < m.seq
+					AND (p.sender = m.recipient OR (p.recipient = m.recipient AND p.status IN ('claimed', 'delivered', 'replied'))))
+				AND NOT EXISTS (SELECT 1 FROM agents a LEFT JOIN sessions d ON d.agent = a.name AND d.ended_at = 0
+					AND d.last_seen >= ? AND d.name = json_extract(a.config, '$.default_session')
+					WHERE a.name = m.recipient AND (json_extract(a.config, '$.fallback') = 'on' OR d.id IS NOT NULL)))`
 			for _, agent := range q.Unrouted {
 				args = append(args, agent)
 			}
+			args = append(args, q.LiveSince.UnixMilli())
 		}
 	}
 	where += ` AND (` + session + `)`
