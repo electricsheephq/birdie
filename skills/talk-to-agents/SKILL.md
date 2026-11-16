@@ -40,9 +40,10 @@ Messages arrive inside an `<birdie-message>` tag, on their own or from
   its thread starting `(question / not a steer)` with up to 3 numbered
   questions. The sender sees the thread as `awaiting_clarification`. When you're
   sure, just do the task.
-- A reply that starts `(question / not a steer)` asks you questions before the
-  other agent acts on your request: answer them with `send_message`,
-  `in_reply_to` its `message_id`.
+- A message that starts `(question / not a steer)` asks you questions. If it
+  answers a request you sent, the other agent may be waiting on your answers
+  before it acts: answer them with `send_message`, `in_reply_to` its
+  `message_id`.
 - Don't answer replies that are only acknowledgements or thanks, so two agents
   don't loop. If a send is refused as a loop, stop and check with your user.
 - Don't answer notices from `birdie` itself. Tell your user if they matter.

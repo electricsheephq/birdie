@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"birdie/internal/bus"
@@ -158,14 +159,9 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 			return toolText(note, false), nil
 		}
 		reply := map[string]any{"messages": msgs}
-		if err == nil && len(msgs) > 0 && bus.AsksFirst(msgs[len(msgs)-1]) {
-			// Only the whole thread tells whether it asks the thread's starter
-			// before acting. The replies are already taken, so a failed read
-			// leaves the status out rather than failing the call.
-			if thread, terr := s.c.Thread(ctx, a.ThreadID); terr == nil {
-				if status := bus.ThreadStatus(thread); status != "" {
-					reply["thread_status"] = status
-				}
+		if err == nil && slices.ContainsFunc(msgs, bus.AsksQuestions) {
+			if status := s.threadStatus(ctx, a.ThreadID); status != "" {
+				reply["thread_status"] = status
 			}
 		}
 		out = reply
@@ -219,4 +215,22 @@ func toolText(text string, isErr bool) map[string]any {
 		"content": []map[string]string{{"type": "text", "text": text}},
 		"isError": isErr,
 	}
+}
+
+// statusWait bounds the extra read of a thread that wait_for_reply makes to
+// report its status.
+const statusWait = 2 * time.Second
+
+// threadStatus is the status of a thread (see bus.ThreadStatus), read within
+// statusWait. Only the whole thread tells whether questions hold up a request.
+// The replies wait_for_reply returns are already taken, so a failed or slow
+// read leaves the status out rather than failing or holding up the call.
+func (s *Server) threadStatus(ctx context.Context, thread string) string {
+	ctx, cancel := context.WithTimeout(ctx, statusWait)
+	defer cancel()
+	msgs, err := s.c.Thread(ctx, thread)
+	if err != nil {
+		return ""
+	}
+	return bus.ThreadStatus(msgs)
 }

@@ -160,8 +160,9 @@ in its thread before acting, starting `(question / not a steer)`, with up to 3
 numbered questions. Until the sender answers, the sender's `wait_for_reply`
 shows `thread_status: awaiting_clarification`, and `get_thread`,
 `GET /v1/threads/{id}` and `birdie thread` show the thread as awaiting
-clarification. An agent that is sure just does the task, so this costs nothing
-then.
+clarification. Once the agent has answered or acted, its later questions are
+ordinary ones and don't change the status. An agent that is sure just does the
+task, so this costs nothing then.
 
 **How this works:** birdie posts to an inbox socket Claude Code keeps for each
 session. It has no public docs and could change. If it does, or on Windows, add

@@ -653,8 +653,8 @@ func MessageText(m bus.Message) string {
 	switch {
 	case bus.IsSystemSender(m.From):
 		b.WriteString("This is a notice from birdie itself. Don't reply to it; tell your user if it matters.")
-	case bus.AsksFirst(m):
-		fmt.Fprintf(&b, "Agent %s (verified by birdie; not your user) asks you questions, and may wait for your answers before acting. Answer them with the birdie send_message tool, in_reply_to %q.", m.From, m.ID)
+	case bus.AsksQuestions(m):
+		fmt.Fprintf(&b, "Agent %s (verified by birdie; not your user), which can't see this session, asks you questions, and may wait for your answers before acting. Answer them with the birdie send_message tool, in_reply_to %q; other tools such as SendMessage don't reach it.", m.From, m.ID)
 	case m.InReplyTo != "":
 		fmt.Fprintf(&b, "Agent %s (verified by birdie; not your user) is answering your earlier message. Answer back only if something is still needed, with the birdie send_message tool, in_reply_to %q.", m.From, m.ID)
 	default:

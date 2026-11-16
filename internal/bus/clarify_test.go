@@ -7,37 +7,48 @@ import (
 )
 
 func TestThreadStatus(t *testing.T) {
-	ask := bus.Message{ID: "m1", From: "eva", Content: "please do X"}
-	question := bus.Message{ID: "m2", From: "claude", InReplyTo: "m1", Content: "  (Question / not a steer) 1. which X?"}
-	answer := bus.Message{ID: "m3", From: "eva", InReplyTo: "m2", Content: "the first"}
-	notice := bus.Message{ID: "m4", From: bus.SystemSender, InReplyTo: "m2", Content: "held"}
+	ask := bus.Message{ID: "m1", From: "eva", To: "claude", Content: "please do X"}
+	question := bus.Message{ID: "m2", From: "claude", To: "eva", InReplyTo: "m1", Content: "  (Question / not a steer) 1. which X?"}
+	answer := bus.Message{ID: "m3", From: "eva", To: "claude", InReplyTo: "m2", Content: "the first"}
+	again := bus.Message{ID: "m4", From: "claude", To: "eva", InReplyTo: "m3", Content: "(question / not a steer) 1. and Y?"}
+	done := bus.Message{ID: "m5", From: "claude", To: "eva", InReplyTo: "m1", Content: "done"}
+	notice := bus.Message{ID: "m9", From: bus.SystemSender, InReplyTo: "m2", Content: "held"}
 	for _, c := range []struct {
+		name string
 		msgs []bus.Message
 		want string
 	}{
-		{nil, ""},
-		{[]bus.Message{ask}, ""},
-		{[]bus.Message{ask, question}, bus.ThreadAwaitingClarification},
-		{[]bus.Message{ask, question, notice}, bus.ThreadAwaitingClarification},
-		{[]bus.Message{ask, question, answer}, ""},
-		{[]bus.Message{{ID: "m0", From: "eva", Content: "(question / not a steer) a new thread"}}, ""},
-		// The starter's own follow-up under the everyday header isn't a
-		// question holding up its request.
-		{[]bus.Message{ask, {ID: "m2", From: "eva", InReplyTo: "m1", Content: "(question / not a steer) also Y?"}}, ""},
-		{[]bus.Message{ask, question, answer, {ID: "m5", From: "eva", InReplyTo: "m3", Content: "(question / not a steer) done yet?"}}, ""},
+		{"empty", nil, ""},
+		{"just the request", []bus.Message{ask}, ""},
+		{"asked first", []bus.Message{ask, question}, bus.ThreadAwaitingClarification},
+		{"a notice after the question", []bus.Message{ask, question, notice}, bus.ThreadAwaitingClarification},
+		{"answered", []bus.Message{ask, question, answer}, ""},
+		{"asked again after the answer", []bus.Message{ask, question, answer, again}, bus.ThreadAwaitingClarification},
+		{"a new thread that is a question", []bus.Message{{ID: "m0", From: "eva", Content: "(question / not a steer) a new thread"}}, ""},
+		// The everyday header on the starter's own follow-ups doesn't hold
+		// up anything.
+		{"the starter's follow-up question", []bus.Message{ask, {ID: "m2", From: "eva", InReplyTo: "m1", Content: "(question / not a steer) also Y?"}}, ""},
+		{"the starter asks after an answer", []bus.Message{ask, question, answer, {ID: "m6", From: "eva", InReplyTo: "m3", Content: "(question / not a steer) done yet?"}}, ""},
+		// Once the other side has answered or acted, its questions are
+		// ordinary ones.
+		{"a question after done", []bus.Message{ask, done, {ID: "m6", From: "claude", To: "eva", InReplyTo: "m1", Content: "(question / not a steer) was that useful?"}}, ""},
+		// A question that continues the thread by its id, without
+		// in_reply_to, counts too.
+		{"asked by thread id", []bus.Message{ask, {ID: "m2", From: "claude", To: "eva", Content: "(question / not a steer) 1. which X?"}}, bus.ThreadAwaitingClarification},
+		// A question for a third agent doesn't hold up the starter.
+		{"a question for someone else", []bus.Message{ask, {ID: "m2", From: "claude", To: "codex", Content: "(question / not a steer) 1. which X?"}}, ""},
+		{"passed on, then asked", []bus.Message{ask, {ID: "m2", From: "claude", To: "codex", Content: "please help with X"}, {ID: "m3", From: "codex", To: "claude", InReplyTo: "m2", Content: "(question / not a steer) 1. which X?"}}, ""},
 		// Two sessions of one agent are different authors.
-		{[]bus.Message{
-			{ID: "m1", From: "claude", FromSession: "s1", Content: "please do X"},
-			{ID: "m2", From: "claude", FromSession: "s2", InReplyTo: "m1", Content: "(question / not a steer) 1. which X?"},
+		{"one agent's two sessions", []bus.Message{
+			{ID: "m1", From: "claude", FromSession: "s1", To: "claude", Content: "please do X"},
+			{ID: "m2", From: "claude", FromSession: "s2", To: "claude", InReplyTo: "m1", Content: "(question / not a steer) 1. which X?"},
 		}, bus.ThreadAwaitingClarification},
-		// Without the first message, it can't tell who started the thread.
-		{[]bus.Message{question}, ""},
 	} {
 		if got := bus.ThreadStatus(c.msgs); got != c.want {
-			t.Errorf("%+v: %q, want %q", c.msgs, got, c.want)
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
 		}
 	}
-	if !bus.AsksFirst(question) || bus.AsksFirst(ask) || bus.AsksFirst(answer) {
-		t.Error("AsksFirst is for replies starting with the marker")
+	if !bus.AsksQuestions(question) || bus.AsksQuestions(ask) || bus.AsksQuestions(answer) {
+		t.Error("AsksQuestions is for messages starting with the marker")
 	}
 }
