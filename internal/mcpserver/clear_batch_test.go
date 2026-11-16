@@ -259,3 +259,68 @@ func TestARefusedPushGivesTheBatchBackAndFollowsTheNewConversation(t *testing.T)
 		}
 	}
 }
+
+// unsureHost can't tell which conversation it serves, as Claude Code's host
+// when its registry entry is read while being rewritten.
+type unsureHost struct{ *refusingHost }
+
+func (unsureHost) conversation() (string, error) { return "", errUnsure }
+func (h unsureHost) Push(_ context.Context, _ string, m bus.Message) error {
+	h.pushed <- m.ID
+	return nil
+}
+
+func TestABridgeThatCantTellItsConversationPushesNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st, err := store.Open(filepath.Join(t.TempDir(), "bus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(st, logger)
+	for _, name := range []string{"claude", "peer"} {
+		if err := st.CreateAgent(ctx, bus.Agent{Name: name, TokenHash: bus.HashToken(name + "-tok"), Delivery: bus.DeliveryPull, CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.ReportSession(ctx, "claude", "old", bus.SessionInput{Name: "review", Tier: bus.TierPush}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := b.Send(ctx, "claude", bus.SendInput{To: "peer", Content: "old question", FromSession: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer, err := b.Send(ctx, "peer", bus.SendInput{InReplyTo: q.ID, Content: "answer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := httptest.NewServer(httpapi.New(b, logger))
+	defer api.Close()
+	c := client.New(api.URL, "claude-tok")
+	c.SetSession("old")
+	h := unsureHost{&refusingHost{pushed: make(chan string, 4)}}
+	h.id.Store("old")
+	srv := New(c, "claude", "test", false, log.New(io.Discard, "", 0))
+	srv.host = h
+	done := make(chan struct{})
+	go func() { defer close(done); srv.pump(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	select {
+	case id := <-h.pushed:
+		t.Fatalf("%s was pushed", id)
+	case <-time.After(time.Second):
+	}
+	got, err := st.GetMessage(ctx, answer.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != bus.StatusQueued {
+		t.Fatalf("status %s, want queued", got.Status)
+	}
+	if c.Session() != "old" {
+		t.Fatalf("the bridge moved to %s", c.Session())
+	}
+}

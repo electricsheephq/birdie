@@ -46,6 +46,9 @@ type Host interface {
 // the host no longer serves.
 var ErrOtherConversation = errors.New("the session has moved to another conversation")
 
+// errUnsure is a host that can't tell which conversation it serves right now.
+var errUnsure = errors.New("can't tell which conversation the session serves right now")
+
 // HostOptions configure DetectHost.
 type HostOptions struct {
 	// NoPush keeps messages from interrupting the session; they wait for
@@ -138,31 +141,43 @@ func claudeDir() string {
 	return filepath.Join(home, ".claude")
 }
 
-func (h *claudeHost) entry() (claudeEntry, bool) {
+// entry reads the process's registry entry. fresh is false when the read
+// failed or was cut short, as while Claude Code rewrites the entry at /clear;
+// e is then the last whole entry, if there was one. That keeps the session's
+// identity steady: the environment would name the conversation the process
+// started with. But a remembered entry can't say the conversation hasn't
+// changed since, so it is never enough to show a message (see conversation).
+func (h *claudeHost) entry() (e claudeEntry, ok, fresh bool) {
 	h.once.Do(func() { h.pid = claudeAncestor() })
 	if h.pid == 0 {
-		return claudeEntry{}, false
+		return claudeEntry{}, false, false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	var e claudeEntry
 	b, err := os.ReadFile(filepath.Join(claudeDir(), "sessions", fmt.Sprintf("%d.json", h.pid)))
 	if err != nil || json.Unmarshal(b, &e) != nil {
-		// Read while Claude Code rewrites it, as at /clear, the entry can be
-		// cut short. The environment would then name the conversation the
-		// process started with, not the one it serves now, so the last whole
-		// entry stands in.
 		if h.last != nil {
-			return *h.last, true
+			return *h.last, true, false
 		}
-		return claudeEntry{}, false
+		return claudeEntry{}, false, false
 	}
 	h.last = &e
-	return e, true
+	return e, true, true
+}
+
+// conversation is the session's conversation as the registry says right now.
+// Once a whole entry has been read, a read that fails or is cut short gives
+// errUnsure. Before that, it is the conversation in the environment.
+func (h *claudeHost) conversation() (string, error) {
+	e, ok, fresh := h.entry()
+	if ok && !fresh {
+		return "", errUnsure
+	}
+	return h.info(e, ok).ID, nil
 }
 
 func (h *claudeHost) Session() SessionInfo {
-	e, ok := h.entry()
+	e, ok, _ := h.entry()
 	return h.info(e, ok)
 }
 
@@ -201,7 +216,7 @@ func (h *claudeHost) info(e claudeEntry, ok bool) SessionInfo {
 var claudeStates = map[string]string{"busy": bus.StateBusy, "idle": bus.StateIdle, "waiting": bus.StateWaiting}
 
 func (h *claudeHost) socket() string {
-	e, _ := h.entry()
+	e, _, _ := h.entry()
 	return socketOf(e)
 }
 
@@ -227,7 +242,10 @@ func (h *claudeHost) Push(ctx context.Context, session string, m bus.Message) er
 	// The socket belongs to the process, not the conversation, and stays the
 	// same through /clear. So the conversation is checked against the same
 	// read of the registry the socket comes from, just before writing.
-	e, ok := h.entry()
+	e, ok, fresh := h.entry()
+	if ok && !fresh {
+		return errUnsure
+	}
 	if h.info(e, ok).ID != session {
 		return ErrOtherConversation
 	}

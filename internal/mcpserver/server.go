@@ -345,15 +345,18 @@ func (s *Server) pump(ctx context.Context) {
 			pause(ctx, 5*time.Second)
 			continue
 		}
-		failed, moved := false, false
+		// stop, once set, says why the rest of the batch goes back to the
+		// queue: the conversation changed (/clear), so they wait for the old
+		// one, or the bridge can't tell which conversation it serves.
+		var stop error
+		failed := false
 		for _, m := range msgs {
 			// Checked before each message, not once per batch: /clear can
-			// come while one is being shown. After it, the rest are the old
-			// conversation's and go back to the queue to wait for it.
-			if !moved && s.moved(polled) {
-				moved = true
+			// come while one is being shown.
+			if stop == nil {
+				stop = s.check(polled)
 			}
-			if moved {
+			if stop != nil {
 				s.nack(ctx, m)
 				continue
 			}
@@ -367,8 +370,8 @@ func (s *Server) pump(ctx context.Context) {
 				continue
 			}
 			if err := s.show(ctx, polled, m); err != nil {
-				if errors.Is(err, ErrOtherConversation) {
-					moved = true
+				if errors.Is(err, ErrOtherConversation) || errors.Is(err, errUnsure) {
+					stop = err
 				} else {
 					s.log.Printf("push %s: %v", m.ID, err)
 					failed = true
@@ -379,27 +382,41 @@ func (s *Server) pump(ctx context.Context) {
 			s.remember(m)
 			s.ack(ctx, m)
 		}
-		if moved || s.moved(polled) {
+		if errors.Is(stop, ErrOtherConversation) || errors.Is(s.check(polled), ErrOtherConversation) {
 			// Act for the new conversation before polling again.
 			if h := s.currentHost(); h != nil {
 				s.syncSession(ctx, h)
 			}
 			continue
 		}
-		if failed {
+		if stop != nil || failed {
 			pause(ctx, 5*time.Second)
 		}
 	}
 }
 
-// moved reports whether the conversation changed (/clear) since the poll that
-// took messages for conversation polled.
-func (s *Server) moved(polled string) bool {
-	if s.c.Session() != polled {
-		return true
+// check says whether the bridge still serves conversation session, the one
+// messages were taken for: nil if it does, ErrOtherConversation if it changed
+// (/clear), or errUnsure if the host can't tell right now.
+func (s *Server) check(session string) error {
+	if s.c.Session() != session {
+		return ErrOtherConversation
 	}
 	h := s.currentHost()
-	return h != nil && h.Session().ID != polled
+	if h == nil {
+		return nil
+	}
+	id := h.Session().ID
+	if c, ok := h.(interface{ conversation() (string, error) }); ok {
+		var err error
+		if id, err = c.conversation(); err != nil {
+			return err
+		}
+	}
+	if id != session {
+		return ErrOtherConversation
+	}
+	return nil
 }
 
 func pause(ctx context.Context, d time.Duration) {
@@ -426,8 +443,8 @@ func (s *Server) show(ctx context.Context, session string, m bus.Message) error 
 	// meanwhile, so the conversation is checked holding the output lock.
 	s.outMu.Lock()
 	defer s.outMu.Unlock()
-	if s.moved(session) {
-		return ErrOtherConversation
+	if err := s.check(session); err != nil {
+		return err
 	}
 	_, err = s.out.Write(append(b, '\n'))
 	return err
