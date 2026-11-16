@@ -23,10 +23,11 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   that no session can take: if it is older than 7 days it expires, otherwise
   its sender is told it is held. Choosing a default or turning fallback on
   lets a session take it instead.
-- **The database gains a column on start:** `sessions.pull_only`, default
-  off.
-- **Rolling back:** the bbcdfcc binary runs on the upgraded database. Messages
-  that expired stay expired.
+- **The database gains two columns on start:** `messages.held_at` and
+  `sessions.pull_only`, both 0 by default.
+- **Rolling back:** the bbcdfcc binary runs on the upgraded database and
+  ignores the new columns. Messages that expired stay expired, and its
+  `birdie thread` shows them as `expired`.
 - **Hermes:** update the plugin with the daemon. Don't run
   `birdie setup hermes` on a machine whose plugin is managed separately.
 
