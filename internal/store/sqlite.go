@@ -399,18 +399,42 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 const waiting = `(m.status = 'queued' OR (m.status = 'claimed' AND m.lease_until > 0 AND m.lease_until <= ?))`
 
 func (s *SQLite) SettleHeld(ctx context.Context, q bus.HoldQuery, build func([]bus.HeldMessage) []bus.Message) ([]bus.HeldMessage, []bus.Message, error) {
-	where := `m.to_session != '' AND m.sender NOT IN (?, ?) AND ` + waiting + `
+	where := `m.sender NOT IN (?, ?) AND ` + waiting + `
 		AND m.recipient IN (SELECT name FROM agents WHERE delivery = 'pull')`
 	args := []any{bus.SystemSender, bus.LegacySystemSender, q.Now.UnixMilli()}
+	session := `m.to_session != '' AND s.ended_at > 0`
 	if q.Lapsed {
-		where += ` AND (s.id IS NULL OR s.ended_at > 0 OR s.last_seen < ?)`
+		session = `m.to_session != '' AND (s.id IS NULL OR s.ended_at > 0 OR s.last_seen < ?)`
 		args = append(args, q.LiveSince.UnixMilli())
-	} else {
-		where += ` AND s.ended_at > 0`
+		if len(q.Unrouted) > 0 {
+			// Before sessions were required, a new conversation could be
+			// queued for the agent alone, and no session takes it now. Mail
+			// in a thread the recipient spoke in, or took a message in, is
+			// left alone: the recipient knows that thread, and whoever waits
+			// on it or reads without a session takes it (see Bus.Send). The
+			// route is checked again here, in the same transaction, so a
+			// default chosen or fallback turned on since Unrouted was made
+			// keeps the mail for the session that can now take it.
+			session = `(` + session + `) OR (m.to_session = '' AND m.recipient IN (?` + strings.Repeat(", ?", len(q.Unrouted)-1) + `)
+				AND NOT EXISTS (SELECT 1 FROM messages p WHERE p.thread_id = m.thread_id AND p.seq < m.seq
+					AND (p.sender = m.recipient OR (p.recipient = m.recipient AND p.status IN ('claimed', 'delivered', 'replied'))))
+				AND NOT EXISTS (SELECT 1 FROM agents a LEFT JOIN sessions d ON d.agent = a.name AND d.ended_at = 0
+					AND d.last_seen >= ? AND d.name = json_extract(a.config, '$.default_session')
+					WHERE a.name = m.recipient AND (json_extract(a.config, '$.fallback') = 'on' OR d.id IS NOT NULL)))`
+			for _, agent := range q.Unrouted {
+				args = append(args, agent)
+			}
+			args = append(args, q.LiveSince.UnixMilli())
+		}
 	}
+	where += ` AND (` + session + `)`
 	if q.Expire {
-		where += ` AND MAX(m.created_at, COALESCE(CASE WHEN s.ended_at > 0 THEN s.ended_at ELSE s.last_seen END, 0)) < ?`
-		args = append(args, q.Before.UnixMilli())
+		// Mail for no session counts from when its sender was told it is
+		// held, so it never expires untold, and an upgrade leaves time to
+		// choose a default before mail sent long ago expires.
+		where += ` AND CASE WHEN m.to_session = '' THEN m.held_at > 0 AND m.held_at < ?
+			ELSE MAX(m.created_at, COALESCE(CASE WHEN s.ended_at > 0 THEN s.ended_at ELSE s.last_seen END, 0)) < ? END`
+		args = append(args, q.Before.UnixMilli(), q.Before.UnixMilli())
 	} else {
 		where += ` AND m.held_at = 0`
 	}
