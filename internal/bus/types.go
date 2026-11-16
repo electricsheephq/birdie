@@ -263,6 +263,8 @@ type Store interface {
 	ThreadAccess(ctx context.Context, threadID, agent string) (exists, member bool, err error)
 	// Thread returns the thread's messages that agent sent or received.
 	Thread(ctx context.Context, threadID, agent string) ([]Message, error)
+	// HasNotice checks for a system notice without reading the thread's content.
+	HasNotice(ctx context.Context, threadID, agent, kind string) (bool, error)
 	// ThreadSession returns the session of agent that last took part in
 	// thread with from: the one that sent a message, or else took one (and
 	// didn't give it back) or was due one. It returns "" if none did.
@@ -297,7 +299,8 @@ type Store interface {
 	// SettleHeld finds, in one transaction, up to q.Limit messages for pull
 	// agents that wait for a session that isn't running, marks them (their
 	// sender told they are held, or expired; see HoldQuery), and inserts the
-	// notices build makes for them. build must not use the store.
+	// notices build makes for them. Content has only the first 4*PreviewRunes
+	// bytes for event previews, and Meta is omitted. build must not use the store.
 	SettleHeld(ctx context.Context, q HoldQuery, build func([]HeldMessage) []Message) ([]HeldMessage, []Message, error)
 	// MoveSession points everything that names agent's session from at the
 	// session to instead.

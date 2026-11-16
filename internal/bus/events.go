@@ -35,8 +35,9 @@ type Event struct {
 }
 
 const (
-	eventBuffer  = 64
-	previewRunes = 200
+	eventBuffer = 64
+	// PreviewRunes bounds event text, including previews read from the store.
+	PreviewRunes = 200
 )
 
 type watchers struct {
@@ -79,13 +80,19 @@ func (b *Bus) emit(e Event) {
 }
 
 func (b *Bus) emitMessage(typ string, m Message, takenBy, errMsg string) {
-	text := []rune(m.Content)
-	if len(text) > previewRunes {
-		text = text[:previewRunes]
+	end, n := len(m.Content), 0
+	for i := range m.Content {
+		if n == PreviewRunes {
+			end = i
+			break
+		}
+		n++
 	}
+	// Copy only the preview so watchers don't keep the full message alive.
+	text := string([]rune(m.Content[:end]))
 	b.emit(Event{
 		Kind: "message", Type: typ, ID: m.ID, ThreadID: m.ThreadID, InReplyTo: m.InReplyTo,
 		From: m.From, To: m.To, FromSession: m.FromSession, ToSession: m.ToSession,
-		TakenBy: takenBy, Text: string(text), Error: errMsg,
+		TakenBy: takenBy, Text: text, Error: errMsg,
 	})
 }
