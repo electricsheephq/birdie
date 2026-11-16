@@ -134,6 +134,8 @@ func progress(m store.Tracked, kind string, labels sessionLabels, now time.Time)
 		return s
 	case bus.StatusFailed:
 		return fmt.Sprintf("not delivered: birdie gave up after %d %s: %s", m.Attempts, plural(m.Attempts, "try", "tries"), errorText(m.Error, 200))
+	case bus.StatusExpired:
+		return "not delivered: expired waiting for its session, which closed"
 	}
 	return m.Status
 }

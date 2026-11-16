@@ -56,7 +56,7 @@ export interface Agent {
   health: Health;
 }
 
-export type MessageStatus = 'queued' | 'claimed' | 'delivered' | 'replied' | 'failed';
+export type MessageStatus = 'queued' | 'claimed' | 'delivered' | 'replied' | 'failed' | 'expired';
 
 /** A message with how far it got. */
 export interface Tracked {
@@ -160,8 +160,8 @@ export interface ApiError { error: string }
  */
 export interface MessageEvent {
   kind: 'message';
-  /** queued: sent. claimed: taken, not confirmed. delivered. replied: answered. retrying: a try failed. failed: given up. */
-  type: 'queued' | 'claimed' | 'delivered' | 'replied' | 'retrying' | 'failed';
+  /** queued: sent. claimed: taken, not confirmed. delivered. replied: answered. retrying: a try failed. failed: given up. expired: its session closed and didn't come back in time. */
+  type: 'queued' | 'claimed' | 'delivered' | 'replied' | 'retrying' | 'failed' | 'expired';
   id: string;
   thread_id: string;
   in_reply_to?: string;

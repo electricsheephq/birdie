@@ -39,6 +39,8 @@ export function progress(m: Tracked, kind: Delivery | undefined, now: number): s
     }
     case 'failed':
       return 'not delivered: birdie gave up after ' + m.attempts + ' ' + plural(m.attempts, 'try', 'tries') + ': ' + errorText(m.error);
+    case 'expired':
+      return 'not delivered: expired waiting for its session, which closed';
   }
   return m.status;
 }
@@ -61,6 +63,8 @@ export function chipFor(status: MessageStatus, hasError: boolean, answeredBy?: s
       return { label: 'taken', tone: 'pending' };
     case 'failed':
       return { label: 'not delivered', tone: 'problem' };
+    case 'expired':
+      return { label: 'expired', tone: 'problem' };
     case 'queued':
       return hasError ? { label: 'retrying', tone: 'problem' } : { label: 'queued', tone: 'pending' };
   }
@@ -79,5 +83,5 @@ export function threadChip(t: ThreadSummary): Chip {
 
 /** A message has a delivery problem worth flagging. */
 export function troubled(m: Tracked): boolean {
-  return m.status === 'failed' || (m.status === 'queued' && !!m.error);
+  return m.status === 'failed' || m.status === 'expired' || (m.status === 'queued' && !!m.error);
 }
