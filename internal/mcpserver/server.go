@@ -103,7 +103,7 @@ func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 	}()
 
 	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 64<<10), 32<<20)
+	sc.Buffer(make([]byte, 64<<10), bus.MaxRequestBytes)
 	var wg, pumpWG sync.WaitGroup
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
@@ -553,7 +553,7 @@ func (s *Server) show(ctx context.Context, session string, m bus.Message) error 
 	b, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"method":  "notifications/claude/channel",
-		"params":  map[string]any{"content": MessageText(m), "meta": channelMeta(m)},
+		"params":  map[string]any{"content": PushText(m), "meta": channelMeta(m)},
 	})
 	if err != nil {
 		return err
