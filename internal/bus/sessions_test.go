@@ -436,6 +436,9 @@ func TestAMessageForClaudeAloneNeedsASession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if m.ToSession != "s1" {
+		t.Fatalf("the message isn't pinned to the chosen session: %q", m.ToSession)
+	}
 	if got := take(t, b, "claude", "s2"); len(got) != 0 {
 		t.Fatalf("the session that wasn't chosen got %+v", got)
 	}
@@ -749,8 +752,37 @@ func TestAnAddressReachesOnlyItsSession(t *testing.T) {
 	addAgent(t, st, "bot", nil)
 	addAgent(t, st, "claude", nil)
 	now := time.Now()
+	report(t, b, "claude", "proc-1234", "api", bus.TierPush, now.Add(-2*time.Minute))
 	report(t, b, "claude", "proc-12345", "api", bus.TierPush, now)
 	report(t, b, "claude", "proc-12399", "api", bus.TierPush, now.Add(-time.Minute))
+	report(t, b, "claude", "proc-777", "web", bus.TierPush, now)
+	report(t, b, "claude", "proc-5551", "api", bus.TierPush, now.Add(-3*time.Minute))
+	report(t, b, "claude", "proc-5559", "api", bus.TierPush, now.Add(-3*time.Minute))
+	for _, id := range []string{"proc-1234", "proc-5551"} {
+		if err := b.EndSession(ctx, "claude", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refused := func(to, code string) {
+		t.Helper()
+		_, err := b.Send(ctx, "bot", bus.SendInput{To: to, Content: "x"})
+		if e, ok := bus.AsAddressError(err); !ok || e.Code != code {
+			t.Fatalf("send to %s: err = %v, want %s", to, err, code)
+		}
+	}
+	// A stopped session's whole id is never taken for the start of another's.
+	refused("claude/api#proc-1234", bus.RecipientSessionEnded)
+	refused("claude/proc-1234", bus.RecipientSessionEnded)
+	// The start of ids of a running session and a stopped one could mean either.
+	refused("claude/api#proc-123", bus.RecipientAmbiguous)
+	refused("claude/api#proc-555", bus.RecipientAmbiguous)
+	// A whole id under another session's name.
+	refused("claude/web#proc-12345", bus.RecipientNotFound)
+	for _, id := range []string{"proc-12345", "proc-5559"} {
+		if got := take(t, b, "claude", id); len(got) != 0 {
+			t.Fatalf("%s wasn't addressed but got %+v", id, got)
+		}
+	}
 	a, _ := st.GetAgent(ctx, "claude")
 	live, err := b.Sessions(ctx, a)
 	if err != nil {
@@ -839,6 +871,7 @@ func TestAnAnswerToClaudeOutsideASessionWaitsOnItsThread(t *testing.T) {
 	b, st := newBus(t)
 	addAgent(t, st, "bot", nil)
 	addAgent(t, st, "claude", nil)
+	addAgent(t, st, "codex", nil)
 	report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
 	q, err := b.Send(ctx, "claude", bus.SendInput{To: "bot", Content: "question"})
 	if err != nil {
@@ -858,6 +891,20 @@ func TestAnAnswerToClaudeOutsideASessionWaitsOnItsThread(t *testing.T) {
 	// A new conversation still needs a session.
 	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", Content: "new"}); !errors.Is(err, bus.ErrInvalid) {
 		t.Fatalf("new conversation: err = %v", err)
+	}
+	// So does bringing claude into a conversation it isn't in.
+	other, err := b.Send(ctx, "bot", bus.SendInput{To: "codex", Content: "between bot and codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []bus.SendInput{
+		{To: "claude", ThreadID: other.ThreadID, Content: "joining"},
+		{To: "claude", InReplyTo: other.ID, Content: "joining"},
+	} {
+		_, err := b.Send(ctx, "bot", in)
+		if e, ok := bus.AsAddressError(err); !ok || e.Code != bus.SessionRequired {
+			t.Fatalf("%+v: err = %v", in, err)
+		}
 	}
 }
 

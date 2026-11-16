@@ -221,7 +221,8 @@ Or from a terminal:
 
 ```sh
 birdie agent add me
-birdie send --as me --to claude "What's 12 × 12?"
+birdie session list                  # the address of each running session
+birdie send --as me --to claude/api "What's 12 × 12?"
 birdie inbox --as me --wait 60s
 ```
 
