@@ -74,5 +74,5 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   it is held (#23).
 - Mail sent to bare `claude` before the upgrade is no longer stranded when no
   session can take it. Its sender is told it is held, and it expires after the
-  hold time, counted from then. Answers to what `claude` asked outside a
-  session aren't affected (#24).
+  hold time, counted from then. Answers and follow-ups in a thread `claude`
+  already spoke in, or took a message in, aren't affected (#24).
