@@ -246,6 +246,7 @@ func (s *Server) handle(ctx context.Context, req request) {
 	written := s.writeLive(ctx, resp)
 	for _, m := range taken {
 		if written {
+			s.markShown(m.ID) // if this confirmation is lost, it isn't pushed again
 			s.ack(ctx, m)
 		} else {
 			s.nack(ctx, m)
@@ -598,9 +599,20 @@ func (s *Server) remember(m bus.Message) {
 		clear(s.shown)
 	}
 	s.shown[m.ThreadID] = append(s.shown[m.ThreadID], m)
-	if !s.pushed[m.ID] {
-		s.pushed[m.ID] = true
-		s.pushedOrder = append(s.pushedOrder, m.ID)
+	s.markShownLocked(m.ID)
+}
+
+// markShown records that a tool call's answer showed the message with id.
+func (s *Server) markShown(id string) {
+	s.waitMu.Lock()
+	defer s.waitMu.Unlock()
+	s.markShownLocked(id)
+}
+
+func (s *Server) markShownLocked(id string) {
+	if !s.pushed[id] {
+		s.pushed[id] = true
+		s.pushedOrder = append(s.pushedOrder, id)
 		if len(s.pushedOrder) > maxPushed {
 			delete(s.pushed, s.pushedOrder[0])
 			s.pushedOrder = s.pushedOrder[1:]
