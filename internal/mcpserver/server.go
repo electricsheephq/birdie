@@ -53,6 +53,10 @@ type Server struct {
 
 	pumpOnce sync.Once
 
+	// calls cancels requests in flight, by id, when the client cancels them.
+	callsMu sync.Mutex
+	calls   map[string]context.CancelFunc
+
 	// DetectHost picks the Host from the MCP client's name. Without it the
 	// bridge doesn't act as a session.
 	DetectHost func(client string) Host
@@ -68,7 +72,8 @@ type Server struct {
 
 func New(c *client.Client, name, version string, channel bool, logger *log.Logger) *Server {
 	return &Server{c: c, name: name, version: version, channel: channel, log: logger,
-		waiters: map[string][]chan bus.Message{}, shown: map[string][]bus.Message{}, beat: make(chan struct{}, 1)}
+		waiters: map[string][]chan bus.Message{}, shown: map[string][]bus.Message{}, beat: make(chan struct{}, 1),
+		calls: map[string]context.CancelFunc{}}
 }
 
 type request struct {
@@ -110,6 +115,15 @@ func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 		switch {
 		case req.Method == "":
 			// A response to a request we never send; ignore.
+		case len(req.ID) == 0 && req.Method == "notifications/cancelled":
+			// The client gave up on a request (the user interrupted the turn):
+			// stop it, and give back what it took but couldn't show.
+			var p struct {
+				RequestID json.RawMessage `json:"requestId"`
+			}
+			if json.Unmarshal(req.Params, &p) == nil {
+				s.cancelCall(p.RequestID)
+			}
 		case len(req.ID) == 0:
 			if req.Method == "notifications/initialized" {
 				s.pumpOnce.Do(func() {
@@ -126,8 +140,13 @@ func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 			// In order, because the notification after it needs its result.
 			s.handle(ctx, req)
 		default:
-			// Concurrent so a long wait_for_reply never blocks ping.
-			wg.Go(func() { s.handle(ctx, req) })
+			// Concurrent so a long wait_for_reply never blocks ping. Tracked
+			// before the next line is read, so a cancellation always finds it.
+			rctx, done := s.trackCall(ctx, req.ID)
+			wg.Go(func() {
+				defer done()
+				s.handle(rctx, req)
+			})
 		}
 	}
 	// Input closed: stop pulling new messages, but give in-flight calls a
@@ -146,6 +165,40 @@ func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 	return sc.Err()
 }
 
+// trackCall gives request id a context the client can cancel, and done to
+// call when the request is finished.
+func (s *Server) trackCall(ctx context.Context, id json.RawMessage) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	key := callKey(id)
+	s.callsMu.Lock()
+	s.calls[key] = cancel
+	s.callsMu.Unlock()
+	return ctx, func() {
+		s.callsMu.Lock()
+		delete(s.calls, key)
+		s.callsMu.Unlock()
+		cancel()
+	}
+}
+
+func (s *Server) cancelCall(id json.RawMessage) {
+	s.callsMu.Lock()
+	cancel := s.calls[callKey(id)]
+	s.callsMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// callKey is a request id as it compares: the same JSON, however spaced.
+func callKey(id json.RawMessage) string {
+	var b bytes.Buffer
+	if json.Compact(&b, id) != nil {
+		return string(id)
+	}
+	return b.String()
+}
+
 func (s *Server) handle(ctx context.Context, req request) {
 	var result any
 	var rerr *rpcError
@@ -160,6 +213,10 @@ func (s *Server) handle(ctx context.Context, req request) {
 		result, rerr = s.callTool(ctx, req.Params)
 	default:
 		rerr = &rpcError{-32601, "method not found: " + req.Method}
+	}
+	if ctx.Err() != nil {
+		// Cancelled, or the bridge is stopping: nobody reads an answer now.
+		return
 	}
 	resp := map[string]any{"jsonrpc": "2.0", "id": req.ID}
 	if rerr != nil {
@@ -362,8 +419,7 @@ func (s *Server) pump(ctx context.Context) {
 				continue
 			}
 			if s.route(m) {
-				s.ack(ctx, m)
-				continue
+				continue // the waiter confirms it, or gives it back
 			}
 			if failed {
 				// Back to the queue for the next try, or for check_inbox.
@@ -549,17 +605,18 @@ func channelMeta(m bus.Message) map[string]string {
 	return meta
 }
 
+// route hands m to one wait_for_reply waiting on its thread, if one has room.
 func (s *Server) route(m bus.Message) bool {
 	s.waitMu.Lock()
 	defer s.waitMu.Unlock()
-	chs := s.waiters[m.ThreadID]
-	for _, ch := range chs {
+	for _, ch := range s.waiters[m.ThreadID] {
 		select {
 		case ch <- m:
+			return true
 		default:
 		}
 	}
-	return len(chs) > 0
+	return false
 }
 
 func (s *Server) addWaiter(thread string) chan bus.Message {
@@ -580,8 +637,9 @@ func (s *Server) removeWaiter(thread string, ch chan bus.Message) {
 }
 
 // waitForReply blocks until a message arrives on thread or timeout passes.
-// pushing is whether the session counted as push when the call began; the
-// caller confirms what this returns only if it didn't, so the two must agree.
+// pushing is whether the session counted as push when the call began. The
+// caller confirms what this returns, or gives it back if the call was
+// cancelled.
 func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.Duration, pushing bool) ([]bus.Message, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -602,7 +660,8 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 	}
 	ch := s.addWaiter(thread)
 	// finish stops the pump routing here, then takes what it already did:
-	// those are confirmed, so dropping them would lose them.
+	// those are taken for this call, so dropping them would leave them
+	// leased.
 	finish := func(msgs []bus.Message) []bus.Message {
 		s.removeWaiter(thread, ch)
 		for {
@@ -629,16 +688,15 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 	for {
 		msgs, err := s.c.Inbox(ctx, thread, 0)
 		if err == nil && len(msgs) > 0 {
-			// Taken, even if the deadline passed meanwhile: keep them, or they
-			// sit leased to this session until the lease ends.
-			s.ackAll(ctx, msgs, nil)
+			// Taken, even if the deadline passed meanwhile: return them, or
+			// they sit leased to this session until the lease ends.
 			return finish(msgs), nil
 		}
 		if ctx.Err() != nil {
 			return finish(nil), nil
 		}
 		if err != nil {
-			// What the pump routed here is confirmed, so it wins over an error.
+			// What the pump routed here is taken, so it wins over an error.
 			if got := finish(nil); len(got) > 0 {
 				return got, nil
 			}
