@@ -877,10 +877,6 @@ func TestHeldMessagesExpireAndTheSenderIsTold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waiting, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/web", Content: "for a running session"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if m.Held != "" {
 		t.Fatalf("held while running: %q", m.Held)
 	}
@@ -902,6 +898,10 @@ func TestHeldMessagesExpireAndTheSenderIsTold(t *testing.T) {
 	notice("held")
 	if got := take(t, b, "claude", "s2"); len(got) != 0 {
 		t.Fatalf("another session got %+v", got)
+	}
+	waiting, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/web", Content: "for a running session"})
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	b.HoldFor = time.Millisecond
