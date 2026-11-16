@@ -18,17 +18,20 @@ func AsksQuestions(m Message) bool {
 }
 
 // ThreadStatus is the status of a thread from its messages, oldest first, as
-// one of its agents sees them: ThreadAwaitingClarification when the latest
-// message asks the thread's starter questions (AsksQuestions) and its author
-// has sent nothing but questions in the thread; otherwise empty.
+// one of its agents sees them: ThreadAwaitingClarification when the agent that
+// got the thread's first message has sent nothing but questions
+// (AsksQuestions) back to the agent that sent it, and the latest message is
+// one of them; otherwise empty.
 //
-// The first message the reader sees names the starter. It must start the
-// thread, or join it by its id; when the reader sees only replies, because
-// threads are read per agent, the status is empty rather than guessed. Once
-// the asker has said anything that isn't a question, such as an answer or
-// "done", its later questions don't hold up a request; what other agents in
-// the thread say doesn't change that. The starter's own questions don't count,
-// nor do birdie's notices.
+// That is the clarify-back protocol: the receiver of a new request asks
+// before acting. Questions from anyone else in the thread don't set it, nor do
+// the starter's own questions or birdie's notices. Once the receiver has said
+// anything that isn't a question, such as an answer or "done", its later
+// questions don't hold up the request.
+//
+// The first message the reader sees is taken as the thread's first. It must
+// start the thread, or join it by its id; when the reader sees only replies,
+// because threads are read per agent, the status is empty rather than guessed.
 func ThreadStatus(msgs []Message) string {
 	var root, last *Message
 	for i := range msgs {
@@ -40,7 +43,8 @@ func ThreadStatus(msgs []Message) string {
 		}
 		last = &msgs[i]
 	}
-	if root == nil || root.InReplyTo != "" || last == root || !AsksQuestions(*last) || sameAuthor(*last, *root) || last.To != root.From {
+	if root == nil || root.InReplyTo != "" || last == root || !AsksQuestions(*last) || sameAuthor(*last, *root) ||
+		last.From != root.To || last.To != root.From {
 		return ""
 	}
 	for _, m := range msgs {

@@ -39,6 +39,8 @@ func TestThreadStatus(t *testing.T) {
 		// A question for a third agent doesn't hold up the starter.
 		{"a question for someone else", []bus.Message{ask, {ID: "m2", From: "claude", To: "codex", Content: "(question / not a steer) 1. which X?"}}, ""},
 		{"passed on, then asked", []bus.Message{ask, {ID: "m2", From: "claude", To: "codex", Content: "please help with X"}, {ID: "m3", From: "codex", To: "claude", InReplyTo: "m2", Content: "(question / not a steer) 1. which X?"}}, ""},
+		// Only the agent the request went to asks first.
+		{"an observer asks the starter", []bus.Message{ask, {ID: "m2", From: "codex", To: "eva", Content: "(question / not a steer) 1. why X?"}}, ""},
 		// Two sessions of one agent are different authors.
 		{"one agent's two sessions", []bus.Message{
 			{ID: "m1", From: "claude", FromSession: "s1", To: "claude", Content: "please do X"},
@@ -99,6 +101,17 @@ func TestThreadStatusInThreadsWithThreeAgents(t *testing.T) {
 	for _, reader := range []string{"a", "b", "c"} {
 		if got := status(work.ThreadID, reader); got != "" {
 			t.Errorf("after done, as %s reads it: %q, want none", reader, got)
+		}
+	}
+
+	// Nor does c's question to a, who never asked c for anything.
+	work = send("a", bus.SendInput{To: "b", Content: "implement it"})
+	send("b", bus.SendInput{InReplyTo: work.ID, Content: "done"})
+	result = send("b", bus.SendInput{InReplyTo: work.ID, To: "c", Content: "the result, for your records"})
+	send("c", bus.SendInput{InReplyTo: result.ID, To: "a", Content: bus.ClarifyMarker + " 1. Why this approach?"})
+	for _, reader := range []string{"a", "b", "c"} {
+		if got := status(work.ThreadID, reader); got != "" {
+			t.Errorf("an observer's question, as %s reads it: %q, want none", reader, got)
 		}
 	}
 }
