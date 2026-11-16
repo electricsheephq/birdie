@@ -45,7 +45,7 @@ func hook(ctx context.Context, args []string) error {
 	}
 	text := make([]string, len(msgs))
 	for i, m := range msgs {
-		text[i] = mcpserver.MessageText(m)
+		text[i] = mcpserver.PushText(m)
 	}
 	out, err := grokHookOutput(pos[1], strings.Join(text, "\n\n"))
 	if err == nil {
