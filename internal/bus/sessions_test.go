@@ -681,6 +681,40 @@ func TestThreadFollowUpsGoToTheSessionThatTookTheLastMessage(t *testing.T) {
 	}
 }
 
+// A stand-in id reported before the real one moves everything pinned to it.
+func TestReplacingAStandInMovesItsMessages(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	report(t, b, "claude", "proc-1", "api", bus.TierPush, time.Now())
+	q, err := b.Send(ctx, "claude", bus.SendInput{To: "bot", Content: "question", FromSession: "proc-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/api", Content: "for you"})
+	if err != nil || direct.ToSession != "proc-1" {
+		t.Fatalf("direct = %+v, %v", direct, err)
+	}
+	if err := b.ReportSession(ctx, "claude", "real", bus.SessionInput{Name: "api", Tier: bus.TierPush, Replaces: "proc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := b.Send(ctx, "bot", bus.SendInput{InReplyTo: q.ID, Content: "answer"})
+	if err != nil || a.ToSession != "real" {
+		t.Fatalf("answer = %+v, %v", a, err)
+	}
+	if got := take(t, b, "claude", "real"); len(got) != 2 {
+		t.Fatalf("real got %+v", got)
+	}
+	agent, _ := st.GetAgent(ctx, "claude")
+	if live, _ := b.Sessions(ctx, agent); len(live) != 1 || live[0].ID != "real" {
+		t.Fatalf("live = %+v", live)
+	}
+	if err := b.ReportSession(ctx, "claude", "x", bus.SessionInput{Replaces: "bad id"}); !errors.Is(err, bus.ErrInvalid) {
+		t.Fatalf("bad replaces: err = %v", err)
+	}
+}
+
 // A session that took a message and gave it back hasn't taken part.
 func TestAMessageGivenBackDoesntMakeASessionPartOfTheThread(t *testing.T) {
 	ctx := context.Background()

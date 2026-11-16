@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -58,6 +59,11 @@ type Server struct {
 	hostMu     sync.RWMutex
 	host       Host
 	beat       chan struct{}
+
+	// syncMu keeps session changes in order. replaces is a stand-in id whose
+	// move to the real one the bus hasn't confirmed yet.
+	syncMu   sync.Mutex
+	replaces string
 }
 
 func New(c *client.Client, name, version string, channel bool, logger *log.Logger) *Server {
@@ -259,21 +265,39 @@ func (s *Server) pushing() bool { return s.tier() == bus.TierPush }
 // syncSession makes the client act for the host's current conversation and
 // tells the bus about it.
 func (s *Server) syncSession(ctx context.Context, h Host) {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
 	info := h.Session()
 	if old := s.c.Session(); old != info.ID {
 		s.c.SetSession(info.ID)
-		if old != "" {
+		switch {
+		case old == procID():
+			// The same conversation, now known by its real id: what was
+			// pinned to the stand-in moves with it.
+			s.replaces = old
+		case old != "":
+			// A new conversation (/clear): what was pinned to the old one
+			// waits for it, including a stand-in's move not yet reported.
+			s.replaces = ""
 			if err := s.c.EndSession(ctx, old); err != nil {
 				s.log.Printf("end session: %v", err)
 			}
 		}
 	}
+	if s.replaces == info.ID {
+		s.replaces = ""
+	}
 	err := s.c.ReportSession(ctx, info.ID, bus.SessionInput{
 		Name: info.Name, Cwd: info.Cwd, Branch: gitBranch(info.Cwd), Tier: s.tier(), State: info.State, ActiveAt: info.ActiveAt,
+		Replaces: s.replaces,
 	})
-	if err != nil && ctx.Err() == nil {
-		s.log.Printf("report session: %v", err)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.log.Printf("report session: %v", err)
+		}
+		return
 	}
+	s.replaces = ""
 }
 
 func (s *Server) reportLoop(ctx context.Context, h Host) {
@@ -306,11 +330,13 @@ func (s *Server) endSession() {
 // unless a wait_for_reply call is waiting on that thread. It takes nothing
 // while the session can't be pushed to, so messages stay for check_inbox.
 func (s *Server) pump(ctx context.Context) {
+	unsure := 0 // batches in a row given back because the host couldn't tell
 	for ctx.Err() == nil {
 		if !s.pushing() {
 			pause(ctx, 5*time.Second)
 			continue
 		}
+		polled := s.c.Session()
 		msgs, err := s.c.Inbox(ctx, "", pollWait)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -320,32 +346,101 @@ func (s *Server) pump(ctx context.Context) {
 			pause(ctx, 5*time.Second)
 			continue
 		}
+		// stop, once set, says why the rest of the batch goes back to the
+		// queue: the conversation changed (/clear), so they wait for the old
+		// one, or the bridge can't tell which conversation it serves.
+		var stop error
 		failed := false
 		for _, m := range msgs {
+			// Checked before each message, not once per batch: /clear can
+			// come while one is being shown.
+			if stop == nil {
+				stop = s.check(polled)
+			}
+			if stop != nil {
+				s.nack(ctx, m)
+				continue
+			}
 			if s.route(m) {
 				s.ack(ctx, m)
 				continue
 			}
-			if !failed {
-				if err := s.show(ctx, m); err != nil {
+			if failed {
+				// Back to the queue for the next try, or for check_inbox.
+				s.nack(ctx, m)
+				continue
+			}
+			if err := s.show(ctx, polled, m); err != nil {
+				if errors.Is(err, ErrOtherConversation) || errors.Is(err, errUnsure) {
+					stop = err
+				} else {
 					s.log.Printf("push %s: %v", m.ID, err)
 					failed = true
 				}
-			}
-			if failed {
-				// Back to the queue for the next try, or for check_inbox.
-				if err := s.c.Nack(context.WithoutCancel(ctx), m.ID); err != nil {
-					s.log.Printf("nack %s: %v", m.ID, err)
-				}
+				s.nack(ctx, m)
 				continue
 			}
 			s.remember(m)
 			s.ack(ctx, m)
 		}
-		if failed {
+		if errors.Is(stop, ErrOtherConversation) || errors.Is(s.check(polled), ErrOtherConversation) {
+			// Act for the new conversation before polling again.
+			if h := s.currentHost(); h != nil {
+				s.syncSession(ctx, h)
+			}
+			continue
+		}
+		if stop == nil {
+			unsure = 0
+		}
+		switch {
+		case failed:
 			pause(ctx, 5*time.Second)
+		case stop != nil:
+			// Can't tell which conversation: most often a registry read that
+			// met a rewrite, which is over in a moment.
+			unsure++
+			if time.Duration(unsure)*unsureRetry < registryGrace {
+				pause(ctx, unsureRetry)
+			} else {
+				pause(ctx, 5*time.Second)
+			}
 		}
 	}
+}
+
+// unsureRetry is how soon the pump tries again when the host couldn't tell
+// which conversation it serves.
+const unsureRetry = 500 * time.Millisecond
+
+// check says whether the bridge still serves conversation session, the one
+// messages were taken for: nil if it does, ErrOtherConversation if it changed
+// (/clear), or errUnsure if the host can't tell right now.
+func (s *Server) check(session string) error {
+	if s.c.Session() != session {
+		return ErrOtherConversation
+	}
+	h := s.currentHost()
+	if h == nil {
+		return nil
+	}
+	id, err := hostConversation(h)
+	if err != nil {
+		return err
+	}
+	if id != session {
+		return ErrOtherConversation
+	}
+	return nil
+}
+
+// hostConversation is the conversation h serves right now, by a fresh look
+// where h has one, or errUnsure if it can't tell.
+func hostConversation(h Host) (string, error) {
+	if c, ok := h.(interface{ conversation() (string, error) }); ok {
+		return c.conversation()
+	}
+	return h.Session().ID, nil
 }
 
 func pause(ctx context.Context, d time.Duration) {
@@ -355,17 +450,28 @@ func pause(ctx context.Context, d time.Duration) {
 	}
 }
 
-// show puts a message in front of the model.
-func (s *Server) show(ctx context.Context, m bus.Message) error {
+// show puts a message taken for conversation session in front of the model.
+func (s *Server) show(ctx context.Context, session string, m bus.Message) error {
 	if h := s.currentHost(); h != nil && h.Tier() == bus.TierPush {
-		return h.Push(ctx, m)
+		return h.Push(ctx, session, m)
 	}
-	s.write(map[string]any{
+	b, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"method":  "notifications/claude/channel",
 		"params":  map[string]any{"content": MessageText(m), "meta": channelMeta(m)},
 	})
-	return nil
+	if err != nil {
+		return err
+	}
+	// The write can wait behind a tool call's answer, and /clear can come
+	// meanwhile, so the conversation is checked holding the output lock.
+	s.outMu.Lock()
+	defer s.outMu.Unlock()
+	if err := s.check(session); err != nil {
+		return err
+	}
+	_, err = s.out.Write(append(b, '\n'))
+	return err
 }
 
 func (s *Server) ack(ctx context.Context, m bus.Message) {
@@ -374,6 +480,12 @@ func (s *Server) ack(ctx context.Context, m bus.Message) {
 	}
 	if err := s.c.Ack(context.WithoutCancel(ctx), m.ID); err != nil {
 		s.log.Printf("ack %s: %v", m.ID, err)
+	}
+}
+
+func (s *Server) nack(ctx context.Context, m bus.Message) {
+	if err := s.c.Nack(context.WithoutCancel(ctx), m.ID); err != nil {
+		s.log.Printf("nack %s: %v", m.ID, err)
 	}
 }
 
@@ -468,10 +580,12 @@ func (s *Server) removeWaiter(thread string, ch chan bus.Message) {
 }
 
 // waitForReply blocks until a message arrives on thread or timeout passes.
-func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.Duration) ([]bus.Message, error) {
+// pushing is whether the session counted as push when the call began; the
+// caller confirms what this returns only if it didn't, so the two must agree.
+func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.Duration, pushing bool) ([]bus.Message, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	if !s.pushing() {
+	if !pushing {
 		for {
 			remaining := time.Until(deadlineOf(ctx))
 			if remaining <= 0 {
@@ -479,7 +593,7 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 			}
 			msgs, err := s.c.Inbox(ctx, thread, min(remaining, bus.MaxWait-5*time.Second))
 			if err != nil || len(msgs) > 0 {
-				if ctx.Err() != nil {
+				if ctx.Err() != nil && len(msgs) == 0 {
 					return nil, nil
 				}
 				return msgs, err
@@ -487,29 +601,62 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 		}
 	}
 	ch := s.addWaiter(thread)
-	defer s.removeWaiter(thread, ch)
-	s.waitMu.Lock()
-	already := s.shown[thread]
-	delete(s.shown, thread)
-	s.waitMu.Unlock()
-	if len(already) > 0 {
-		return already, nil
-	}
-	select {
-	case m := <-ch:
-		msgs := []bus.Message{m}
+	// finish stops the pump routing here, then takes what it already did:
+	// those are confirmed, so dropping them would lose them.
+	finish := func(msgs []bus.Message) []bus.Message {
+		s.removeWaiter(thread, ch)
 		for {
 			select {
 			case m := <-ch:
 				msgs = append(msgs, m)
 			default:
-				return msgs, nil
+				return msgs
 			}
 		}
-	case <-ctx.Done():
-		return nil, nil
+	}
+	s.waitMu.Lock()
+	already := s.shown[thread]
+	delete(s.shown, thread)
+	s.waitMu.Unlock()
+	if len(already) > 0 {
+		return finish(already), nil
+	}
+	// The pump only takes what this session is due. Naming the thread also
+	// collects what in it waits for a session that has gone, so check the
+	// thread itself now and then.
+	tick := time.NewTicker(threadCheck)
+	defer tick.Stop()
+	for {
+		msgs, err := s.c.Inbox(ctx, thread, 0)
+		if err == nil && len(msgs) > 0 {
+			// Taken, even if the deadline passed meanwhile: keep them, or they
+			// sit leased to this session until the lease ends.
+			s.ackAll(ctx, msgs, nil)
+			return finish(msgs), nil
+		}
+		if ctx.Err() != nil {
+			return finish(nil), nil
+		}
+		if err != nil {
+			// What the pump routed here is confirmed, so it wins over an error.
+			if got := finish(nil); len(got) > 0 {
+				return got, nil
+			}
+			return nil, err
+		}
+		select {
+		case m := <-ch:
+			return finish([]bus.Message{m}), nil
+		case <-tick.C:
+		case <-ctx.Done():
+			return finish(nil), nil
+		}
 	}
 }
+
+// threadCheck is how often a push session waiting on a thread checks it for
+// messages the pump doesn't take.
+const threadCheck = 2 * time.Second
 
 func deadlineOf(ctx context.Context) time.Time {
 	d, _ := ctx.Deadline()

@@ -435,6 +435,24 @@ func (s *SQLite) EndSession(ctx context.Context, agent, id string, at time.Time)
 	return err
 }
 
+func (s *SQLite) MoveSession(ctx context.Context, agent, from, to string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`UPDATE messages SET to_session = ? WHERE recipient = ? AND to_session = ?`,
+		`UPDATE messages SET taken_by = ? WHERE recipient = ? AND taken_by = ?`,
+		`UPDATE messages SET from_session = ? WHERE sender = ? AND from_session = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, to, agent, from); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *SQLite) LiveSessions(ctx context.Context, agent string, since time.Time) ([]bus.Session, error) {
 	return collectSessions(s.db.QueryContext(ctx, `SELECT `+sessionCols+` FROM sessions
 		WHERE agent = ? AND last_seen >= ? AND ended_at = 0 ORDER BY active_at DESC, id`, agent, since.UnixMilli()))

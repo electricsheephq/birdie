@@ -222,6 +222,9 @@ func (b *Bus) ReportSession(ctx context.Context, agent, id string, in SessionInp
 	if in.Name != "" && !sessionPattern.MatchString(in.Name) {
 		return fmt.Errorf("%w: bad session name %q", ErrInvalid, in.Name)
 	}
+	if in.Replaces != "" && !sessionPattern.MatchString(in.Replaces) {
+		return fmt.Errorf("%w: bad session id %q", ErrInvalid, in.Replaces)
+	}
 	switch in.Tier {
 	case TierPush, TierTurn, TierPull:
 	case "":
@@ -246,6 +249,15 @@ func (b *Bus) ReportSession(ctx context.Context, agent, id string, in SessionInp
 	}
 	if err := b.store.UpsertSession(ctx, s); err != nil {
 		return err
+	}
+	if in.Replaces != "" && in.Replaces != id {
+		if err := b.store.MoveSession(ctx, agent, in.Replaces, id); err != nil {
+			return err
+		}
+		if err := b.store.EndSession(ctx, agent, in.Replaces, now); err != nil {
+			return err
+		}
+		b.emit(Event{Kind: "session", Type: "ended", Agent: agent, Session: in.Replaces})
 	}
 	b.notify(agent)
 	b.emit(Event{Kind: "session", Type: "reported", Agent: agent, Session: id, Name: s.Name, State: s.State})
