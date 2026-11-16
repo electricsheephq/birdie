@@ -167,7 +167,11 @@ func (s *server) thread(w http.ResponseWriter, r *http.Request, a bus.Agent) {
 		s.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"messages": msgs})
+	out := map[string]any{"messages": msgs}
+	if status := bus.ThreadStatus(msgs); status != "" {
+		out["status"] = status
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *server) fail(w http.ResponseWriter, err error) {
