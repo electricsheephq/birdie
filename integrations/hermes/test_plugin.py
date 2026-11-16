@@ -287,7 +287,8 @@ class PluginTest(unittest.TestCase):
         self.assertIn("taken just before", self.call(ctx, "birdie_check_inbox"))
 
     def test_giving_back_doesnt_spin_when_reports_fail(self):
-        self.write_config(True)
+        # Wake stays off, so no delivery loop takes the message meanwhile:
+        # only the deliver() call below handles it.
         ctx, network = self.load()
         self.turn(ctx)
         conversation = network.conversation("s1")
