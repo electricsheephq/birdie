@@ -121,7 +121,15 @@ type claudeHost struct {
 
 	mu   sync.Mutex
 	last *claudeEntry // the last entry read whole
+	// failingSince is when whole reads started failing after last.
+	failingSince time.Time
 }
+
+// registryGrace is how long a remembered registry entry is not enough to show
+// a message. A read cut short by a rewrite fails for a moment; one failing for
+// longer means the registry is unavailable, and the session then goes by the
+// remembered entry, as it goes by the environment when there never was one.
+const registryGrace = 10 * time.Second
 
 type claudeEntry struct {
 	SessionID       string `json:"sessionId"`
@@ -141,36 +149,39 @@ func claudeDir() string {
 	return filepath.Join(home, ".claude")
 }
 
-// entry reads the process's registry entry. fresh is false when the read
-// failed or was cut short, as while Claude Code rewrites the entry at /clear;
-// e is then the last whole entry, if there was one. That keeps the session's
-// identity steady: the environment would name the conversation the process
-// started with. But a remembered entry can't say the conversation hasn't
-// changed since, so it is never enough to show a message (see conversation).
-func (h *claudeHost) entry() (e claudeEntry, ok, fresh bool) {
+// entry reads the process's registry entry. When the read fails or is cut
+// short, as while Claude Code rewrites the entry at /clear, e is the last
+// whole entry, if there was one. That keeps the session's identity steady:
+// the environment would name the conversation the process started with. But
+// a remembered entry can't say the conversation hasn't changed since, so sure
+// is false until reads have failed for registryGrace (see conversation).
+func (h *claudeHost) entry() (e claudeEntry, ok, sure bool) {
 	h.once.Do(func() { h.pid = claudeAncestor() })
 	if h.pid == 0 {
-		return claudeEntry{}, false, false
+		return claudeEntry{}, false, true
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	b, err := os.ReadFile(filepath.Join(claudeDir(), "sessions", fmt.Sprintf("%d.json", h.pid)))
 	if err != nil || json.Unmarshal(b, &e) != nil {
-		if h.last != nil {
-			return *h.last, true, false
+		if h.last == nil {
+			return claudeEntry{}, false, true
 		}
-		return claudeEntry{}, false, false
+		if h.failingSince.IsZero() {
+			h.failingSince = time.Now()
+		}
+		return *h.last, true, time.Since(h.failingSince) >= registryGrace
 	}
-	h.last = &e
+	h.last, h.failingSince = &e, time.Time{}
 	return e, true, true
 }
 
-// conversation is the session's conversation as the registry says right now.
-// Once a whole entry has been read, a read that fails or is cut short gives
-// errUnsure. Before that, it is the conversation in the environment.
+// conversation is the session's conversation as the registry says right now,
+// or errUnsure while it can't tell (see entry). With no registry entry, it is
+// the conversation in the environment.
 func (h *claudeHost) conversation() (string, error) {
-	e, ok, fresh := h.entry()
-	if ok && !fresh {
+	e, ok, sure := h.entry()
+	if !sure {
 		return "", errUnsure
 	}
 	return h.info(e, ok).ID, nil
@@ -242,8 +253,8 @@ func (h *claudeHost) Push(ctx context.Context, session string, m bus.Message) er
 	// The socket belongs to the process, not the conversation, and stays the
 	// same through /clear. So the conversation is checked against the same
 	// read of the registry the socket comes from, just before writing.
-	e, ok, fresh := h.entry()
-	if ok && !fresh {
+	e, ok, sure := h.entry()
+	if !sure {
 		return errUnsure
 	}
 	if h.info(e, ok).ID != session {

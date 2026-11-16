@@ -389,11 +389,20 @@ func (s *Server) pump(ctx context.Context) {
 			}
 			continue
 		}
-		if stop != nil || failed {
+		switch {
+		case failed:
 			pause(ctx, 5*time.Second)
+		case stop != nil:
+			// Can't tell which conversation: most often a registry read that
+			// met a rewrite, which is over in a moment.
+			pause(ctx, unsureRetry)
 		}
 	}
 }
+
+// unsureRetry is how soon the pump tries again when the host couldn't tell
+// which conversation it serves.
+const unsureRetry = 500 * time.Millisecond
 
 // check says whether the bridge still serves conversation session, the one
 // messages were taken for: nil if it does, ErrOtherConversation if it changed

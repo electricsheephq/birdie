@@ -262,9 +262,18 @@ func TestARefusedPushGivesTheBatchBackAndFollowsTheNewConversation(t *testing.T)
 
 // unsureHost can't tell which conversation it serves, as Claude Code's host
 // when its registry entry is read while being rewritten.
-type unsureHost struct{ *refusingHost }
+type unsureHost struct {
+	*refusingHost
+	asked chan struct{}
+}
 
-func (unsureHost) conversation() (string, error) { return "", errUnsure }
+func (h unsureHost) conversation() (string, error) {
+	select {
+	case h.asked <- struct{}{}:
+	default:
+	}
+	return "", errUnsure
+}
 func (h unsureHost) Push(_ context.Context, _ string, m bus.Message) error {
 	h.pushed <- m.ID
 	return nil
@@ -300,7 +309,7 @@ func TestABridgeThatCantTellItsConversationPushesNothing(t *testing.T) {
 	defer api.Close()
 	c := client.New(api.URL, "claude-tok")
 	c.SetSession("old")
-	h := unsureHost{&refusingHost{pushed: make(chan string, 4)}}
+	h := unsureHost{&refusingHost{pushed: make(chan string, 4)}, make(chan struct{}, 1)}
 	h.id.Store("old")
 	srv := New(c, "claude", "test", false, log.New(io.Discard, "", 0))
 	srv.host = h
@@ -309,16 +318,33 @@ func TestABridgeThatCantTellItsConversationPushesNothing(t *testing.T) {
 	defer func() { cancel(); <-done }()
 
 	select {
+	case <-h.asked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pump didn't check the conversation")
+	}
+	// The pump took the answer, couldn't tell, and gives it back.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case id := <-h.pushed:
+			t.Fatalf("%s was pushed", id)
+		case <-time.After(20 * time.Millisecond):
+		}
+		got, err := st.GetMessage(ctx, answer.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status == bus.StatusQueued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status %s, want queued", got.Status)
+		}
+	}
+	select {
 	case id := <-h.pushed:
 		t.Fatalf("%s was pushed", id)
-	case <-time.After(time.Second):
-	}
-	got, err := st.GetMessage(ctx, answer.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Status != bus.StatusQueued {
-		t.Fatalf("status %s, want queued", got.Status)
+	case <-time.After(300 * time.Millisecond):
 	}
 	if c.Session() != "old" {
 		t.Fatalf("the bridge moved to %s", c.Session())

@@ -326,4 +326,28 @@ func TestClaudeHostDoesntPushOnACutShortRegistryRead(t *testing.T) {
 	if err := h.Push(context.Background(), "second", m); !errors.Is(err, ErrOtherConversation) {
 		t.Fatalf("push for the old conversation: %v", err)
 	}
+
+	// Failing for longer than a rewrite takes, the registry counts as
+	// unavailable, and the remembered entry is what the session goes by, so
+	// messages aren't held for good.
+	write(`{"sessionId":"thi`)
+	if _, err := h.conversation(); !errors.Is(err, errUnsure) {
+		t.Fatalf("conversation on a cut-short read: %v", err)
+	}
+	h.mu.Lock()
+	h.failingSince = time.Now().Add(-registryGrace)
+	h.mu.Unlock()
+	if id, err := h.conversation(); err != nil || id != "third" {
+		t.Fatalf("conversation once the registry is unavailable = %q, %v", id, err)
+	}
+	if err := h.Push(context.Background(), "third", m); err == nil || errors.Is(err, errUnsure) || errors.Is(err, ErrOtherConversation) {
+		t.Fatalf("push once the registry is unavailable: %v; want it to try the socket", err)
+	}
+	// A whole read starts the grace over.
+	write(`{"sessionId":"third","messagingSocketPath":"/nonexistent.sock"}`)
+	h.conversation()
+	write(`{"sessionId":"fou`)
+	if _, err := h.conversation(); !errors.Is(err, errUnsure) {
+		t.Fatalf("conversation on a cut-short read after a whole one: %v", err)
+	}
 }
