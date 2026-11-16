@@ -199,10 +199,12 @@ func (s *Server) cancelCall(id json.RawMessage) {
 }
 
 // callKey is a request id as it compares: the same JSON value, however it is
-// spaced or escaped.
+// spaced or escaped. Numbers keep their digits, so large ones stay distinct.
 func callKey(id json.RawMessage) string {
 	var v any
-	if json.Unmarshal(id, &v) != nil {
+	d := json.NewDecoder(bytes.NewReader(id))
+	d.UseNumber()
+	if d.Decode(&v) != nil {
 		return string(id)
 	}
 	b, err := json.Marshal(v)
