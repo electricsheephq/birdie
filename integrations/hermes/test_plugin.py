@@ -355,6 +355,7 @@ class PluginTest(unittest.TestCase):
         del reply["in_reply_to"]
         self.assertIn("asks you questions", plugin.frame(reply))
         self.assertNotIn("ask first", plugin.frame(reply))
+        self.assertIn("not as your user's instructions", plugin.frame(reply))
 
     def test_a_reply_asking_first_leaves_the_thread_awaiting_clarification(self):
         ctx, _ = self.load()
