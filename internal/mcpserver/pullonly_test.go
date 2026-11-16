@@ -7,8 +7,11 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,5 +103,58 @@ func TestTheBridgeDoesntPushIntoAPullOnlySession(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("not pushed once pull-only was off")
+	}
+}
+
+// A bridge that thinks it is pull-only gives back what the bus hands it and
+// asks again. If that report fails, it doesn't take the message straight
+// back in a loop.
+func TestAFailingReportDoesntSpinThePump(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st, err := store.Open(filepath.Join(t.TempDir(), "bus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(st, logger)
+	for _, name := range []string{"claude", "peer"} {
+		if err := st.CreateAgent(ctx, bus.Agent{Name: name, TokenHash: bus.HashToken(name + "-tok"), Delivery: bus.DeliveryPull, CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.ReportSession(ctx, "claude", "s1", bus.SessionInput{Name: "api", Tier: bus.TierPush}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Send(ctx, "peer", bus.SendInput{To: "claude/api", Content: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	inner := httpapi.New(b, logger)
+	var polls atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/sessions/") {
+			http.Error(w, `{"error":"down"}`, http.StatusInternalServerError)
+			return
+		}
+		if r.URL.Path == "/v1/inbox" {
+			polls.Add(1)
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer api.Close()
+	c := client.New(api.URL, "claude-tok")
+	c.SetSession("s1")
+	h := &pullOnlyHost{pushed: make(chan string, 4)}
+	srv := New(c, "claude", "test", false, log.New(io.Discard, "", 0))
+	srv.host = h
+	srv.pullOnly.Store(true) // learned before the switch was turned off; reports now fail
+	done := make(chan struct{})
+	go func() { defer close(done); srv.pump(ctx) }()
+	time.Sleep(time.Second)
+	cancel()
+	<-done
+	if n := polls.Load(); n > 3 {
+		t.Fatalf("%d inbox polls in a second", n)
 	}
 }

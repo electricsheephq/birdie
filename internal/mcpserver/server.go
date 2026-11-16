@@ -519,6 +519,11 @@ func (s *Server) pump(ctx context.Context) {
 			if h := s.currentHost(); h != nil {
 				s.syncSession(ctx, h)
 			}
+			if s.pullOnly.Load() {
+				// Still pull-only, or the report failed: don't take them
+				// straight back.
+				pause(ctx, 5*time.Second)
+			}
 		}
 		if errors.Is(stop, ErrOtherConversation) || errors.Is(s.check(polled), ErrOtherConversation) {
 			// Act for the new conversation before polling again.

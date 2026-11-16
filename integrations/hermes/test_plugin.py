@@ -286,6 +286,20 @@ class PluginTest(unittest.TestCase):
         self.assertEqual(ctx.injected, [], "pushed into a pull-only conversation")
         self.assertIn("taken just before", self.call(ctx, "birdie_check_inbox"))
 
+    def test_giving_back_doesnt_spin_when_reports_fail(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        self.turn(ctx)
+        conversation = network.conversation("s1")
+        conversation.pull_only = True  # learned before; reports fail now
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "x"})
+        waited = []
+        with mock.patch.object(network, "report", side_effect=plugin.BusError("down")), \
+                mock.patch.object(conversation.closed, "wait", side_effect=lambda s: waited.append(s)):
+            network.deliver(conversation, {"id": sent["id"], "thread_id": sent["thread_id"], "from": "peer", "content": "x"})
+        self.assertEqual(waited, [plugin.RETRY_SECONDS])
+        self.assertEqual(ctx.injected, [])
+
     def test_a_refused_message_stays_for_the_tool_and_the_next_turn_tries_again(self):
         self.write_config(True)
         ctx, _ = self.load(accept=False)

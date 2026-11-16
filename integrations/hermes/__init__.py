@@ -448,7 +448,10 @@ class Network:
                 # Taken just before it was made pull-only: back to the queue for
                 # birdie_check_inbox. Asking again ends any loop on a stale flag.
                 self.bus.nack(message["id"])
-                self.report(conversation)
+                try:
+                    self.report(conversation)
+                except BusError:
+                    conversation.closed.wait(RETRY_SECONDS)  # don't take it straight back
                 return
             accepted = False
             if conversation.wake and not conversation.closed.is_set() and self.wake_allowed():
