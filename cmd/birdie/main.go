@@ -179,6 +179,7 @@ func serve(ctx context.Context, args []string) error {
 	db := fs.String("db", defaultDB(), "SQLite database path")
 	publicURL := fs.String("public-url", "", "externally reachable base URL (e.g. a tunnel), advertised to webhook agents for replies")
 	loopLimit := fs.Int("loop-limit", bus.DefaultLoopLimit, "messages one agent may send another in 10 minutes before they're refused as a loop (0 = no limit)")
+	holdFor := fs.Duration("hold-for", bus.DefaultHoldFor, "how long a message waits for a session that stopped to come back (from when it stopped, or from the send if later), before it expires")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -197,6 +198,7 @@ func serve(ctx context.Context, args []string) error {
 	acp := &adapter.ACP{State: st, Log: logger, Version: version}
 	b := bus.New(st, logger, &adapter.Webhook{HTTP: &http.Client{}, PublicURL: *publicURL}, acp)
 	b.LoopLimit = *loopLimit
+	b.HoldFor = *holdFor
 	if *loopLimit == 0 {
 		b.LoopLimit = -1
 	}
