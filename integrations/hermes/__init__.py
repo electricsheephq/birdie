@@ -6,6 +6,7 @@ another credential or calls a model; a woken turn goes through Hermes's own inpu
 """
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import logging
@@ -28,6 +29,7 @@ NOT_SET_UP = ("birdie isn't set up yet. Run `birdie setup hermes`, then restart 
               "Get birdie from https://github.com/koshikraj/birdie")
 NO_TOKEN = ("Hermes doesn't have the BIRDIE_HERMES_TOKEN secret yet. Run `birdie setup hermes`: "
             "it shows the token and how to give it to Hermes. Then restart Hermes.")
+MAX_DELIVERED = 1024  # message ids a conversation remembers putting in
 BEAT_SECONDS = 30  # the bus drops a session it hasn't heard from in 90
 POLL_SECONDS = 25
 LEASE_SECONDS = 120
@@ -167,6 +169,20 @@ class Conversation:
         self.lock = threading.Lock()
         self.waiting = {}  # thread id -> queue, for a wait_for_reply in progress
         self.shown = {}  # thread id -> messages already put in this conversation
+        # Ids of the messages put in this conversation most recently, so one that
+        # comes back (its confirmation was lost and its lease ran out) is
+        # confirmed, not put in again.
+        self.delivered = collections.OrderedDict()
+
+    def was_delivered(self, message_id):
+        with self.lock:
+            return message_id in self.delivered
+
+    def mark_delivered(self, message_id):
+        with self.lock:
+            self.delivered[message_id] = True
+            while len(self.delivered) > MAX_DELIVERED:
+                self.delivered.popitem(last=False)
 
 
 class Network:
@@ -389,10 +405,14 @@ class Network:
         the queue for birdie_check_inbox, and the next turn tries waking again."""
         thread = message.get("thread_id", "")
         try:
+            if conversation.was_delivered(message["id"]):
+                self.bus.ack(message["id"])
+                return
             with conversation.lock:
                 waiter = conversation.waiting.get(thread)
             if waiter is not None:
                 waiter.put(message)
+                conversation.mark_delivered(message["id"])
                 self.bus.ack(message["id"])
                 return
             accepted = False
@@ -404,6 +424,7 @@ class Network:
             if accepted:
                 with conversation.lock:
                     conversation.shown.setdefault(thread, []).append(message)
+                conversation.mark_delivered(message["id"])
                 self.bus.ack(message["id"])
                 return
             self.bus.nack(message["id"])
