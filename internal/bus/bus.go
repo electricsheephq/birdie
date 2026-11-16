@@ -27,9 +27,13 @@ const (
 	// reported. Sessions report every SessionBeat.
 	SessionTTL  = 90 * time.Second
 	SessionBeat = 30 * time.Second
-	// SessionRetention is how long a session is remembered after it stops.
+	// SessionRetention is how long a session is listed after it stops.
 	SessionRetention = 24 * time.Hour
-	maxBranchBytes   = 255
+	// SessionKeep is how long a session is remembered after it stops, so a
+	// message addressed to its id is refused rather than given to another
+	// session with that name.
+	SessionKeep    = 30 * 24 * time.Hour
+	maxBranchBytes = 255
 
 	// DefaultLoopLimit messages from one agent to another within LoopWindow
 	// probably means they are stuck answering each other.
@@ -288,7 +292,8 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	}
 
 	thread := in.ThreadID
-	var pinned string // the session the thread says should get this
+	joins := in.InReplyTo != "" // it answers, or follows up in, a conversation that exists
+	var pinned string           // the session the thread says should get this
 	var parent Message
 	if in.InReplyTo != "" {
 		var err error
@@ -325,6 +330,7 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		if exists && !member {
 			return Message{}, fmt.Errorf("%w: not a participant in thread %q", ErrForbidden, thread)
 		}
+		joins = exists
 	}
 	if in.To == "" {
 		return Message{}, fmt.Errorf("%w: to is required unless in_reply_to is set", ErrInvalid)
@@ -362,7 +368,11 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 			return Message{}, err
 		}
 	}
-	if toSession == "" && to.Delivery == DeliveryPull && !PicksSession(to) {
+	// A new conversation must name a session. One that answers or follows
+	// up a conversation with no session in it (sent by `birdie send`, or by
+	// an agent with no sessions) waits for whoever waits on its thread or
+	// reads without being a session; no session is picked for it.
+	if toSession == "" && !joins && to.Delivery == DeliveryPull && !PicksSession(to) {
 		if err := b.needsDefault(ctx, to); err != nil {
 			return Message{}, err
 		}
@@ -476,6 +486,10 @@ func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput) (ClaimFilter, er
 		f.LeaseUntil = now.Add(in.Lease)
 	}
 	if in.Session == "" {
+		// Not a session: it takes only mail that isn't for a running one
+		// (see the store), and on a thread it named, mail for a session
+		// that has gone.
+		f.Orphans = in.Thread != ""
 		return f, nil
 	}
 	// Waiting on a thread names what it wants, so it doesn't need to be the

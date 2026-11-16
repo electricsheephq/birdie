@@ -69,17 +69,14 @@ func refs(a Agent, live []Session) []SessionRef {
 	return out
 }
 
-// addressOf is an address that reaches only s: its name with the start of its
-// id, or its id when it has no name.
+// addressOf is an address that reaches only s: its name with its whole id,
+// or its id when it has no name. A shortened id could later match another
+// session.
 func addressOf(a Agent, s Session) string {
 	if s.Name == "" {
 		return a.Name + "/" + s.ID
 	}
-	id := s.ID
-	if len(id) > 8 {
-		id = id[:8]
-	}
-	return a.Name + "/" + s.Name + "#" + id
+	return a.Name + "/" + s.Name + "#" + s.ID
 }
 
 func describe(r SessionRef, now time.Time) string {
@@ -112,7 +109,7 @@ func ago(t, now time.Time) string {
 // A session that isn't running is never swapped for another.
 func (b *Bus) findSession(ctx context.Context, to Agent, addr Address) (Session, []SessionRef, error) {
 	now := time.Now()
-	recent, err := b.store.RecentSessions(ctx, to.Name, now.Add(-SessionRetention))
+	recent, err := b.store.RecentSessions(ctx, to.Name, now.Add(-SessionKeep))
 	if err != nil {
 		return Session{}, nil, err
 	}
