@@ -198,23 +198,30 @@ func othersNote(to Agent, name string, others []SessionRef) string {
 }
 
 // chosenSession is the session the user chose to take messages addressed to
-// agent to alone, which doesn't pick one itself (see PicksSession). The
-// message is pinned to it, so it waits for that session even if another with
-// its name opens later. Without one running, the message is refused, with
-// the sessions that are, so the sender can address one.
-func (b *Bus) chosenSession(ctx context.Context, to Agent) (Session, error) {
+// agent to alone, which doesn't pick one itself (see PicksSession), and the
+// other running sessions with its name. The message is pinned to it, so it
+// waits for that session even if another with its name opens later. Without
+// one running, the message is refused, with the sessions that are, so the
+// sender can address one.
+func (b *Bus) chosenSession(ctx context.Context, to Agent) (Session, []SessionRef, error) {
 	live, err := b.store.LiveSessions(ctx, to.Name, time.Now().Add(-SessionTTL))
 	if err != nil {
-		return Session{}, err
+		return Session{}, nil, err
 	}
 	if d := defaultSession(live, to); d != nil {
-		return *d, nil
+		var same []Session
+		for _, s := range live {
+			if s.Name == d.Name && s.ID != d.ID {
+				same = append(same, s)
+			}
+		}
+		return *d, refs(to, same), nil
 	}
 	msg := fmt.Sprintf("%s doesn't pick one of its sessions for a message addressed to %s alone; send it to one of them", to.DisplayName(), to.Name)
 	if len(live) == 0 {
 		msg = fmt.Sprintf("%s has no running session; send to one by its address once it is running", to.DisplayName())
 	}
-	return Session{}, &AddressError{Code: SessionRequired, Msg: msg, Live: refs(to, live), kind: ErrInvalid}
+	return Session{}, nil, &AddressError{Code: SessionRequired, Msg: msg, Live: refs(to, live), kind: ErrInvalid}
 }
 
 // AsAddressError reports err's AddressError, if it is one.
