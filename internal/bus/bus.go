@@ -822,12 +822,8 @@ func (b *Bus) Notice(ctx context.Context, m Message, kind, text string) error {
 	if IsSystemSender(m.From) {
 		return nil
 	}
-	if msgs, err := b.store.Thread(ctx, m.ThreadID, m.From); err == nil {
-		for _, old := range msgs {
-			if IsSystemSender(old.From) && old.Meta[noticeKey] == kind {
-				return nil
-			}
-		}
+	if exists, err := b.store.HasNotice(ctx, m.ThreadID, m.From, kind); err == nil && exists {
+		return nil
 	}
 	id := randHex(12)
 	n := Message{

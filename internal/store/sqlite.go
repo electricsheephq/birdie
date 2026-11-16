@@ -282,6 +282,15 @@ func (s *SQLite) Thread(ctx context.Context, threadID, agent string) ([]bus.Mess
 		threadID, agent, agent))
 }
 
+func (s *SQLite) HasNotice(ctx context.Context, threadID, agent, kind string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM messages WHERE thread_id = ? AND recipient = ?
+		AND sender IN (?, ?) AND COALESCE(json_extract(meta, '$.notice'), '') = ?
+	)`, threadID, agent, bus.SystemSender, bus.LegacySystemSender, kind).Scan(&exists)
+	return exists, err
+}
+
 func (s *SQLite) ThreadSession(ctx context.Context, threadID, from, agent string) (string, error) {
 	var id string
 	err := s.db.QueryRowContext(ctx,
@@ -411,9 +420,13 @@ func (s *SQLite) SettleHeld(ctx context.Context, q bus.HoldQuery, build func([]b
 		return nil, nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT `+msgCols+`, COALESCE(s.name, '') FROM messages m
+	// A byte prefix covers every preview rune without stopping at embedded NULs.
+	// Notices need routing details, not full content or caller-supplied metadata.
+	rows, err := tx.QueryContext(ctx, `SELECT m.id, m.thread_id, m.in_reply_to, m.sender, m.recipient,
+		m.from_session, m.to_session, substr(CAST(m.content AS BLOB), 1, ?), '{}',
+		m.status, m.attempts, m.created_at, COALESCE(s.name, '') FROM messages m
 		LEFT JOIN sessions s ON s.agent = m.recipient AND s.id = m.to_session
-		WHERE `+where+` ORDER BY m.seq LIMIT ?`, args...)
+		WHERE `+where+` ORDER BY m.seq LIMIT ?`, append([]any{4 * bus.PreviewRunes}, args...)...)
 	if err != nil {
 		return nil, nil, err
 	}
