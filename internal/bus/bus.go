@@ -164,7 +164,8 @@ func (b *Bus) RecentSessions(ctx context.Context, a Agent) ([]Session, error) {
 }
 
 // defaultSession picks the session of a that takes new conversations: the
-// one with the name the user chose, else, if the agent picks one itself (see
+// one with the name the user chose (the most recently active, if several
+// have it), else, if the agent picks one itself (see
 // PicksSession), the one that can see messages soonest, most recently active
 // first. It returns nil if there are none.
 func defaultSession(live []Session, a Agent) *Session {
@@ -173,12 +174,15 @@ func defaultSession(live []Session, a Agent) *Session {
 	var best *Session
 	for i := range live {
 		s := &live[i]
-		if chosen != "" && s.Name == chosen {
-			return s
+		if chosen != "" && s.Name == chosen && (best == nil || s.ActiveAt.After(best.ActiveAt)) {
+			best = s
 		}
-		if !auto {
-			continue
-		}
+	}
+	if best != nil || !auto {
+		return best
+	}
+	for i := range live {
+		s := &live[i]
 		if best == nil || tierRank(s.Tier) > tierRank(best.Tier) ||
 			(tierRank(s.Tier) == tierRank(best.Tier) && s.ActiveAt.After(best.ActiveAt)) {
 			best = s
@@ -355,7 +359,8 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		return Message{}, err
 	}
 	toSession := pinned
-	var others []SessionRef
+	var others []SessionRef // running sessions with the name that were passed over
+	name := addr.Session
 	if addr.Session != "" {
 		s, more, err := b.findSession(ctx, to, addr)
 		if err != nil {
@@ -381,11 +386,11 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		}
 	}
 	if toSession == "" && !joins && to.Delivery == DeliveryPull && !PicksSession(to) {
-		s, err := b.chosenSession(ctx, to)
+		s, more, err := b.chosenSession(ctx, to)
 		if err != nil {
 			return Message{}, err
 		}
-		toSession = s.ID
+		toSession, others, name = s.ID, more, s.Name
 	}
 
 	id := randHex(12)
@@ -419,7 +424,7 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	m.Note = b.deliveryNote(ctx, to, m)
 	if len(others) > 0 {
 		m.OtherSessions = others
-		m.Note += "; " + othersNote(to, addr.Session, others)
+		m.Note += "; " + othersNote(to, name, others)
 	}
 	if to.Delivery == DeliveryPull {
 		b.notify(to.Name)

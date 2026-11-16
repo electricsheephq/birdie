@@ -432,12 +432,17 @@ func TestAMessageForClaudeAloneNeedsASession(t *testing.T) {
 	if err := st.SetAgentConfig(ctx, "claude", "default_session", "api"); err != nil {
 		t.Fatal(err)
 	}
+	report(t, b, "claude", "s3", "api", bus.TierPush, now.Add(-2*time.Minute))
 	m, err := send("claude")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if m.ToSession != "s1" {
 		t.Fatalf("the message isn't pinned to the chosen session: %q", m.ToSession)
+	}
+	// The other running session with that name is named to the sender.
+	if len(m.OtherSessions) != 1 || m.OtherSessions[0].Address != "claude/api#s3" || !strings.Contains(m.Note, "claude/api#s3") {
+		t.Fatalf("others = %+v, note %q", m.OtherSessions, m.Note)
 	}
 	if got := take(t, b, "claude", "s2"); len(got) != 0 {
 		t.Fatalf("the session that wasn't chosen got %+v", got)
@@ -446,8 +451,10 @@ func TestAMessageForClaudeAloneNeedsASession(t *testing.T) {
 		t.Fatalf("the chosen session got %+v", got)
 	}
 	// Not while it isn't running.
-	if err := b.EndSession(ctx, "claude", "s1"); err != nil {
-		t.Fatal(err)
+	for _, id := range []string{"s1", "s3"} {
+		if err := b.EndSession(ctx, "claude", id); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := send("claude"); !errors.Is(err, bus.ErrInvalid) {
 		t.Fatalf("chosen session closed: err = %v", err)
