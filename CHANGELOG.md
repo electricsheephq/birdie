@@ -19,10 +19,10 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   them, and `/clear` is tracked.
 - **Expect one burst of notices on first start.** Messages held for a session
   that stopped more than 7 days ago (`serve --hold-for`) expire, and each
-  sender is told once. So does mail sent to bare `claude` before the upgrade
-  that no session can take: if it is older than 7 days it expires, otherwise
-  its sender is told it is held. Choosing a default or turning fallback on
-  lets a session take it instead.
+  sender is told once. Mail sent to bare `claude` before the upgrade, which
+  no session can take, is held too: its sender is told, and it expires 7 days
+  after that unless you choose a default or turn fallback on first, which
+  lets a session take it.
 - **The database gains two columns on start:** `messages.held_at` and
   `sessions.pull_only`, both 0 by default.
 - **Rolling back:** the bbcdfcc binary runs on the upgraded database and
@@ -66,12 +66,13 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 - Runs of dashes in session names collapse to one (#3).
 - The setup and migration tests pass on macOS, and they never touch the real
   config folder (#20).
-- A stalled daemon can't hold up a session's bridge: reporting or ending a
-  session, and confirming or returning a message, give up after 10 seconds
-  (#22).
+- A stalled daemon can't hold up a session's bridge forever: reporting or
+  ending a session, and confirming or returning a message, each give up after
+  10 seconds (#22).
 - A very large message no longer costs a full read each time birdie makes an
   event preview, checks whether a notice was already sent, or tells a sender
   it is held (#23).
 - Mail sent to bare `claude` before the upgrade is no longer stranded when no
   session can take it. Its sender is told it is held, and it expires after the
-  hold time (#24).
+  hold time, counted from then. Answers to what `claude` asked outside a
+  session aren't affected (#24).
