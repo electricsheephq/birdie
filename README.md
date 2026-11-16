@@ -140,7 +140,10 @@ If a session closes, new conversations waiting for it go to the default
 session; if none is open, they wait for one. For `claude`, they wait for the
 session you chose. Answers and follow-ups for a closed
 session wait for that session to come back, because what they answer was said
-there; the sender is told so when it sends. A session can still collect one by
+there; the sender is told so when it sends, or when the session closes before
+taking them. If the session doesn't come back within 7 days of the send
+(`birdie serve --hold-for`), the message expires and the sender is told. No
+other session gets it. A session can still collect one by
 waiting on its thread.
 
 To keep one session from being interrupted, give its MCP server `--no-push`;
