@@ -56,14 +56,14 @@ func TestInboxDeadlinesLeaveTimeForTheWholeLongPoll(t *testing.T) {
 	}
 }
 
-func TestSessionCallsKeepAShorterCallerDeadline(t *testing.T) {
+func TestBoundedCallsKeepAShorterCallerDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	want, _ := ctx.Deadline()
 	c := New("http://daemon", "test-token")
 	c.HTTP.Transport = deadlineTransport(func(r *http.Request) (*http.Response, error) {
 		if got, ok := r.Context().Deadline(); !ok || !got.Equal(want) {
-			t.Error("session call replaced the caller's earlier deadline")
+			t.Errorf("%s %s replaced the caller's earlier deadline", r.Method, r.URL.Path)
 		}
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
 	})
@@ -71,6 +71,12 @@ func TestSessionCallsKeepAShorterCallerDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := c.EndSession(ctx, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Ack(ctx, "m1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Nack(ctx, "m1"); err != nil {
 		t.Fatal(err)
 	}
 }
