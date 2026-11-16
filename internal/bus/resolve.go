@@ -146,7 +146,7 @@ func (b *Bus) findSession(ctx context.Context, to Agent, addr Address) (Session,
 		}
 		// A whole id can only mean this session, so one that may still be
 		// open gets it; if it has gone, the message is held.
-		if s.Live(now) || b.mayStillRun(ctx, s, now) {
+		if s.Live(now) || b.mayStillRun(s, now) {
 			return s, nil, nil
 		}
 		return ended(s)
@@ -192,15 +192,12 @@ func (b *Bus) findSession(ctx context.Context, to Agent, addr Address) (Session,
 // mayStillRun reports whether s, silent but never closed, may still be open
 // because birdie has only just started or woken and s hasn't reported yet: it
 // was running when birdie last heard from any session before that.
-func (b *Bus) mayStillRun(ctx context.Context, s Session, now time.Time) bool {
-	if !s.EndedAt.IsZero() || !b.quiet(now) {
+func (b *Bus) mayStillRun(s Session, now time.Time) bool {
+	heard := b.heard.Load()
+	if !s.EndedAt.IsZero() || !b.quiet(now) || heard == 0 {
 		return false
 	}
-	heard, err := b.store.LastSeenBefore(ctx, time.UnixMilli(b.listening.Load()))
-	if err != nil || heard.IsZero() {
-		return false
-	}
-	return !s.LastSeen.Before(heard.Add(-SessionTTL))
+	return !s.LastSeen.Before(time.UnixMilli(heard).Add(-SessionTTL))
 }
 
 // othersNote tells the sender that name reached one of several sessions.

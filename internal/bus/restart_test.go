@@ -25,7 +25,7 @@ func TestAWholeIdIsntRefusedJustAfterARestart(t *testing.T) {
 	addAgent(t, st, "bot", nil)
 	addAgent(t, st, "claude", nil)
 	stale := time.Now().Add(-10 * time.Minute) // the daemon was down
-	for _, id := range []string{"s1", "closed"} {
+	for _, id := range []string{"s1", "s2", "closed"} {
 		if err := st.UpsertSession(ctx, bus.Session{Agent: "claude", ID: id, Name: "api", Tier: bus.TierPush, ActiveAt: stale, LastSeen: stale}); err != nil {
 			t.Fatal(err)
 		}
@@ -52,9 +52,16 @@ func TestAWholeIdIsntRefusedJustAfterARestart(t *testing.T) {
 	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/gone", Content: "hi"}); !isAddressError(err, bus.RecipientSessionEnded) {
 		t.Fatalf("a session gone before birdie stopped: %v", err)
 	}
+	// s1 reports again; that doesn't make the long-gone one look recent.
+	if err := b.ReportSession(ctx, "claude", "s1", bus.SessionInput{Name: "api", Tier: bus.TierPush}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/gone", Content: "hi"}); !isAddressError(err, bus.RecipientSessionEnded) {
+		t.Fatalf("a session gone before birdie stopped, once others report: %v", err)
+	}
 	time.Sleep(400 * time.Millisecond)
-	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/s1", Content: "hi"}); !isAddressError(err, bus.RecipientSessionEnded) {
-		t.Fatalf("after listening: %v", err)
+	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/s2", Content: "hi"}); !isAddressError(err, bus.RecipientSessionEnded) {
+		t.Fatalf("after listening, one that never came back: %v", err)
 	}
 }
 
@@ -121,5 +128,29 @@ func TestARestartLosesAndRepeatsNothing(t *testing.T) {
 	}
 	if got, err := st.GetMessage(ctx, sent[0].ID); err != nil || got.Status != bus.StatusDelivered {
 		t.Fatalf("confirmed one: %+v, %v", got.Status, err)
+	}
+}
+
+// After the machine sleeps, a session that was running when it went to sleep
+// gets its whole id until it reports; one gone long before still doesn't.
+func TestAWholeIdIsntRefusedJustAfterAWake(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	b.QuietFor = 300 * time.Millisecond
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	now := time.Now()
+	slept := now.Add(-10 * time.Minute)
+	for id, seen := range map[string]time.Time{"open": slept, "gone": slept.Add(-48 * time.Hour)} {
+		if err := st.UpsertSession(ctx, bus.Session{Agent: "claude", ID: id, Name: id, Tier: bus.TierPush, ActiveAt: seen, LastSeen: seen}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b.Woke(slept, now)
+	if m, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/open", Content: "hi"}); err != nil || m.ToSession != "open" {
+		t.Fatalf("open after a wake: %+v, %v", m, err)
+	}
+	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/gone", Content: "hi"}); !isAddressError(err, bus.RecipientSessionEnded) {
+		t.Fatalf("gone after a wake: %v", err)
 	}
 }

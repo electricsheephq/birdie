@@ -69,8 +69,12 @@ type Bus struct {
 	// machine wakes, before it takes a session it hasn't heard from as
 	// stopped or expires anything: SessionTTL, long enough for every running
 	// session to report. Negative means not at all.
-	QuietFor   time.Duration
-	listening  atomic.Int64 // since when, in Unix ms
+	QuietFor  time.Duration
+	listening atomic.Int64 // since when, in Unix ms
+	// heard is when birdie last heard from any session before it started
+	// listening, in Unix ms (0 if never). Taken as listening starts, before
+	// sessions report again and overwrite their last_seen.
+	heard      atomic.Int64
 	lastExpire time.Time
 
 	mu      sync.Mutex
@@ -87,7 +91,12 @@ func New(s Store, log *slog.Logger, ds ...Deliverer) *Bus {
 		waiters:    make(map[string]map[chan struct{}]struct{}),
 		kick:       make(chan struct{}, 1),
 	}
-	b.listening.Store(time.Now().UnixMilli())
+	now := time.Now()
+	b.listening.Store(now.UnixMilli())
+	// Nothing can have reported to this bus yet.
+	if t, err := s.LastSeenBefore(context.Background(), now); err == nil && !t.IsZero() {
+		b.heard.Store(t.UnixMilli())
+	}
 	for _, d := range ds {
 		b.deliverers[d.Kind()] = d
 	}
@@ -329,6 +338,14 @@ func days(d time.Duration) string {
 		return fmt.Sprintf("%d days", n)
 	}
 	return d.String()
+}
+
+// woke starts listening again after a sleep: sessions were last heard
+// before it, up to last, when the bus last ran.
+func (b *Bus) woke(last, now time.Time) {
+	b.heard.Store(last.UnixMilli())
+	b.listening.Store(now.UnixMilli())
+	b.lastExpire = time.Time{}
 }
 
 // quiet reports whether the bus has listened for too short a time, since it
@@ -943,8 +960,7 @@ func (b *Bus) RunDelivery(ctx context.Context) {
 	awake := func(waiting bool) {
 		now := time.Now()
 		if asleep(time.Duration(now.UnixMilli()-last.UnixMilli())*time.Millisecond, now.Sub(last), waiting) {
-			b.listening.Store(now.UnixMilli())
-			b.lastExpire = time.Time{}
+			b.woke(last, now)
 		}
 		last = now
 	}
