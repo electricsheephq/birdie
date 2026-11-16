@@ -933,14 +933,12 @@ func (b *Bus) RunDelivery(ctx context.Context) {
 	}
 	t := time.NewTicker(sweepInterval)
 	defer t.Stop()
-	// Wall-clock time goes on while the machine sleeps. A gap far longer than
-	// a tick, while delivering or waiting, means sessions may not have
-	// reported since, so the bus listens again before taking silence as
-	// stopping.
+	// After a sleep, sessions may not have reported since, so the bus listens
+	// again before taking silence as stopping.
 	last := time.Now()
-	awake := func() {
+	awake := func(waiting bool) {
 		now := time.Now()
-		if now.UnixMilli()-last.UnixMilli() > SessionBeat.Milliseconds() {
+		if asleep(time.Duration(now.UnixMilli()-last.UnixMilli())*time.Millisecond, now.Sub(last), waiting) {
 			b.listening.Store(now.UnixMilli())
 			b.lastExpire = time.Time{}
 		}
@@ -948,7 +946,7 @@ func (b *Bus) RunDelivery(ctx context.Context) {
 	}
 	for {
 		b.deliverDue(ctx)
-		awake()
+		awake(false)
 		if now := time.Now(); !b.quiet(now) && now.Sub(b.lastExpire) >= expireEvery {
 			b.lastExpire = now
 			// Expiring first spares a message that is already too old a
@@ -963,8 +961,17 @@ func (b *Bus) RunDelivery(ctx context.Context) {
 		case <-t.C:
 		case <-b.kick:
 		}
-		awake()
+		awake(true)
 	}
+}
+
+// asleep reports whether the machine slept, or the bus was stopped, during a
+// stretch that took wall on the wall clock and mono on the monotonic clock.
+// The monotonic clock stops while the machine sleeps (on macOS and Linux) and
+// the wall clock doesn't. Delivering can be slow, so only that difference
+// counts; waiting for the next tick never takes long, so any long wait does.
+func asleep(wall, mono time.Duration, waiting bool) bool {
+	return wall-mono > SessionBeat || (waiting && wall > SessionBeat)
 }
 
 func (b *Bus) deliverDue(ctx context.Context) {

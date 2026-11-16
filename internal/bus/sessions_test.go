@@ -1252,3 +1252,24 @@ func TestASendWhileListeningDoesntCallASessionStopped(t *testing.T) {
 		t.Fatalf("sweep: %+v", got)
 	}
 }
+
+// Slow delivery isn't taken for a sleep; a sleep while delivering or
+// waiting is.
+func TestASleepIsToldFromSlowDelivery(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		wall, mono time.Duration
+		waiting    bool
+		want       bool
+	}{
+		{"slow delivery", time.Minute, time.Minute, false, false},
+		{"slept while delivering", time.Minute, 5 * time.Second, false, true},
+		{"slept while waiting", time.Hour, 5 * time.Second, true, true},
+		{"a long wait, however the clocks agree", time.Minute, time.Minute, true, true},
+		{"a tick", 5 * time.Second, 5 * time.Second, true, false},
+	} {
+		if got := bus.Asleep(c.wall, c.mono, c.waiting); got != c.want {
+			t.Errorf("%s: asleep = %v", c.name, got)
+		}
+	}
+}
