@@ -115,6 +115,9 @@ type claudeHost struct {
 
 	once sync.Once
 	pid  int
+
+	mu   sync.Mutex
+	last *claudeEntry // the last entry read whole
 }
 
 type claudeEntry struct {
@@ -137,14 +140,24 @@ func claudeDir() string {
 
 func (h *claudeHost) entry() (claudeEntry, bool) {
 	h.once.Do(func() { h.pid = claudeAncestor() })
-	var e claudeEntry
 	if h.pid == 0 {
-		return e, false
-	}
-	b, err := os.ReadFile(filepath.Join(claudeDir(), "sessions", fmt.Sprintf("%d.json", h.pid)))
-	if err != nil || json.Unmarshal(b, &e) != nil {
 		return claudeEntry{}, false
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var e claudeEntry
+	b, err := os.ReadFile(filepath.Join(claudeDir(), "sessions", fmt.Sprintf("%d.json", h.pid)))
+	if err != nil || json.Unmarshal(b, &e) != nil {
+		// Read while Claude Code rewrites it, as at /clear, the entry can be
+		// cut short. The environment would then name the conversation the
+		// process started with, not the one it serves now, so the last whole
+		// entry stands in.
+		if h.last != nil {
+			return *h.last, true
+		}
+		return claudeEntry{}, false
+	}
+	h.last = &e
 	return e, true
 }
 

@@ -282,3 +282,36 @@ func TestCodexPushOnlyReachesTheThreadItWasTakenFor(t *testing.T) {
 		t.Fatalf("push for the old thread: %v", err)
 	}
 }
+
+// A registry entry read while Claude Code rewrites it can be cut short. The
+// conversation must not fall back to the one in the environment, which is the
+// one the process started with.
+func TestClaudeHostKeepsTheLastWholeRegistryEntry(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("CLAUDE_CODE_MESSAGING_SOCKET", "")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "old")
+	if err := os.Mkdir(filepath.Join(dir, "sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "sessions", "4242.json")
+	h := &claudeHost{}
+	h.once.Do(func() {})
+	h.pid = 4242
+	if err := os.WriteFile(file, []byte(`{"sessionId":"new","messagingSocketPath":"/nonexistent.sock"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if id := h.Session().ID; id != "new" {
+		t.Fatalf("session = %s", id)
+	}
+	if err := os.WriteFile(file, []byte(`{"sessionId":"ne`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if id := h.Session().ID; id != "new" {
+		t.Fatalf("session from a cut-short entry = %s", id)
+	}
+	err := h.Push(context.Background(), "old", bus.Message{ID: "msg_1", ThreadID: "t", From: "bot", Content: "hi"})
+	if !errors.Is(err, ErrOtherConversation) {
+		t.Fatalf("push for the old conversation: %v", err)
+	}
+}

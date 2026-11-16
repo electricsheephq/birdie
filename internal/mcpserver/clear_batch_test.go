@@ -173,3 +173,89 @@ func TestChannelShowOnlyReachesTheConversationItWasTakenFor(t *testing.T) {
 type pullHost struct{ *batchHost }
 
 func (pullHost) Tier() string { return bus.TierPull }
+
+// refusingHost has /clear land between the pump's check and its first Push:
+// the push finds the host serving another conversation and refuses.
+type refusingHost struct {
+	id     atomic.Value
+	pushed chan string
+}
+
+func (h *refusingHost) Session() SessionInfo {
+	return SessionInfo{ID: h.id.Load().(string), Name: "review"}
+}
+func (h *refusingHost) Tier() string            { return bus.TierPush }
+func (h *refusingHost) Observe(json.RawMessage) {}
+func (h *refusingHost) Push(_ context.Context, session string, m bus.Message) error {
+	h.id.Store("new")
+	if session != h.Session().ID {
+		return ErrOtherConversation
+	}
+	h.pushed <- m.ID
+	return nil
+}
+
+func TestARefusedPushGivesTheBatchBackAndFollowsTheNewConversation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st, err := store.Open(filepath.Join(t.TempDir(), "bus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(st, logger)
+	for _, name := range []string{"claude", "peer"} {
+		if err := st.CreateAgent(ctx, bus.Agent{Name: name, TokenHash: bus.HashToken(name + "-tok"), Delivery: bus.DeliveryPull, CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.ReportSession(ctx, "claude", "old", bus.SessionInput{Name: "review", Tier: bus.TierPush}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := b.Send(ctx, "claude", bus.SendInput{To: "peer", Content: "old question", FromSession: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var answers []bus.Message
+	for _, content := range []string{"answer one", "answer two"} {
+		m, err := b.Send(ctx, "peer", bus.SendInput{InReplyTo: q.ID, Content: content})
+		if err != nil {
+			t.Fatal(err)
+		}
+		answers = append(answers, m)
+	}
+	api := httptest.NewServer(httpapi.New(b, logger))
+	defer api.Close()
+	c := client.New(api.URL, "claude-tok")
+	c.SetSession("old")
+	h := &refusingHost{pushed: make(chan string, 4)}
+	h.id.Store("old")
+	srv := New(c, "claude", "test", false, log.New(io.Discard, "", 0))
+	srv.host = h
+	done := make(chan struct{})
+	go func() { defer close(done); srv.pump(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for c.Session() != "new" {
+		if time.Now().After(deadline) {
+			t.Fatal("the bridge didn't follow the new conversation")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	select {
+	case id := <-h.pushed:
+		t.Fatalf("%s was pushed to the new conversation", id)
+	case <-time.After(300 * time.Millisecond):
+	}
+	for _, a := range answers {
+		got, err := st.GetMessage(ctx, a.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != bus.StatusQueued || got.ToSession != "old" {
+			t.Fatalf("%s: status %s, for %q; want queued for the old conversation", a.ID, got.Status, got.ToSession)
+		}
+	}
+}
