@@ -444,6 +444,12 @@ class Network:
                     waiter.put(message)
             if waiter is not None:
                 return
+            if conversation.pull_only:
+                # Taken just before it was made pull-only: back to the queue for
+                # birdie_check_inbox. Asking again ends any loop on a stale flag.
+                self.bus.nack(message["id"])
+                self.report(conversation)
+                return
             accepted = False
             if conversation.wake and not conversation.closed.is_set() and self.wake_allowed():
                 try:
@@ -480,15 +486,25 @@ class Network:
                 raise InterruptedError
 
     def wait_pushed(self, conversation, thread, seconds):
-        """While delivery is running it owns the inbox, so it hands this thread over."""
+        """While delivery is running it owns the inbox, so it hands this thread over.
+        Returns None for the messages if the conversation turns out to be pull-only:
+        then nothing is handed over, and the caller fetches instead."""
         with conversation.lock:
             shown = conversation.shown.pop(thread, [])
             if shown:
                 return shown, True
             waiter = conversation.waiting[thread] = queue.Queue()
         try:
+            try:
+                # Only now that delivery would hand the reply here: it may have been
+                # made pull-only since this conversation last reported.
+                self.report(conversation)
+            except BusError:
+                pass
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
+                if conversation.pull_only:
+                    return None, False
                 try:
                     message = waiter.get(timeout=min(WAIT_STEP_SECONDS, max(0.01, deadline - time.monotonic())))
                 except queue.Empty:
@@ -574,12 +590,15 @@ class Network:
     def wait_for_reply(self, conversation, args):
         thread = args["thread_id"]
         seconds = max(0, min(float(args.get("timeout_seconds") or 120), MAX_REPLY_SECONDS))
+        deadline = time.monotonic() + seconds
         if self.pushing(conversation):
             messages, _ = self.wait_pushed(conversation, thread, seconds)
-            if not messages:
+            if messages == []:
                 return "No reply yet. It will come to you on its own when it arrives."
         else:
-            messages = self.take(conversation, seconds, thread)
+            messages = None
+        if messages is None:  # pull, or made pull-only while waiting
+            messages = self.take(conversation, max(0, deadline - time.monotonic()), thread)
             if not messages:
                 return "No reply yet. Check again later with birdie_wait_for_reply or birdie_check_inbox."
         return "\n\n".join(frame(m) for m in messages)

@@ -445,10 +445,12 @@ func (s *Server) endSession() {
 // pump long-polls the inbox and puts each message in front of the model,
 // unless a wait_for_reply call is waiting on that thread. It takes nothing
 // while the session can't be pushed to, so messages stay for check_inbox.
+// It keeps polling a pull-only session: the bus gives it nothing until that
+// is turned off, so pushes resume without waiting for the next report.
 func (s *Server) pump(ctx context.Context) {
 	unsure := 0 // batches in a row given back because the host couldn't tell
 	for ctx.Err() == nil {
-		if !s.pushing() {
+		if s.canTier() != bus.TierPush {
 			pause(ctx, 5*time.Second)
 			continue
 		}
@@ -466,7 +468,7 @@ func (s *Server) pump(ctx context.Context) {
 		// queue: the conversation changed (/clear), so they wait for the old
 		// one, or the bridge can't tell which conversation it serves.
 		var stop error
-		failed := false
+		failed, relearn := false, false
 		for _, m := range msgs {
 			// Checked before each message, not once per batch: /clear can
 			// come while one is being shown.
@@ -486,6 +488,13 @@ func (s *Server) pump(ctx context.Context) {
 			if s.route(m) {
 				continue // the waiter confirms it, or gives it back
 			}
+			if s.pullOnly.Load() {
+				// Taken just before it was made pull-only: back to the queue
+				// for check_inbox.
+				s.nack(ctx, m)
+				relearn = true
+				continue
+			}
 			if failed {
 				// Back to the queue for the next try, or for check_inbox.
 				s.nack(ctx, m)
@@ -503,6 +512,13 @@ func (s *Server) pump(ctx context.Context) {
 			}
 			s.remember(m)
 			s.ack(ctx, m)
+		}
+		if relearn {
+			// The bus handed these out, so it may say pull-only is off now:
+			// ask, rather than give them back again until the next report.
+			if h := s.currentHost(); h != nil {
+				s.syncSession(ctx, h)
+			}
 		}
 		if errors.Is(stop, ErrOtherConversation) || errors.Is(s.check(polled), ErrOtherConversation) {
 			// Act for the new conversation before polling again.

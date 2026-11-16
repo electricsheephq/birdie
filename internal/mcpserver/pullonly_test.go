@@ -66,6 +66,10 @@ func TestTheBridgeDoesntPushIntoAPullOnlySession(t *testing.T) {
 	srv.host = h
 	out := &bytes.Buffer{}
 	srv.out = out
+	srv.syncSession(ctx, h) // its report says it is pull-only
+	if srv.pushing() {
+		t.Fatal("the bridge didn't learn it is pull-only")
+	}
 	done := make(chan struct{})
 	go func() { defer close(done); srv.pump(ctx) }()
 	defer func() { cancel(); <-done }()
@@ -80,7 +84,9 @@ func TestTheBridgeDoesntPushIntoAPullOnlySession(t *testing.T) {
 		t.Fatalf("check_inbox didn't get it: %s", out)
 	}
 
-	if _, err := b.SetPullOnly(ctx, "claude/api", false); err != nil {
+	// Turned off from another process: the bridge hasn't reported since, so
+	// it still thinks it is pull-only. Pushes resume within seconds anyway.
+	if err := st.SetSessionPullOnly(ctx, "claude", "s1", false); err != nil {
 		t.Fatal(err)
 	}
 	next, err := b.Send(ctx, "peer", bus.SendInput{To: "claude/api", Content: "pushed"})

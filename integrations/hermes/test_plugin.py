@@ -111,6 +111,7 @@ class PluginTest(unittest.TestCase):
     def tearDown(self):
         for network in self.networks:
             network.close()
+        pull_only(False)
         self.drain()
         self.dir.cleanup()
 
@@ -260,6 +261,30 @@ class PluginTest(unittest.TestCase):
         peer("POST", "/v1/messages", {"to": "hermes", "content": "pushed again"})
         self.assertTrue(wait_until(lambda: ctx.injected, 10), "not pushed once pull-only was off")
         self.assertIn("pushed again", ctx.injected[0][1])
+
+    def test_a_wait_gets_its_reply_when_made_pull_only_since_the_last_report(self):
+        self.write_config(True)
+        ctx, _ = self.load()
+        self.turn(ctx)
+        sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}))
+        pull_only(True)  # it hasn't reported since, so it still counts as push
+        peer("POST", "/v1/messages", {"in_reply_to": peer_inbox(5)[0]["id"], "content": "the held reply"})
+        result = self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 4})
+        self.assertIn("the held reply", result)
+        self.assertEqual(ctx.injected, [])
+
+    def test_delivery_gives_back_what_comes_once_pull_only(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        self.turn(ctx)
+        pull_only(True)
+        conversation = network.conversation("s1")
+        network.report(conversation)
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "taken just before"})
+        # Taken by delivery just before the switch, as far as Hermes can tell.
+        network.deliver(conversation, {"id": sent["id"], "thread_id": sent["thread_id"], "from": "peer", "content": "taken just before"})
+        self.assertEqual(ctx.injected, [], "pushed into a pull-only conversation")
+        self.assertIn("taken just before", self.call(ctx, "birdie_check_inbox"))
 
     def test_a_refused_message_stays_for_the_tool_and_the_next_turn_tries_again(self):
         self.write_config(True)
