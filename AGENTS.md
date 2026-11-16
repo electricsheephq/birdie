@@ -15,9 +15,9 @@ make web                  # the web app (Node 22), embedded into the binary
 
 - Go version: `go.mod`. The binary is built with `CGO_ENABLED=0`; SQLite is
   the pure-Go `modernc.org/sqlite`.
-- On macOS, `TestSetupGrokAndCodexRoundTrip`, `TestSetupAll` and
-  `TestMigrateConfig` fail because they expect Linux's `~/.config`. They pass
-  on Linux.
+- birdie's folder is `os.UserConfigDir()`: `~/.config` (or
+  `XDG_CONFIG_HOME`) on Linux, `~/Library/Application Support` on macOS. In
+  tests, set a temporary `HOME` first and look it up the same way.
 - Tests make their own temporary `HOME` and database. They never touch your
   real bus.
 
