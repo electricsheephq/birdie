@@ -288,7 +288,17 @@ func inboxWhere(f bus.ClaimFilter, now time.Time) (string, []any) {
 		q += ` AND m.thread_id = ?`
 		args = append(args, f.Thread)
 	}
-	if f.Session != "" {
+	if f.Session == "" {
+		// A receiver that isn't a session takes what isn't for a running
+		// one: never mail pinned to a session that is open.
+		if f.Orphans {
+			q += ` AND (m.to_session = '' OR m.to_session NOT IN
+				(SELECT id FROM sessions WHERE agent = ? AND last_seen >= ? AND ended_at = 0))`
+			args = append(args, f.Agent, f.LiveSince.UnixMilli())
+		} else {
+			q += ` AND m.to_session = ''`
+		}
+	} else {
 		switch {
 		case f.Unpinned && f.Orphans:
 			// Mail for a session that has gone falls to this one too.
@@ -420,7 +430,7 @@ func (s *SQLite) ReleaseOutbound(ctx context.Context) error {
 }
 
 func (s *SQLite) UpsertSession(ctx context.Context, ses bus.Session) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE last_seen < ?`, ses.LastSeen.Add(-bus.SessionRetention).UnixMilli()); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE last_seen < ?`, ses.LastSeen.Add(-bus.SessionKeep).UnixMilli()); err != nil {
 		return err
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO sessions (agent, id, name, cwd, branch, tier, state, active_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)

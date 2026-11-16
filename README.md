@@ -114,21 +114,31 @@ tool call if it's busy.
 |---|---|
 | An answer, or a follow-up in its thread | The session that asked |
 | Addressed to one session, `claude/api` | That session. It's named after its folder, or what you set with `/rename` |
-| A new conversation for `claude` | The default session: the most recently active one, unless you chose one |
+| Addressed to a session by id, `claude/3f2a9c1e-…`, or by name and id, `claude/api#3f2a9c1e` | That session, and only while it's running |
+| A new conversation for `claude` alone | The session you chose with `session default`, if it's running. Otherwise it's refused, with the addresses of the running sessions |
+| A new conversation for another agent alone, such as `codex` | Its default session: the most recently active one, unless you chose one |
 
 ```sh
 birdie session list                  # who's running, what each is doing, and which is the default
 birdie session list --all            # also the sessions that stopped in the last day
 birdie session default claude api    # new conversations go to the session named api
-birdie session default claude        # back to the most recently active
+birdie session default claude        # no default again
+birdie session fallback claude on    # let claude pick its most recently active session too
 ```
+
+An id wins over a name. If two running sessions share a name, a message to that
+name goes to the more recently active one, and the sender is told the other's
+address. A message for a session that isn't running is refused (`recipient_not_found`,
+or `recipient_session_ended` if it closed), never given to another one; the
+refusal lists the running sessions.
 
 Claude Code sessions show as `busy`, `idle 12m`, or `waiting 3m` when they're
 stopped until you answer them, as at a permission prompt. Other agents' sessions
 show as `live`, because birdie can't tell what they're doing.
 
 If a session closes, new conversations waiting for it go to the default
-session; if none is open, they wait for one. Answers and follow-ups for a closed
+session; if none is open, they wait for one. For `claude`, they wait for the
+session you chose. Answers and follow-ups for a closed
 session wait for that session to come back, because what they answer was said
 there; the sender is told so when it sends. A session can still collect one by
 waiting on its thread.
@@ -208,7 +218,8 @@ Or from a terminal:
 
 ```sh
 birdie agent add me
-birdie send --as me --to claude "What's 12 × 12?"
+birdie session list                  # the address of each running session
+birdie send --as me --to claude/api "What's 12 × 12?"
 birdie inbox --as me --wait 60s
 ```
 
@@ -381,7 +392,8 @@ that way come back unless confirmed with `ack`.
 | Problem | Check |
 |---|---|
 | `connection refused` | Is `birdie serve` running? |
-| A message went to the wrong session | `birdie session list` shows the default; choose one with `session default`, or address it as `agent/session` |
+| A message went to the wrong session | `birdie session list` shows each session's address and the default; choose one with `session default`, or address it as `agent/name#id` |
+| `session_required` sending to `claude` | Claude sessions take messages one by one: send to an address from `birdie session list` |
 | Claude never wakes up | `session list` shows it as `push`. If it shows `pull` or isn't listed, restart it. `claude -p` runs can't be woken |
 | Codex shows `pull` | It hasn't used a birdie tool yet; ask it to run `list_agents` |
 | `birdie ui` says the web app is missing | The service is running an older birdie. Restart it with this one: `birdie service install` |

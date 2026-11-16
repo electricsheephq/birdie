@@ -13,6 +13,10 @@ import (
 func TestPrintThread(t *testing.T) {
 	ctx := context.Background()
 	b, st := statusBus(t)
+	// A new conversation for claude, given to the session it picks.
+	if err := st.SetAgentConfig(ctx, "claude", "fallback", "on"); err != nil {
+		t.Fatal(err)
+	}
 	q, err := b.Send(ctx, "codex", bus.SendInput{To: "claude", Content: "first line\nsecond line\n" + strings.Repeat("long ", 200)})
 	if err != nil {
 		t.Fatal(err)

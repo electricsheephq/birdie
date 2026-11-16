@@ -8,11 +8,21 @@ import (
 	"time"
 
 	"birdie/internal/bus"
+	"birdie/internal/store"
 )
 
 func report(t *testing.T, b *bus.Bus, agent, id, name, tier string, active time.Time) {
 	t.Helper()
 	if err := b.ReportSession(context.Background(), agent, id, bus.SessionInput{Name: name, Tier: tier, ActiveAt: active}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// picksSession has agent pick a session itself for a message addressed to it
+// alone, as every agent did before claude stopped (see bus.PicksSession).
+func picksSession(t *testing.T, st *store.SQLite, agent string) {
+	t.Helper()
+	if err := st.SetAgentConfig(context.Background(), agent, "fallback", "on"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -66,6 +76,7 @@ func TestNewConversationsGoToTheDefaultSession(t *testing.T) {
 	b, st := newBus(t)
 	addAgent(t, st, "alice", nil)
 	addAgent(t, st, "claude", nil)
+	picksSession(t, st, "claude")
 	now := time.Now()
 	report(t, b, "claude", "old", "old", bus.TierPush, now.Add(-time.Hour))
 	report(t, b, "claude", "new", "new", bus.TierPush, now)
@@ -152,6 +163,7 @@ func TestAnswerToAClosedSessionWaitsForIt(t *testing.T) {
 	b, st := newBus(t)
 	addAgent(t, st, "eva", nil)
 	addAgent(t, st, "claude", nil)
+	picksSession(t, st, "claude")
 	report(t, b, "claude", "oneshot", "oneshot", bus.TierPush, time.Now())
 
 	q, err := b.Send(ctx, "claude", bus.SendInput{To: "eva", Content: "question", FromSession: "oneshot"})
@@ -230,6 +242,7 @@ func TestThreadFollowUpsGoToTheSessionInTheThread(t *testing.T) {
 	b, st := newBus(t)
 	addAgent(t, st, "bot", nil)
 	addAgent(t, st, "claude", nil)
+	picksSession(t, st, "claude")
 	now := time.Now()
 	report(t, b, "claude", "asker", "asker", bus.TierPush, now.Add(-time.Hour))
 	report(t, b, "claude", "listener", "listener", bus.TierPush, now)
@@ -292,6 +305,7 @@ func TestClosedSessionsAreListedAfterRunningOnes(t *testing.T) {
 	ctx := context.Background()
 	b, st := newBus(t)
 	addAgent(t, st, "claude", nil)
+	picksSession(t, st, "claude")
 	now := time.Now()
 	report(t, b, "claude", "old", "old", bus.TierPush, now.Add(-time.Hour))
 	report(t, b, "claude", "gone", "gone", bus.TierPush, now)
@@ -330,19 +344,131 @@ func TestAddressingOneSession(t *testing.T) {
 	report(t, b, "claude", "s1", "api", bus.TierPush, now)
 	report(t, b, "claude", "s2", "web", bus.TierPush, now.Add(-time.Minute))
 	report(t, b, "claude", "s3", "web", bus.TierPush, now.Add(-2*time.Minute))
+	report(t, b, "claude", "s4", "docs", bus.TierPush, now)
+	if err := b.EndSession(ctx, "claude", "s4"); err != nil {
+		t.Fatal(err)
+	}
+	// A session named like another's id: the id wins.
+	report(t, b, "claude", "s5", "s1", bus.TierPush, now)
+	send := func(to string) (bus.Message, error) {
+		return b.Send(ctx, "bot", bus.SendInput{To: to, Content: "x"})
+	}
+	code := func(err error) string {
+		if e, ok := bus.AsAddressError(err); ok {
+			return e.Code
+		}
+		return ""
+	}
 
-	m, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/api", Content: "x"})
-	if err != nil || m.To != "claude" || m.ToSession != "s1" {
-		t.Fatalf("m = %+v, %v", m, err)
+	for to, want := range map[string]string{"claude/api": "s1", "claude/s3": "s3", "claude/web#s3": "s3", "claude/s1": "s1", "claude/s1#s5": "s5"} {
+		m, err := send(to)
+		if err != nil || m.To != "claude" || m.ToSession != want || len(m.OtherSessions) != 0 {
+			t.Fatalf("%s: m = %+v, %v; want session %s", to, m, err, want)
+		}
 	}
-	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/web", Content: "x"}); !errors.Is(err, bus.ErrInvalid) || !strings.Contains(err.Error(), "claude/s2") {
-		t.Fatalf("ambiguous name: err = %v", err)
+
+	// A name two running sessions share goes to the most recently active,
+	// and the sender hears about the other.
+	m, err := send("claude/web")
+	if err != nil || m.ToSession != "s2" {
+		t.Fatalf("shared name: m = %+v, %v", m, err)
 	}
-	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/s3", Content: "x"}); err != nil {
-		t.Fatalf("by id: %v", err)
+	if len(m.OtherSessions) != 1 || m.OtherSessions[0].ID != "s3" || m.OtherSessions[0].Address != "claude/web#s3" || !strings.Contains(m.Note, "claude/web#s3") {
+		t.Fatalf("shared name: others = %+v, note %q", m.OtherSessions, m.Note)
 	}
-	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/none", Content: "x"}); !errors.Is(err, bus.ErrNotFound) {
-		t.Fatalf("unknown session: err = %v", err)
+
+	for to, want := range map[string]string{
+		"claude/none":    bus.RecipientNotFound,
+		"claude/api#s2":  bus.RecipientNotFound, // name and id don't match
+		"claude/docs":    bus.RecipientSessionEnded,
+		"claude/s4":      bus.RecipientSessionEnded,
+		"claude/docs#s4": bus.RecipientSessionEnded,
+	} {
+		_, err := send(to)
+		if code(err) != want || !errors.Is(err, bus.ErrNotFound) {
+			t.Fatalf("%s: err = %v; want %s", to, err, want)
+		}
+		e, _ := bus.AsAddressError(err)
+		if len(e.Live) != 4 || !strings.Contains(err.Error(), "claude/api#s1") {
+			t.Fatalf("%s: running sessions = %+v in %v", to, e.Live, err)
+		}
+	}
+}
+
+// claude doesn't pick one of its sessions for a message addressed to claude
+// alone: each is its own conversation, and a message in the wrong one
+// interrupts it. The sender is told which sessions are running.
+func TestAMessageForClaudeAloneNeedsASession(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	addAgent(t, st, "codex", nil)
+	send := func(to string) (bus.Message, error) {
+		return b.Send(ctx, "bot", bus.SendInput{To: to, Content: "x"})
+	}
+
+	_, err := send("claude")
+	if e, ok := bus.AsAddressError(err); !ok || e.Code != bus.SessionRequired || !errors.Is(err, bus.ErrInvalid) || len(e.Live) != 0 {
+		t.Fatalf("no sessions: err = %v", err)
+	}
+
+	now := time.Now()
+	report(t, b, "claude", "s1", "api", bus.TierPush, now.Add(-time.Minute))
+	report(t, b, "claude", "s2", "web", bus.TierPush, now)
+	_, err = send("claude")
+	e, ok := bus.AsAddressError(err)
+	if !ok || e.Code != bus.SessionRequired || len(e.Live) != 2 || e.Live[0].Address != "claude/web#s2" {
+		t.Fatalf("two sessions: err = %v", err)
+	}
+	if !strings.Contains(err.Error(), "claude/api#s1") || !strings.Contains(err.Error(), "claude/web#s2") {
+		t.Fatalf("two sessions: err = %v", err)
+	}
+	if got := take(t, b, "claude", "s2"); len(got) != 0 {
+		t.Fatalf("refused message was queued: %+v", got)
+	}
+
+	// A session the user chose takes them.
+	if err := st.SetAgentConfig(ctx, "claude", "default_session", "api"); err != nil {
+		t.Fatal(err)
+	}
+	report(t, b, "claude", "s3", "api", bus.TierPush, now.Add(-2*time.Minute))
+	m, err := send("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.ToSession != "s1" {
+		t.Fatalf("the message isn't pinned to the chosen session: %q", m.ToSession)
+	}
+	// The other running session with that name is named to the sender.
+	if len(m.OtherSessions) != 1 || m.OtherSessions[0].Address != "claude/api#s3" || !strings.Contains(m.Note, "claude/api#s3") {
+		t.Fatalf("others = %+v, note %q", m.OtherSessions, m.Note)
+	}
+	if got := take(t, b, "claude", "s2"); len(got) != 0 {
+		t.Fatalf("the session that wasn't chosen got %+v", got)
+	}
+	if got := take(t, b, "claude", "s1"); len(got) != 1 || got[0].ID != m.ID {
+		t.Fatalf("the chosen session got %+v", got)
+	}
+	// Not while it isn't running.
+	for _, id := range []string{"s1", "s3"} {
+		if err := b.EndSession(ctx, "claude", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := send("claude"); !errors.Is(err, bus.ErrInvalid) {
+		t.Fatalf("chosen session closed: err = %v", err)
+	}
+
+	// Other agents still pick one, and claude can be told to.
+	report(t, b, "codex", "c1", "repo", bus.TierPush, now)
+	report(t, b, "codex", "c2", "repo2", bus.TierPush, now)
+	if _, err := send("codex"); err != nil {
+		t.Fatalf("codex: %v", err)
+	}
+	picksSession(t, st, "claude")
+	if _, err := send("claude"); err != nil {
+		t.Fatalf("claude with fallback on: %v", err)
 	}
 }
 
@@ -351,6 +477,7 @@ func TestClaimedMessagesComeBackUnlessConfirmed(t *testing.T) {
 	b, st := newBus(t)
 	addAgent(t, st, "bot", nil)
 	addAgent(t, st, "claude", nil)
+	picksSession(t, st, "claude")
 	report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
 	claim := func(lease time.Duration) []bus.Message {
 		msgs, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s1", Lease: lease})
@@ -477,7 +604,8 @@ func TestSenderHearsWhenDeliveryGivesUp(t *testing.T) {
 		}
 	}
 	go b.RunDelivery(ctx)
-	got, err := b.Receive(ctx, "alice", m.ThreadID, 10*time.Second)
+	// The notice is for the session that sent it.
+	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "alice", Session: "s1", Thread: m.ThreadID, Wait: 10 * time.Second})
 	if err != nil || len(got) != 1 {
 		t.Fatalf("got %+v, %v", got, err)
 	}
@@ -532,6 +660,7 @@ func TestThreadFollowUpsGoToTheSessionThatTookTheLastMessage(t *testing.T) {
 	b, st := newBus(t)
 	addAgent(t, st, "bot", nil)
 	addAgent(t, st, "claude", nil)
+	picksSession(t, st, "claude")
 	now := time.Now()
 	report(t, b, "claude", "first", "first", bus.TierPush, now)
 
@@ -603,6 +732,7 @@ func TestAMessageGivenBackDoesntMakeASessionPartOfTheThread(t *testing.T) {
 	b, st := newBus(t)
 	addAgent(t, st, "bot", nil)
 	addAgent(t, st, "claude", nil)
+	picksSession(t, st, "claude")
 	now := time.Now()
 	report(t, b, "claude", "first", "first", bus.TierPush, now)
 	m, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_n", Content: "start"})
@@ -618,5 +748,169 @@ func TestAMessageGivenBackDoesntMakeASessionPartOfTheThread(t *testing.T) {
 	f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: "thr_n", Content: "more"})
 	if err != nil || f.ToSession != "" {
 		t.Fatalf("follow-up = %+v, %v", f, err)
+	}
+}
+
+// A session's address carries its whole id: a shortened one could later
+// reach another session with the same name.
+func TestAnAddressReachesOnlyItsSession(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	now := time.Now()
+	report(t, b, "claude", "proc-1234", "api", bus.TierPush, now.Add(-2*time.Minute))
+	report(t, b, "claude", "proc-12345", "api", bus.TierPush, now)
+	report(t, b, "claude", "proc-12399", "api", bus.TierPush, now.Add(-time.Minute))
+	report(t, b, "claude", "proc-777", "web", bus.TierPush, now)
+	report(t, b, "claude", "proc-5551", "api", bus.TierPush, now.Add(-3*time.Minute))
+	report(t, b, "claude", "proc-5559", "api", bus.TierPush, now.Add(-3*time.Minute))
+	for _, id := range []string{"proc-1234", "proc-5551"} {
+		if err := b.EndSession(ctx, "claude", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refused := func(to, code string) {
+		t.Helper()
+		_, err := b.Send(ctx, "bot", bus.SendInput{To: to, Content: "x"})
+		if e, ok := bus.AsAddressError(err); !ok || e.Code != code {
+			t.Fatalf("send to %s: err = %v, want %s", to, err, code)
+		}
+	}
+	// A stopped session's whole id is never taken for the start of another's.
+	refused("claude/api#proc-1234", bus.RecipientSessionEnded)
+	refused("claude/proc-1234", bus.RecipientSessionEnded)
+	// The start of ids of a running session and a stopped one could mean either.
+	refused("claude/api#proc-123", bus.RecipientAmbiguous)
+	refused("claude/api#proc-555", bus.RecipientAmbiguous)
+	// A whole id under another session's name.
+	refused("claude/web#proc-12345", bus.RecipientNotFound)
+	for _, id := range []string{"proc-12345", "proc-5559"} {
+		if got := take(t, b, "claude", id); len(got) != 0 {
+			t.Fatalf("%s wasn't addressed but got %+v", id, got)
+		}
+	}
+	a, _ := st.GetAgent(ctx, "claude")
+	live, err := b.Sessions(ctx, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var addr string
+	for _, s := range live {
+		if s.ID == "proc-12345" {
+			addr = s.Address
+		}
+	}
+	if addr != "claude/api#proc-12345" {
+		t.Fatalf("address = %q", addr)
+	}
+	if err := b.EndSession(ctx, "claude", "proc-12345"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = b.Send(ctx, "bot", bus.SendInput{To: addr, Content: "x"})
+	if e, ok := bus.AsAddressError(err); !ok || e.Code != bus.RecipientSessionEnded {
+		t.Fatalf("send to the closed session's address: err = %v", err)
+	}
+}
+
+// An id is remembered after the session stops being listed, so a message for
+// it is refused rather than given to a session named like it.
+func TestAnOldIdIsNotTakenForAName(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	old := time.Now().Add(-48 * time.Hour)
+	if err := st.UpsertSession(ctx, bus.Session{Agent: "claude", ID: "s1", Name: "first", Tier: bus.TierPush, ActiveAt: old, LastSeen: old}); err != nil {
+		t.Fatal(err)
+	}
+	report(t, b, "claude", "s2", "s1", bus.TierPush, time.Now())
+	_, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/s1", Content: "x"})
+	if e, ok := bus.AsAddressError(err); !ok || e.Code != bus.RecipientSessionEnded {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// A receiver that isn't a session, such as `birdie inbox`, never takes mail
+// for a running session; on a thread it names, it may take mail for one that
+// has gone.
+func TestAReceiverThatIsntASessionLeavesSessionsMailAlone(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	now := time.Now()
+	report(t, b, "claude", "s1", "api", bus.TierPush, now)
+	report(t, b, "claude", "s2", "gone", bus.TierPush, now)
+	pinned, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/api", Content: "for api"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/gone", Content: "for gone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.EndSession(ctx, "claude", "s2"); err != nil {
+		t.Fatal(err)
+	}
+	none := func(in bus.ReceiveInput) {
+		t.Helper()
+		got, err := b.ReceiveFor(ctx, in)
+		if err != nil || len(got) != 0 {
+			t.Fatalf("%+v took %+v, %v", in, got, err)
+		}
+	}
+	none(bus.ReceiveInput{Agent: "claude"})
+	none(bus.ReceiveInput{Agent: "claude", Thread: pinned.ThreadID})
+	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Thread: orphan.ThreadID})
+	if err != nil || len(got) != 1 || got[0].ID != orphan.ID {
+		t.Fatalf("thread of the closed session: %+v, %v", got, err)
+	}
+	if got := take(t, b, "claude", "s1"); len(got) != 1 || got[0].ID != pinned.ID {
+		t.Fatalf("api got %+v", got)
+	}
+}
+
+// claude asking from outside a session (`birdie send`) still gets its answer:
+// it waits for whoever waits on the thread, and no session is picked for it.
+func TestAnAnswerToClaudeOutsideASessionWaitsOnItsThread(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	addAgent(t, st, "codex", nil)
+	report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
+	q, err := b.Send(ctx, "claude", bus.SendInput{To: "bot", Content: "question"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := b.Send(ctx, "bot", bus.SendInput{InReplyTo: q.ID, Content: "answer"})
+	if err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+	if got := take(t, b, "claude", "s1"); len(got) != 0 {
+		t.Fatalf("a session that didn't ask got %+v", got)
+	}
+	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Thread: q.ThreadID})
+	if err != nil || len(got) != 1 || got[0].ID != a.ID {
+		t.Fatalf("waiting on the thread: %+v, %v", got, err)
+	}
+	// A new conversation still needs a session.
+	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", Content: "new"}); !errors.Is(err, bus.ErrInvalid) {
+		t.Fatalf("new conversation: err = %v", err)
+	}
+	// So does bringing claude into a conversation it isn't in.
+	other, err := b.Send(ctx, "bot", bus.SendInput{To: "codex", Content: "between bot and codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []bus.SendInput{
+		{To: "claude", ThreadID: other.ThreadID, Content: "joining"},
+		{To: "claude", InReplyTo: other.ID, Content: "joining"},
+	} {
+		_, err := b.Send(ctx, "bot", in)
+		if e, ok := bus.AsAddressError(err); !ok || e.Code != bus.SessionRequired {
+			t.Fatalf("%+v: err = %v", in, err)
+		}
 	}
 }

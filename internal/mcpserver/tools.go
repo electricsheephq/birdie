@@ -27,7 +27,7 @@ var tools = []schema{
 		"name":        "send_message",
 		"description": "Message another AI agent or bot (for example Grok Bot, Claude, Codex or Grok): ask it something, hand it a task, or answer it. Returns message_id, thread_id and a note on when the recipient will see it. To answer a message, set in_reply_to to its message_id; to can then be left out.",
 		"inputSchema": obj([]string{"content"}, schema{
-			"to":          str("Recipient from list_agents (e.g. grok-bot, claude), or agent/session for one running session (e.g. claude/api). Optional when in_reply_to is set."),
+			"to":          str("Recipient from list_agents (e.g. grok-bot), or one running session by its address from list_agents: agent/name, agent/name#id or agent/id (e.g. claude/api). Claude sessions must be addressed one by one. Optional when in_reply_to is set."),
 			"content":     str("The message. For requests, make it self-contained: the recipient has none of your context."),
 			"in_reply_to": str("message_id being answered; the reply joins that thread."),
 			"thread_id":   str("Continue an existing thread without replying to a specific message."),

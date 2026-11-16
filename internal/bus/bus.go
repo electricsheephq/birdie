@@ -27,9 +27,13 @@ const (
 	// reported. Sessions report every SessionBeat.
 	SessionTTL  = 90 * time.Second
 	SessionBeat = 30 * time.Second
-	// SessionRetention is how long a session is remembered after it stops.
+	// SessionRetention is how long a session is listed after it stops.
 	SessionRetention = 24 * time.Hour
-	maxBranchBytes   = 255
+	// SessionKeep is how long a session is remembered after it stops, so a
+	// message addressed to its id is refused rather than given to another
+	// session with that name.
+	SessionKeep    = 30 * 24 * time.Hour
+	maxBranchBytes = 255
 
 	// DefaultLoopLimit messages from one agent to another within LoopWindow
 	// probably means they are stuck answering each other.
@@ -123,8 +127,11 @@ func (b *Bus) Sessions(ctx context.Context, a Agent) ([]Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	if d := defaultSession(live, a.Config["default_session"]); d != nil {
+	if d := defaultSession(live, a); d != nil {
 		d.Default = true
+	}
+	for i := range live {
+		live[i].Address = addressOf(a, live[i])
 	}
 	return live, nil
 }
@@ -145,29 +152,64 @@ func (b *Bus) RecentSessions(ctx context.Context, a Agent) ([]Session, error) {
 			stopped = append(stopped, s)
 		}
 	}
-	if d := defaultSession(live, a.Config["default_session"]); d != nil {
+	if d := defaultSession(live, a); d != nil {
 		d.Default = true
 	}
 	slices.SortStableFunc(stopped, func(x, y Session) int { return y.StoppedAt().Compare(x.StoppedAt()) })
-	return append(live, stopped...), nil
+	all = append(live, stopped...)
+	for i := range all {
+		all[i].Address = addressOf(a, all[i])
+	}
+	return all, nil
 }
 
-// defaultSession picks the session that takes new conversations: the one with
-// the name the user chose, else the one that can see messages soonest, most
-// recently active first. It returns nil if there are none.
-func defaultSession(live []Session, chosen string) *Session {
+// defaultSession picks the session of a that takes new conversations: the
+// one with the name the user chose (the most recently active, if several
+// have it), else, if the agent picks one itself (see
+// PicksSession), the one that can see messages soonest, most recently active
+// first. It returns nil if there are none.
+func defaultSession(live []Session, a Agent) *Session {
+	chosen := a.Config["default_session"]
+	auto := PicksSession(a)
 	var best *Session
 	for i := range live {
 		s := &live[i]
-		if chosen != "" && s.Name == chosen {
-			return s
+		if chosen != "" && s.Name == chosen && (best == nil || s.ActiveAt.After(best.ActiveAt)) {
+			best = s
 		}
+	}
+	if best != nil || !auto {
+		return best
+	}
+	for i := range live {
+		s := &live[i]
 		if best == nil || tierRank(s.Tier) > tierRank(best.Tier) ||
 			(tierRank(s.Tier) == tierRank(best.Tier) && s.ActiveAt.After(best.ActiveAt)) {
 			best = s
 		}
 	}
 	return best
+}
+
+// noAutoDefault lists agents that, unless told otherwise, don't pick a session
+// for a message addressed to the agent alone. Their sessions are unrelated
+// conversations, often many at once, and a message landing in the wrong one
+// interrupts it and costs it context.
+var noAutoDefault = map[string]bool{"claude": true}
+
+// PicksSession reports whether a message addressed to agent a alone, not to
+// one of its sessions, may go to the session a picks itself: the most
+// recently active one. Config["fallback"] "on" or "off" says; the default is
+// on, except for the agents in noAutoDefault. A session the user chose with
+// `birdie session default` takes such messages either way.
+func PicksSession(a Agent) bool {
+	switch a.Config["fallback"] {
+	case "on":
+		return true
+	case "off":
+		return false
+	}
+	return !noAutoDefault[a.Name]
 }
 
 func tierRank(tier string) int {
@@ -254,7 +296,8 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	}
 
 	thread := in.ThreadID
-	var pinned string // the session the thread says should get this
+	joins := in.InReplyTo != "" // it answers, or follows up in, a conversation that exists
+	var pinned string           // the session the thread says should get this
 	var parent Message
 	if in.InReplyTo != "" {
 		var err error
@@ -291,6 +334,7 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		if exists && !member {
 			return Message{}, fmt.Errorf("%w: not a participant in thread %q", ErrForbidden, thread)
 		}
+		joins = exists
 	}
 	if in.To == "" {
 		return Message{}, fmt.Errorf("%w: to is required unless in_reply_to is set", ErrInvalid)
@@ -315,17 +359,38 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		return Message{}, err
 	}
 	toSession := pinned
+	var others []SessionRef // running sessions with the name that were passed over
+	name := addr.Session
 	if addr.Session != "" {
-		s, err := b.findSession(ctx, to, addr.Session)
+		s, more, err := b.findSession(ctx, to, addr)
 		if err != nil {
 			return Message{}, err
 		}
-		toSession = s.ID
+		toSession, others = s.ID, more
 	} else if in.InReplyTo == "" && thread != "" {
 		// A follow-up in a thread goes where an answer would.
 		if toSession, err = b.store.ThreadSession(ctx, thread, from, to.Name); err != nil {
 			return Message{}, err
 		}
+	}
+	// A new conversation must name a session. One that answers or follows
+	// up a conversation the recipient is in, with no session of it there
+	// (asked by `birdie send`, or by an agent with no sessions), waits for
+	// whoever waits on its thread or reads without being a session; no
+	// session is picked for it.
+	if joins {
+		if _, member, err := b.store.ThreadAccess(ctx, thread, to.Name); err != nil {
+			return Message{}, err
+		} else if !member {
+			joins = false
+		}
+	}
+	if toSession == "" && !joins && to.Delivery == DeliveryPull && !PicksSession(to) {
+		s, more, err := b.chosenSession(ctx, to)
+		if err != nil {
+			return Message{}, err
+		}
+		toSession, others, name = s.ID, more, s.Name
 	}
 
 	id := randHex(12)
@@ -357,6 +422,10 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		}
 	}
 	m.Note = b.deliveryNote(ctx, to, m)
+	if len(others) > 0 {
+		m.OtherSessions = others
+		m.Note += "; " + othersNote(to, name, others)
+	}
 	if to.Delivery == DeliveryPull {
 		b.notify(to.Name)
 	} else {
@@ -432,6 +501,10 @@ func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput) (ClaimFilter, er
 		f.LeaseUntil = now.Add(in.Lease)
 	}
 	if in.Session == "" {
+		// Not a session: it takes only mail that isn't for a running one
+		// (see the store), and on a thread it named, mail for a session
+		// that has gone.
+		f.Orphans = in.Thread != ""
 		return f, nil
 	}
 	// Waiting on a thread names what it wants, so it doesn't need to be the
@@ -451,7 +524,7 @@ func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput) (ClaimFilter, er
 	if err != nil {
 		return f, err
 	}
-	d := defaultSession(live, a.Config["default_session"])
+	d := defaultSession(live, a)
 	f.Unpinned = d != nil && d.ID == in.Session
 	return f, nil
 }
@@ -538,33 +611,6 @@ func (b *Bus) admit(ctx context.Context, from, to string) error {
 			ErrLoop, from, to, n, LoopWindow)
 	}
 	return nil
-}
-
-func (b *Bus) findSession(ctx context.Context, to Agent, want string) (Session, error) {
-	live, err := b.store.LiveSessions(ctx, to.Name, time.Now().Add(-SessionTTL))
-	if err != nil {
-		return Session{}, err
-	}
-	var match []Session
-	for _, s := range live {
-		if s.ID == want {
-			return s, nil
-		}
-		if s.Name == want {
-			match = append(match, s)
-		}
-	}
-	switch len(match) {
-	case 1:
-		return match[0], nil
-	case 0:
-		return Session{}, fmt.Errorf("%w: %s has no running session %q", ErrNotFound, to.Name, want)
-	}
-	ids := make([]string, len(match))
-	for i, s := range match {
-		ids[i] = to.Name + "/" + s.ID
-	}
-	return Session{}, fmt.Errorf("%w: %s has %d sessions named %q; use one of %s", ErrInvalid, to.Name, len(match), want, strings.Join(ids, ", "))
 }
 
 // deliveryNote tells the sender when the recipient will see m, naming it by

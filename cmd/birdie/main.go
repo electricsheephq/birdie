@@ -288,14 +288,32 @@ func session(ctx context.Context, args []string) error {
 		if err := st.SetAgentConfig(ctx, agent, "default_session", name); err != nil {
 			return fmt.Errorf("set default for %q: %w", agent, err)
 		}
-		label := agent
-		if a, err := st.GetAgent(ctx, agent); err == nil {
-			label = a.DisplayName()
+		a, err := st.GetAgent(ctx, agent)
+		if err != nil {
+			return err
 		}
-		if name == "" {
+		label := a.DisplayName()
+		switch {
+		case name == "" && bus.PicksSession(a):
 			fmt.Printf("%s: new conversations go to the most recently active session\n", label)
-		} else {
+		case name == "":
+			fmt.Printf("%s: no default session; a message addressed to %s alone needs a session's address\n", label, agent)
+		default:
 			fmt.Printf("%s: new conversations go to the session named %s when it's running\n", label, name)
+		}
+		return nil
+	}, func(agent, value string) error {
+		if err := st.SetAgentConfig(ctx, agent, "fallback", value); err != nil {
+			return fmt.Errorf("set fallback for %q: %w", agent, err)
+		}
+		a, err := st.GetAgent(ctx, agent)
+		if err != nil {
+			return err
+		}
+		if bus.PicksSession(a) {
+			fmt.Printf("%s: a message addressed to %s alone goes to its default session, the most recently active one unless you chose one\n", a.DisplayName(), agent)
+		} else {
+			fmt.Printf("%s: a message addressed to %s alone needs a session's address (birdie session list shows them), unless you chose a default session with `birdie session default`\n", a.DisplayName(), agent)
 		}
 		return nil
 	}, args)
