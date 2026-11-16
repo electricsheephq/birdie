@@ -197,6 +197,16 @@ class PluginTest(unittest.TestCase):
         time.sleep(1.5)
         self.assertEqual(len(ctx.injected), 1, "an accepted message must not come again")
 
+    def test_a_message_that_comes_back_is_not_put_in_again(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        self.turn(ctx)
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "once"})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        # Its confirmation was lost and its lease ran out, so it comes again.
+        network.deliver(network.conversation("s1"), {"id": sent["id"], "thread_id": sent["thread_id"], "from": "peer", "content": "once"})
+        self.assertEqual(len(ctx.injected), 1, "a message put in once must not be put in again")
+
     def test_a_refused_message_stays_for_the_tool_and_the_next_turn_tries_again(self):
         self.write_config(True)
         ctx, _ = self.load(accept=False)
