@@ -114,13 +114,15 @@ func TestAWaitDoesntSettleWhatThePumpShowed(t *testing.T) {
 }
 
 func TestRequestIdsCompareAsJSON(t *testing.T) {
-	for _, c := range [][2]string{{`"a"`, `"a"`}, {`1`, ` 1 `}, {`1`, `1.0`}} {
+	for _, c := range [][2]string{{`"a"`, `"\u0061"`}, {`1`, ` 1 `}} {
 		if callKey(json.RawMessage(c[0])) != callKey(json.RawMessage(c[1])) {
 			t.Errorf("%s and %s differ", c[0], c[1])
 		}
 	}
-	if callKey(json.RawMessage(`1`)) == callKey(json.RawMessage(`"1"`)) {
-		t.Error(`1 and "1" are the same`)
+	for _, c := range [][2]string{{`1`, `"1"`}, {`9007199254740992`, `9007199254740993`}} {
+		if callKey(json.RawMessage(c[0])) == callKey(json.RawMessage(c[1])) {
+			t.Errorf("%s and %s are the same", c[0], c[1])
+		}
 	}
 }
 
