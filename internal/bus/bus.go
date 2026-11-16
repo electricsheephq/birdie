@@ -29,6 +29,11 @@ const (
 	SessionBeat = 30 * time.Second
 	// SessionRetention is how long a session is listed after it stops.
 	SessionRetention = 24 * time.Hour
+	// DefaultHoldFor is how long after it was sent a message waits for a
+	// session that closed to come back, before it expires.
+	DefaultHoldFor = 7 * 24 * time.Hour
+	// expireEvery is how often the bus looks for held messages to expire.
+	expireEvery = time.Minute
 	// SessionKeep is how long a session is remembered after it stops, so a
 	// message addressed to its id is refused rather than given to another
 	// session with that name.
@@ -49,6 +54,10 @@ type Bus struct {
 	log        *slog.Logger
 	// LoopLimit overrides DefaultLoopLimit; negative turns the check off.
 	LoopLimit int
+	// HoldFor overrides DefaultHoldFor: how long after it was sent a message
+	// waits for a session that closed before it expires.
+	HoldFor    time.Duration
+	lastExpire time.Time
 
 	mu      sync.Mutex
 	waiters map[string]map[chan struct{}]struct{}
@@ -272,12 +281,88 @@ func (b *Bus) ReportSession(ctx context.Context, agent, id string, in SessionInp
 // default session without delay. Messages pinned to it wait for it to come
 // back; see claimFilter.
 func (b *Bus) EndSession(ctx context.Context, agent, id string) error {
-	if err := b.store.EndSession(ctx, agent, id, time.Now().UTC()); err != nil {
+	now := time.Now().UTC()
+	if err := b.store.EndSession(ctx, agent, id, now); err != nil {
 		return err
 	}
 	b.notify(agent)
 	b.emit(Event{Kind: "session", Type: "ended", Agent: agent, Session: id})
+	// Tell whoever sent what it hadn't taken yet: it waits for the session to
+	// come back, and isn't given to another one.
+	held, err := b.store.Pinned(ctx, agent, id, now)
+	if err != nil {
+		b.log.Error("messages held for a closed session", "agent", agent, "session", id, "err", err)
+		return nil
+	}
+	if len(held) == 0 {
+		return nil
+	}
+	to, err := b.store.GetAgent(ctx, agent)
+	if err != nil {
+		return nil
+	}
+	label := b.sessionLabel(ctx, to, id)
+	for _, m := range held {
+		text := fmt.Sprintf("%s: your message %s to %s is held. That session closed before taking it, so it waits for that session to come back, for up to %s after you sent it; then it expires and you'll be told. No other session gets it. To reach one that is running, send a new message to its address (list_agents shows them).",
+			RecipientSessionEnded, m.ID, label, days(b.holdFor()))
+		if err := b.Notice(ctx, m, "held", text); err != nil {
+			b.log.Error("send notice", "id", m.ID, "err", err)
+		}
+	}
 	return nil
+}
+
+func (b *Bus) holdFor() time.Duration {
+	if b.HoldFor > 0 {
+		return b.HoldFor
+	}
+	return DefaultHoldFor
+}
+
+// days says d in whole days when it is some, else as Go writes it.
+func days(d time.Duration) string {
+	if d >= 24*time.Hour && d%(24*time.Hour) == 0 {
+		n := int(d / (24 * time.Hour))
+		if n == 1 {
+			return "1 day"
+		}
+		return fmt.Sprintf("%d days", n)
+	}
+	return d.String()
+}
+
+// expireHeld expires messages that waited longer than HoldFor for a session
+// that closed, and tells their senders.
+func (b *Bus) expireHeld(ctx context.Context) {
+	now := time.Now()
+	if now.Sub(b.lastExpire) < expireEvery {
+		return
+	}
+	b.lastExpire = now
+	for {
+		msgs, err := b.store.ExpireHeld(ctx, now.Add(-b.holdFor()), now.Add(-SessionTTL), now, inboxBatch)
+		if err != nil {
+			if ctx.Err() == nil {
+				b.log.Error("expire held messages", "err", err)
+			}
+			return
+		}
+		for _, m := range msgs {
+			b.emitMessage(StatusExpired, m, "", "")
+			to := Agent{Name: m.To}
+			if a, err := b.store.GetAgent(ctx, m.To); err == nil {
+				to = a
+			}
+			text := fmt.Sprintf("%s: your message %s to %s expired. That session closed and didn't come back within %s, so it was never delivered, and no other session got it. To reach one that is running, send a new message to its address (list_agents shows them).",
+				RecipientSessionEnded, m.ID, b.sessionLabel(ctx, to, m.ToSession), days(b.holdFor()))
+			if err := b.Notice(ctx, m, "expired", text); err != nil {
+				b.log.Error("send notice", "id", m.ID, "err", err)
+			}
+		}
+		if len(msgs) < inboxBatch {
+			return
+		}
+	}
 }
 
 // Send queues a message from the authenticated agent from. Replies inherit
@@ -407,6 +492,9 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		}
 	}
 	m.Note = b.deliveryNote(ctx, to, m)
+	if m.ToSession != "" && to.Delivery == DeliveryPull && !b.running(ctx, to.Name, m.ToSession) {
+		m.Held = RecipientSessionEnded
+	}
 	if len(others) > 0 {
 		m.OtherSessions = others
 		m.Note += "; " + othersNote(to, addr.Session, others)
@@ -598,6 +686,20 @@ func (b *Bus) admit(ctx context.Context, from, to string) error {
 	return nil
 }
 
+// running reports whether agent's session id is running.
+func (b *Bus) running(ctx context.Context, agent, id string) bool {
+	live, err := b.store.LiveSessions(ctx, agent, time.Now().Add(-SessionTTL))
+	if err != nil {
+		return true // don't claim it closed when it can't be told
+	}
+	for _, s := range live {
+		if s.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // deliveryNote tells the sender when the recipient will see m, naming it by
 // its label.
 func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
@@ -622,8 +724,8 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 	}
 	if target == nil {
 		if m.ToSession != "" {
-			return fmt.Sprintf("queued: %s is no longer open, so this waits for that session to come back; other sessions don't get it unless one waits on this thread. To reach whichever %s session is open now, send a new message without in_reply_to or thread_id",
-				b.sessionLabel(ctx, to, m.ToSession), to.DisplayName())
+			return fmt.Sprintf("queued: %s is no longer open, so this waits for that session to come back, for up to %s; other sessions don't get it unless one waits on this thread. To reach a %s session that is open now, send a new message to its address (list_agents shows them)",
+				b.sessionLabel(ctx, to, m.ToSession), days(b.holdFor()), to.DisplayName())
 		}
 		return fmt.Sprintf("queued: %s has no open session; it gets this when it next checks or starts", to.DisplayName())
 	}
@@ -706,6 +808,7 @@ func (b *Bus) RunDelivery(ctx context.Context) {
 	defer t.Stop()
 	for {
 		b.deliverDue(ctx)
+		b.expireHeld(ctx)
 		select {
 		case <-ctx.Done():
 			return
