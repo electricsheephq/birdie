@@ -17,6 +17,7 @@ import (
 func TestAStalledDaemonDoesntHoldCheckInboxOrTheSessionLockForever(t *testing.T) {
 	for _, method := range []string{http.MethodPut, http.MethodDelete} {
 		t.Run(method, func(t *testing.T) {
+			t.Parallel() // each waits out the real ten-second deadline
 			entered := make(chan struct{}, 1)
 			release := make(chan struct{})
 			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
