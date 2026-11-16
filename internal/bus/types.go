@@ -31,6 +31,9 @@ const (
 	StatusDelivered = "delivered"
 	StatusReplied   = "replied"
 	StatusFailed    = "failed"
+	// StatusExpired is a message held for a session that closed, and that
+	// didn't come back in time (see Bus.HoldFor).
+	StatusExpired = "expired"
 
 	// DeliveryPull agents fetch their own inbox (MCP, HTTP long-poll).
 	// Any other delivery kind is pushed by the Deliverer registered for it.
@@ -185,6 +188,10 @@ type Message struct {
 	// Note says when the recipient will see the message. Only set on the
 	// result of a send.
 	Note string `json:"note,omitempty"`
+	// Held, on the result of a send, is RecipientSessionEnded when the
+	// session the message is for isn't running: it waits for that session to
+	// come back, and expires if it doesn't in time.
+	Held string `json:"held,omitempty"`
 	// OtherSessions, on the result of a send to a name several running
 	// sessions share, lists the ones that didn't get it, so the sender can
 	// address one of them instead.
@@ -281,6 +288,11 @@ type Store interface {
 	// EndSession records that a session closed. Until it reports again, it no
 	// longer counts as running.
 	EndSession(ctx context.Context, agent, id string, at time.Time) error
+	// SettleHeld finds, in one transaction, up to q.Limit messages for pull
+	// agents that wait for a session that isn't running, marks them (their
+	// sender told they are held, or expired; see HoldQuery), and inserts the
+	// notices build makes for them. build must not use the store.
+	SettleHeld(ctx context.Context, q HoldQuery, build func([]HeldMessage) []Message) ([]HeldMessage, []Message, error)
 	// MoveSession points everything that names agent's session from at the
 	// session to instead.
 	MoveSession(ctx context.Context, agent, from, to string) error
@@ -299,4 +311,27 @@ type Store interface {
 type Deliverer interface {
 	Kind() string
 	Deliver(ctx context.Context, to Agent, m Message) error
+}
+
+// HoldQuery picks messages held for a session of a pull agent that isn't
+// running. A session isn't running once it closed; with Lapsed, also once it
+// hasn't been heard from since LiveSince, or was never heard from.
+type HoldQuery struct {
+	// Expire picks messages to expire: held since before Before, counted from
+	// when they were sent or their session stopped, whichever is later.
+	// Otherwise SettleHeld picks those whose sender hasn't been told they are
+	// held.
+	Expire    bool
+	Lapsed    bool
+	LiveSince time.Time
+	Before    time.Time
+	Now       time.Time
+	Limit     int
+}
+
+// HeldMessage is a message held for a session that isn't running, with that
+// session's name, if it has one.
+type HeldMessage struct {
+	Message
+	SessionName string
 }

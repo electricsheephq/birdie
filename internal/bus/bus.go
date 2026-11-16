@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 )
@@ -36,6 +37,12 @@ const (
 	SessionBeat = 30 * time.Second
 	// SessionRetention is how long a session is listed after it stops.
 	SessionRetention = 24 * time.Hour
+	// DefaultHoldFor is how long a message waits for a session that stopped
+	// to come back, before it expires: counted from when the session stopped,
+	// or from the send if that was later.
+	DefaultHoldFor = 7 * 24 * time.Hour
+	// expireEvery is how often the bus looks for held messages to expire.
+	expireEvery = time.Minute
 	// SessionKeep is how long a session is remembered after it stops, so a
 	// message addressed to its id is refused rather than given to another
 	// session with that name.
@@ -56,6 +63,15 @@ type Bus struct {
 	log        *slog.Logger
 	// LoopLimit overrides DefaultLoopLimit; negative turns the check off.
 	LoopLimit int
+	// HoldFor overrides DefaultHoldFor.
+	HoldFor time.Duration
+	// QuietFor overrides how long the bus listens, after it starts or the
+	// machine wakes, before it takes a session it hasn't heard from as
+	// stopped or expires anything: SessionTTL, long enough for every running
+	// session to report. Negative means not at all.
+	QuietFor   time.Duration
+	listening  atomic.Int64 // since when, in Unix ms
+	lastExpire time.Time
 
 	mu      sync.Mutex
 	waiters map[string]map[chan struct{}]struct{}
@@ -71,6 +87,7 @@ func New(s Store, log *slog.Logger, ds ...Deliverer) *Bus {
 		waiters:    make(map[string]map[chan struct{}]struct{}),
 		kick:       make(chan struct{}, 1),
 	}
+	b.listening.Store(time.Now().UnixMilli())
 	for _, d := range ds {
 		b.deliverers[d.Kind()] = d
 	}
@@ -283,12 +300,169 @@ func (b *Bus) ReportSession(ctx context.Context, agent, id string, in SessionInp
 // default session without delay. Messages pinned to it wait for it to come
 // back; see claimFilter.
 func (b *Bus) EndSession(ctx context.Context, agent, id string) error {
-	if err := b.store.EndSession(ctx, agent, id, time.Now().UTC()); err != nil {
+	now := time.Now().UTC()
+	if err := b.store.EndSession(ctx, agent, id, now); err != nil {
 		return err
 	}
 	b.notify(agent)
 	b.emit(Event{Kind: "session", Type: "ended", Agent: agent, Session: id})
+	// Tell whoever sent what it hadn't taken yet: it waits for the session to
+	// come back, and isn't given to another one.
+	b.noticeHeld(ctx, false)
 	return nil
+}
+
+func (b *Bus) holdFor() time.Duration {
+	if b.HoldFor > 0 {
+		return b.HoldFor
+	}
+	return DefaultHoldFor
+}
+
+// days says d in whole days when it is some, else as Go writes it.
+func days(d time.Duration) string {
+	if d >= 24*time.Hour && d%(24*time.Hour) == 0 {
+		n := int(d / (24 * time.Hour))
+		if n == 1 {
+			return "1 day"
+		}
+		return fmt.Sprintf("%d days", n)
+	}
+	return d.String()
+}
+
+// quiet reports whether the bus has listened for too short a time, since it
+// started or the machine woke, to tell that a session it hasn't heard from
+// has stopped.
+func (b *Bus) quiet(now time.Time) bool {
+	q := b.QuietFor
+	if q == 0 {
+		q = SessionTTL
+	}
+	return q > 0 && now.UnixMilli()-b.listening.Load() < q.Milliseconds()
+}
+
+// noticeHeld tells the senders of messages held for a session that isn't
+// running, once each, that they are held. Only the sweep, which notices a
+// wake before it looks, passes lapsed: then sessions that went silent count
+// too, not only those that closed.
+func (b *Bus) noticeHeld(ctx context.Context, lapsed bool) {
+	now := time.Now()
+	b.settleHeld(ctx, HoldQuery{Lapsed: lapsed && !b.quiet(now), LiveSince: now.Add(-SessionTTL), Now: now, Limit: inboxBatch})
+}
+
+// expireHeld expires messages held longer than HoldFor for a session that
+// isn't running, and tells their senders.
+func (b *Bus) expireHeld(ctx context.Context) {
+	now := time.Now()
+	if b.quiet(now) {
+		return
+	}
+	b.settleHeld(ctx, HoldQuery{Expire: true, Lapsed: true, LiveSince: now.Add(-SessionTTL), Before: now.Add(-b.holdFor()), Now: now, Limit: inboxBatch})
+}
+
+func (b *Bus) settleHeld(ctx context.Context, q HoldQuery) {
+	agents := map[string]Agent{}
+	if list, err := b.store.ListAgents(ctx); err == nil {
+		for _, a := range list {
+			agents[a.Name] = a
+		}
+	}
+	for {
+		held, notices, err := b.store.SettleHeld(ctx, q, func(held []HeldMessage) []Message {
+			return heldNotices(held, q.Expire, agents, b.holdFor(), q.Now)
+		})
+		if err != nil {
+			if ctx.Err() == nil {
+				b.log.Error("settle held messages", "expire", q.Expire, "err", err)
+			}
+			return
+		}
+		if q.Expire {
+			for _, m := range held {
+				b.emitMessage(StatusExpired, m.Message, "", "")
+			}
+		}
+		for _, n := range notices {
+			b.emitMessage(StatusQueued, n, "", "")
+			b.notify(n.To)
+		}
+		if len(notices) > 0 {
+			select {
+			case b.kick <- struct{}{}:
+			default:
+			}
+		}
+		if len(held) < q.Limit {
+			return
+		}
+	}
+}
+
+// plural is one for a single message, else many.
+func plural(n int, one, many string) string {
+	if n > 1 {
+		return many
+	}
+	return one
+}
+
+// heldNotices tells each sender about its messages in held, one notice per
+// thread and pair of sessions, naming every message.
+func heldNotices(held []HeldMessage, expired bool, agents map[string]Agent, hold time.Duration, now time.Time) []Message {
+	type key struct{ thread, from, fromSession, to, toSession string }
+	var order []key
+	groups := map[key][]HeldMessage{}
+	for _, h := range held {
+		k := key{h.ThreadID, h.From, h.FromSession, h.To, h.ToSession}
+		if _, ok := groups[k]; !ok {
+			order = append(order, k)
+		}
+		groups[k] = append(groups[k], h)
+	}
+	kind := "held"
+	if expired {
+		kind = "expired"
+	}
+	var out []Message
+	for _, k := range order {
+		g := groups[k]
+		ids := make([]string, len(g))
+		for i, h := range g {
+			ids[i] = h.ID
+		}
+		to, ok := agents[k.to]
+		if !ok {
+			to = Agent{Name: k.to}
+		}
+		label := to.DisplayName() + " · " + k.toSession
+		if g[0].SessionName != "" {
+			label = to.DisplayName() + " · " + g[0].SessionName
+		}
+		subject := plural(len(ids), "your message ", "your messages ") + strings.Join(ids, ", ")
+		verb := plural(len(ids), "is", "are")
+		var text string
+		if expired {
+			text = fmt.Sprintf("%s: %s to %s expired. That session stopped and didn't come back within %s, so %s never delivered, and no other session got %s. To reach a session that is running, send a new message to its address (list_agents shows them).",
+				RecipientSessionEnded, subject, label, days(hold), plural(len(ids), "it was", "they were"), plural(len(ids), "it", "them"))
+		} else {
+			text = fmt.Sprintf("%s: %s to %s %s held. That session isn't running, so %s for that session to come back, for up to %s from when it stopped or you sent %s, whichever is later; after that %s and you'll be told. No other session gets %s. To reach a session that is running, send a new message to its address (list_agents shows them).",
+				RecipientSessionEnded, subject, label, verb, plural(len(ids), "it waits", "they wait"), days(hold), plural(len(ids), "it", "them"), plural(len(ids), "it expires", "they expire"), plural(len(ids), "it", "them"))
+		}
+		out = append(out, Message{
+			ID:        "msg_" + randHex(12),
+			ThreadID:  k.thread,
+			InReplyTo: ids[0],
+			From:      SystemSender,
+			To:        k.from,
+			ToSession: k.fromSession,
+			Content:   text,
+			Meta:      map[string]string{noticeKey: kind, "messages": strings.Join(ids, ",")},
+			Status:    StatusQueued,
+			CreatedAt: now.UTC(),
+		})
+	}
+	return out
 }
 
 // Send queues a message from the authenticated agent from. Replies inherit
@@ -413,6 +587,10 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		Meta:        in.Meta,
 		Status:      StatusQueued,
 		CreatedAt:   time.Now().UTC(),
+	}
+	// Stored with the message, so a notice can't also tell the sender.
+	if m.ToSession != "" && to.Delivery == DeliveryPull && b.stopped(ctx, to.Name, m.ToSession) {
+		m.Held = RecipientSessionEnded
 	}
 	if err := b.store.InsertMessage(ctx, m); err != nil {
 		return Message{}, err
@@ -549,6 +727,11 @@ func (b *Bus) Nack(ctx context.Context, agent, id string) error {
 	changed, err := b.store.Settle(ctx, id, agent, false, time.Now())
 	if changed {
 		b.notify(agent)
+		// Given back by a session that has since closed (a /clear while it
+		// held the message): it is held now, and its sender is told.
+		if m, err := b.store.GetMessage(ctx, id); err == nil && m.ToSession != "" && !b.running(ctx, agent, m.ToSession) {
+			b.noticeHeld(ctx, false)
+		}
 	}
 	return err
 }
@@ -617,6 +800,37 @@ func (b *Bus) admit(ctx context.Context, from, to string) error {
 	return nil
 }
 
+// stopped reports whether agent's session id has stopped: it closed, or,
+// once the bus has listened long enough to tell (see quiet), it went silent
+// or was never heard from.
+func (b *Bus) stopped(ctx context.Context, agent, id string) bool {
+	now := time.Now()
+	recent, err := b.store.RecentSessions(ctx, agent, now.Add(-SessionKeep))
+	if err != nil {
+		return false // don't claim it stopped when it can't be told
+	}
+	for _, s := range recent {
+		if s.ID == id {
+			return !s.EndedAt.IsZero() || (!s.Live(now) && !b.quiet(now))
+		}
+	}
+	return !b.quiet(now)
+}
+
+// running reports whether agent's session id is running.
+func (b *Bus) running(ctx context.Context, agent, id string) bool {
+	live, err := b.store.LiveSessions(ctx, agent, time.Now().Add(-SessionTTL))
+	if err != nil {
+		return true // don't claim it closed when it can't be told
+	}
+	for _, s := range live {
+		if s.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // deliveryNote tells the sender when the recipient will see m, naming it by
 // its label.
 func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
@@ -641,8 +855,8 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 	}
 	if target == nil {
 		if m.ToSession != "" {
-			return fmt.Sprintf("queued: %s is no longer open, so this waits for that session to come back; other sessions don't get it unless one waits on this thread. To reach whichever %s session is open now, send a new message without in_reply_to or thread_id",
-				b.sessionLabel(ctx, to, m.ToSession), to.DisplayName())
+			return fmt.Sprintf("queued: %s is no longer open, so this waits for that session to come back, for up to %s; other sessions don't get it unless one waits on this thread. To reach a %s session that is open now, send a new message to its address (list_agents shows them)",
+				b.sessionLabel(ctx, to, m.ToSession), days(b.holdFor()), to.DisplayName())
 		}
 		return fmt.Sprintf("queued: %s has no open session; it gets this when it next checks or starts", to.DisplayName())
 	}
@@ -723,15 +937,45 @@ func (b *Bus) RunDelivery(ctx context.Context) {
 	}
 	t := time.NewTicker(sweepInterval)
 	defer t.Stop()
+	// After a sleep, sessions may not have reported since, so the bus listens
+	// again before taking silence as stopping.
+	last := time.Now()
+	awake := func(waiting bool) {
+		now := time.Now()
+		if asleep(time.Duration(now.UnixMilli()-last.UnixMilli())*time.Millisecond, now.Sub(last), waiting) {
+			b.listening.Store(now.UnixMilli())
+			b.lastExpire = time.Time{}
+		}
+		last = now
+	}
 	for {
 		b.deliverDue(ctx)
+		awake(false)
+		if now := time.Now(); !b.quiet(now) && now.Sub(b.lastExpire) >= expireEvery {
+			b.lastExpire = now
+			// Expiring first spares a message that is already too old a
+			// notice that it is held.
+			b.expireHeld(ctx)
+			b.noticeHeld(ctx, true)
+		}
+		last = time.Now()
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		case <-b.kick:
 		}
+		awake(true)
 	}
+}
+
+// asleep reports whether the machine slept, or the bus was stopped, during a
+// stretch that took wall on the wall clock and mono on the monotonic clock.
+// The monotonic clock stops while the machine sleeps (on macOS and Linux) and
+// the wall clock doesn't. Delivering can be slow, so only that difference
+// counts; waiting for the next tick never takes long, so any long wait does.
+func asleep(wall, mono time.Duration, waiting bool) bool {
+	return wall-mono > SessionBeat || (waiting && wall > SessionBeat)
 }
 
 func (b *Bus) deliverDue(ctx context.Context) {

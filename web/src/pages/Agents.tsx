@@ -474,7 +474,7 @@ function resolve(o: Overview | undefined, to: string): string {
 }
 
 type Phase = MessageStatus | 'retrying';
-const RANK: Record<Phase, number> = { queued: 0, retrying: 1, claimed: 2, delivered: 3, replied: 4, failed: 5 };
+const RANK: Record<Phase, number> = { queued: 0, retrying: 1, claimed: 2, delivered: 3, replied: 4, failed: 5, expired: 5 };
 
 interface Sent {
   result: SendResult;
@@ -609,6 +609,11 @@ function SendForm({
         problem = true;
         title = 'Not delivered';
         detail = 'birdie gave up' + (error ? ': ' + errorText(error) : '') + '.';
+        break;
+      case 'expired':
+        problem = true;
+        title = 'Not delivered';
+        detail = 'Its session closed and didn’t come back in time, so it expired. No other session got it.';
         break;
     }
   }
