@@ -18,8 +18,8 @@ import (
 	"birdie/internal/store"
 )
 
-// bridge is a Server with no session, on a test daemon where peer has sent
-// claude one message.
+// bridge is a Server with no conversation, for a running Claude session s1,
+// on a test daemon where peer has sent s1 one message.
 func bridge(t *testing.T) (*Server, *store.SQLite, bus.Message, *bytes.Buffer) {
 	t.Helper()
 	ctx := context.Background()
@@ -36,13 +36,18 @@ func bridge(t *testing.T) (*Server, *store.SQLite, bus.Message, *bytes.Buffer) {
 		}
 	}
 	b.LoopLimit = -1
+	if err := b.ReportSession(ctx, "claude", "s1", bus.SessionInput{Name: "test"}); err != nil {
+		t.Fatal(err)
+	}
 	api := httptest.NewServer(httpapi.New(b, logger))
 	t.Cleanup(api.Close)
-	m, err := b.Send(ctx, "peer", bus.SendInput{To: "claude", Content: "hello"})
+	m, err := b.Send(ctx, "peer", bus.SendInput{To: "claude/s1", Content: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := New(client.New(api.URL, "claude-tok"), "claude", "test", false, log.New(io.Discard, "", 0))
+	c := client.New(api.URL, "claude-tok")
+	c.SetSession("s1")
+	srv := New(c, "claude", "test", false, log.New(io.Discard, "", 0))
 	out := &bytes.Buffer{}
 	srv.out = out
 	return srv, st, m, out
@@ -59,7 +64,7 @@ func status(t *testing.T, st *store.SQLite, id string) string {
 
 var checkInbox = request{ID: json.RawMessage(`7`), Method: "tools/call", Params: json.RawMessage(`{"name":"check_inbox","arguments":{}}`)}
 
-// A call answers, then confirms what it took, even with no session.
+// A call answers, then confirms what it took, even with no conversation.
 func TestACallConfirmsWhatItTookOnceAnswered(t *testing.T) {
 	srv, st, m, out := bridge(t)
 	srv.handle(context.Background(), checkInbox)
