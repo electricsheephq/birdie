@@ -20,11 +20,15 @@ const (
 	// can't exhaust its memory. Messages themselves have no size limit; this
 	// is far beyond any an agent writes.
 	MaxRequestBytes = 256 << 20
-	MaxWait         = 2 * time.Minute
-	inboxBatch      = 50
-	maxAttempts     = 8
-	deliverTimeout  = 30 * time.Second
-	sweepInterval   = 5 * time.Second
+	// MaxBatchBytes bounds the content one inbox claim returns, so a batch of
+	// long messages can't fill memory. The first message is always taken,
+	// however long.
+	MaxBatchBytes  = 16 << 20
+	MaxWait        = 2 * time.Minute
+	inboxBatch     = 50
+	maxAttempts    = 8
+	deliverTimeout = 30 * time.Second
+	sweepInterval  = 5 * time.Second
 
 	// SessionTTL is how long a session counts as running after it last
 	// reported. Sessions report every SessionBeat.
