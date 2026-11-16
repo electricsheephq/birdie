@@ -194,9 +194,12 @@ func (h *fakeHost) Session() mcpserver.SessionInfo {
 func (h *fakeHost) setID(id string)         { h.id.Store(&id) }
 func (h *fakeHost) Tier() string            { return h.tier }
 func (h *fakeHost) Observe(json.RawMessage) {}
-func (h *fakeHost) Push(_ context.Context, m bus.Message) error {
+func (h *fakeHost) Push(_ context.Context, session string, m bus.Message) error {
 	if h.fail.Load() {
 		return errors.New("socket gone")
+	}
+	if session != h.Session().ID {
+		return mcpserver.ErrOtherConversation
 	}
 	h.pushed <- m
 	return nil

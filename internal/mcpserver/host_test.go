@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"birdie/internal/bus"
 )
@@ -86,12 +89,15 @@ func TestClaudePushWritesUserFrame(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_MESSAGING_SOCKET", path)
 	// The token is there, and must not be sent: see Push.
 	t.Setenv("CLAUDE_CODE_MESSAGING_TOKEN", "secret")
+	// No registry entry, so the conversation is the one in the environment.
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "conv-1")
 
 	h := &claudeHost{}
 	if h.Tier() != bus.TierPush {
 		t.Fatalf("tier = %s", h.Tier())
 	}
-	if err := h.Push(context.Background(), bus.Message{ID: "msg_1", ThreadID: "t", From: "bot", Content: "hello"}); err != nil {
+	if err := h.Push(context.Background(), "conv-1", bus.Message{ID: "msg_1", ThreadID: "t", From: "bot", Content: "hello"}); err != nil {
 		t.Fatal(err)
 	}
 	line := <-got
@@ -206,5 +212,73 @@ func TestGrokTierNeedsHooks(t *testing.T) {
 	os.WriteFile(GrokHooksPath(), []byte("{}"), 0o600)
 	if h.Tier() != bus.TierTurn {
 		t.Fatalf("with hooks: tier = %s", h.Tier())
+	}
+}
+
+// After /clear the Claude Code process, and its inbox socket, stay the same
+// while the conversation changes, so Push must not write a message taken for
+// the old conversation.
+func TestClaudePushOnlyReachesTheConversationItWasTakenFor(t *testing.T) {
+	dir := t.TempDir()
+	// Socket paths have a short length limit, too short for t.TempDir here.
+	sockDir, err := os.MkdirTemp("", "bd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	path := filepath.Join(sockDir, "s.sock")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	got := make(chan string, 4)
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			line, _ := bufio.NewReader(c).ReadString('\n')
+			c.Close()
+			got <- line
+		}
+	}()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("CLAUDE_CODE_MESSAGING_SOCKET", "")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "old")
+	if err := os.Mkdir(filepath.Join(dir, "sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h := &claudeHost{}
+	h.once.Do(func() {})
+	h.pid = 4242
+	entry := fmt.Sprintf(`{"sessionId":"new","messagingSocketPath":%q}`, path)
+	if err := os.WriteFile(filepath.Join(dir, "sessions", "4242.json"), []byte(entry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = h.Push(context.Background(), "old", bus.Message{ID: "msg_1", ThreadID: "t", From: "bot", Content: "for the old one"})
+	if !errors.Is(err, ErrOtherConversation) {
+		t.Fatalf("push for the old conversation: %v", err)
+	}
+	if err := h.Push(context.Background(), "new", bus.Message{ID: "msg_2", ThreadID: "t", From: "bot", Content: "for the new one"}); err != nil {
+		t.Fatal(err)
+	}
+	if line := <-got; !strings.Contains(line, "for the new one") {
+		t.Fatalf("first frame written: %s", line)
+	}
+	select {
+	case line := <-got:
+		t.Fatalf("another frame written: %s", line)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestCodexPushOnlyReachesTheThreadItWasTakenFor(t *testing.T) {
+	h := &codexHost{thread: "new"}
+	err := h.Push(context.Background(), "old", bus.Message{ID: "msg_1", ThreadID: "t", From: "bot", Content: "hi"})
+	if !errors.Is(err, ErrOtherConversation) {
+		t.Fatalf("push for the old thread: %v", err)
 	}
 }

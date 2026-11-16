@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -344,46 +345,61 @@ func (s *Server) pump(ctx context.Context) {
 			pause(ctx, 5*time.Second)
 			continue
 		}
-		if h := s.currentHost(); s.c.Session() != polled || (h != nil && h.Session().ID != polled) {
-			// The conversation changed while the poll was out (/clear), so
-			// these are another conversation's: back to the queue to wait for
-			// it, and act for the new one before polling again.
-			for _, m := range msgs {
-				if err := s.c.Nack(context.WithoutCancel(ctx), m.ID); err != nil {
-					s.log.Printf("nack %s: %v", m.ID, err)
-				}
-			}
-			if h != nil {
-				s.syncSession(ctx, h)
-			}
-			continue
-		}
-		failed := false
+		failed, moved := false, false
 		for _, m := range msgs {
+			// Checked before each message, not once per batch: /clear can
+			// come while one is being shown. After it, the rest are the old
+			// conversation's and go back to the queue to wait for it.
+			if !moved && s.moved(polled) {
+				moved = true
+			}
+			if moved {
+				s.nack(ctx, m)
+				continue
+			}
 			if s.route(m) {
 				s.ack(ctx, m)
 				continue
 			}
-			if !failed {
-				if err := s.show(ctx, m); err != nil {
+			if failed {
+				// Back to the queue for the next try, or for check_inbox.
+				s.nack(ctx, m)
+				continue
+			}
+			if err := s.show(ctx, polled, m); err != nil {
+				if errors.Is(err, ErrOtherConversation) {
+					moved = true
+				} else {
 					s.log.Printf("push %s: %v", m.ID, err)
 					failed = true
 				}
-			}
-			if failed {
-				// Back to the queue for the next try, or for check_inbox.
-				if err := s.c.Nack(context.WithoutCancel(ctx), m.ID); err != nil {
-					s.log.Printf("nack %s: %v", m.ID, err)
-				}
+				s.nack(ctx, m)
 				continue
 			}
 			s.remember(m)
 			s.ack(ctx, m)
 		}
+		if moved || s.moved(polled) {
+			// Act for the new conversation before polling again.
+			if h := s.currentHost(); h != nil {
+				s.syncSession(ctx, h)
+			}
+			continue
+		}
 		if failed {
 			pause(ctx, 5*time.Second)
 		}
 	}
+}
+
+// moved reports whether the conversation changed (/clear) since the poll that
+// took messages for conversation polled.
+func (s *Server) moved(polled string) bool {
+	if s.c.Session() != polled {
+		return true
+	}
+	h := s.currentHost()
+	return h != nil && h.Session().ID != polled
 }
 
 func pause(ctx context.Context, d time.Duration) {
@@ -393,10 +409,10 @@ func pause(ctx context.Context, d time.Duration) {
 	}
 }
 
-// show puts a message in front of the model.
-func (s *Server) show(ctx context.Context, m bus.Message) error {
+// show puts a message taken for conversation session in front of the model.
+func (s *Server) show(ctx context.Context, session string, m bus.Message) error {
 	if h := s.currentHost(); h != nil && h.Tier() == bus.TierPush {
-		return h.Push(ctx, m)
+		return h.Push(ctx, session, m)
 	}
 	s.write(map[string]any{
 		"jsonrpc": "2.0",
@@ -412,6 +428,12 @@ func (s *Server) ack(ctx context.Context, m bus.Message) {
 	}
 	if err := s.c.Ack(context.WithoutCancel(ctx), m.ID); err != nil {
 		s.log.Printf("ack %s: %v", m.ID, err)
+	}
+}
+
+func (s *Server) nack(ctx context.Context, m bus.Message) {
+	if err := s.c.Nack(context.WithoutCancel(ctx), m.ID); err != nil {
+		s.log.Printf("nack %s: %v", m.ID, err)
 	}
 }
 

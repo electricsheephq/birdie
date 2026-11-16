@@ -32,12 +32,19 @@ type Host interface {
 	Session() SessionInfo
 	// Tier says how soon the session sees a message right now.
 	Tier() string
-	// Push shows the message to the model. It is only called at TierPush.
-	Push(ctx context.Context, m bus.Message) error
+	// Push shows the message to the model of conversation session, the one
+	// it was taken for. If the host now serves another conversation (after
+	// /clear), it returns ErrOtherConversation and shows nothing. It is only
+	// called at TierPush.
+	Push(ctx context.Context, session string, m bus.Message) error
 	// Observe sees the _meta of each tool call, which is the only place some
 	// agents name their conversation.
 	Observe(meta json.RawMessage)
 }
+
+// ErrOtherConversation is Push refusing a message taken for a conversation
+// the host no longer serves.
+var ErrOtherConversation = errors.New("the session has moved to another conversation")
 
 // HostOptions configure DetectHost.
 type HostOptions struct {
@@ -95,7 +102,7 @@ type plainHost struct{ info SessionInfo }
 func (h *plainHost) Session() SessionInfo    { return h.info }
 func (h *plainHost) Tier() string            { return bus.TierPull }
 func (h *plainHost) Observe(json.RawMessage) {}
-func (h *plainHost) Push(context.Context, bus.Message) error {
+func (h *plainHost) Push(context.Context, string, bus.Message) error {
 	return errors.New("this agent can't be pushed to")
 }
 
@@ -142,8 +149,13 @@ func (h *claudeHost) entry() (claudeEntry, bool) {
 }
 
 func (h *claudeHost) Session() SessionInfo {
-	info := h.fallback
 	e, ok := h.entry()
+	return h.info(e, ok)
+}
+
+// info is the session as registry entry e describes it.
+func (h *claudeHost) info(e claudeEntry, ok bool) SessionInfo {
+	info := h.fallback
 	if id := os.Getenv("CLAUDE_CODE_SESSION_ID"); id != "" {
 		info.ID = id
 	}
@@ -176,10 +188,14 @@ func (h *claudeHost) Session() SessionInfo {
 var claudeStates = map[string]string{"busy": bus.StateBusy, "idle": bus.StateIdle, "waiting": bus.StateWaiting}
 
 func (h *claudeHost) socket() string {
+	e, _ := h.entry()
+	return socketOf(e)
+}
+
+func socketOf(e claudeEntry) string {
 	if s := os.Getenv("CLAUDE_CODE_MESSAGING_SOCKET"); s != "" {
 		return s
 	}
-	e, _ := h.entry()
 	return e.Socket
 }
 
@@ -194,8 +210,15 @@ func (h *claudeHost) Tier() string {
 // between tool calls, or starts a turn if the session is idle, and marks it as
 // coming from a peer. No token is sent on purpose, so a session that skips
 // permission prompts still holds the message for its user to review.
-func (h *claudeHost) Push(ctx context.Context, m bus.Message) error {
-	path := h.socket()
+func (h *claudeHost) Push(ctx context.Context, session string, m bus.Message) error {
+	// The socket belongs to the process, not the conversation, and stays the
+	// same through /clear. So the conversation is checked against the same
+	// read of the registry the socket comes from, just before writing.
+	e, ok := h.entry()
+	if h.info(e, ok).ID != session {
+		return ErrOtherConversation
+	}
+	path := socketOf(e)
 	if path == "" {
 		return errors.New("no inbox socket")
 	}
@@ -275,14 +298,18 @@ func (h *codexHost) Tier() string {
 	return bus.TierPush
 }
 
-func (h *codexHost) Push(ctx context.Context, m bus.Message) error {
+func (h *codexHost) Push(ctx context.Context, session string, m bus.Message) error {
+	thread := h.current()
+	if thread == "" || thread != session {
+		return ErrOtherConversation
+	}
 	text := MessageText(m)
 	if len(text) > maxArgBytes {
 		text = fmt.Sprintf("<birdie-message from=%q message_id=%q thread_id=%q>\nThis message is too long to show here. Read it with the birdie get_thread tool, and answer with send_message, in_reply_to %q.\n</birdie-message>", m.From, m.ID, m.ThreadID, m.ID)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "codex", "queue", "--thread", h.current(), "--message", text)
+	cmd := exec.CommandContext(ctx, "codex", "queue", "--thread", thread, "--message", text)
 	cmd.Dir = h.fallback.Cwd
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("codex queue: %w: %s", err, strings.TrimSpace(string(out)))
@@ -343,6 +370,6 @@ func (h *grokHost) Tier() string {
 }
 
 func (h *grokHost) Observe(json.RawMessage) {}
-func (h *grokHost) Push(context.Context, bus.Message) error {
+func (h *grokHost) Push(context.Context, string, bus.Message) error {
 	return errors.New("grok sessions get messages through hooks")
 }
