@@ -379,6 +379,7 @@ func TestHermesPlugin(t *testing.T) {
 	cmd := exec.CommandContext(ctx, python, "-I", filepath.Join("..", "..", "integrations", "hermes", "test_plugin.py"))
 	cmd.Env = append(os.Environ(), "PATH="+path, "PYTHONDONTWRITEBYTECODE=1",
 		"BIRDIE_TEST_URL="+srv.URL,
+		"BIRDIE_TEST_DB="+o.db,
 		"BIRDIE_TEST_TOKEN_FILE="+filepath.Join(tokenDir(), "hermes"),
 		"BIRDIE_TEST_PEER_TOKEN_FILE="+filepath.Join(tokenDir(), "peer"))
 	var out bytes.Buffer

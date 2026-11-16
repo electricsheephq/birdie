@@ -91,7 +91,8 @@ func (s *server) inbox(w http.ResponseWriter, r *http.Request, a bus.Agent) {
 		}
 		wait = time.Duration(secs * float64(time.Second))
 	}
-	in := bus.ReceiveInput{Agent: a.Name, Thread: r.URL.Query().Get("thread_id"), Session: r.URL.Query().Get("session"), Wait: wait}
+	in := bus.ReceiveInput{Agent: a.Name, Thread: r.URL.Query().Get("thread_id"), Session: r.URL.Query().Get("session"), Wait: wait,
+		Push: r.URL.Query().Get("push") == "1"}
 	if v := r.URL.Query().Get("lease"); v != "" {
 		secs, err := strconv.ParseFloat(v, 64)
 		if err != nil || secs < 0 {
@@ -143,7 +144,13 @@ func (s *server) reportSession(w http.ResponseWriter, r *http.Request, a bus.Age
 		s.fail(w, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	// The session learns from the answer whether someone made it pull-only.
+	on, err := s.b.PullOnly(r.Context(), a.Name, r.PathValue("id"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"pull_only": on})
 }
 
 func (s *server) endSession(w http.ResponseWriter, r *http.Request, a bus.Agent) {
@@ -160,7 +167,11 @@ func (s *server) thread(w http.ResponseWriter, r *http.Request, a bus.Agent) {
 		s.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"messages": msgs})
+	out := map[string]any{"messages": msgs}
+	if status := bus.ThreadStatus(msgs); status != "" {
+		out["status"] = status
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *server) fail(w http.ResponseWriter, err error) {

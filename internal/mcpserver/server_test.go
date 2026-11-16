@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -91,6 +92,12 @@ func toolJSON(t *testing.T, result map[string]any) map[string]any {
 
 func setup(t *testing.T, channel bool) (*session, *client.Client) {
 	t.Helper()
+	return setupWith(t, channel, nil)
+}
+
+// setupWith is setup with the bus's HTTP API wrapped by wrap, if not nil.
+func setupWith(t *testing.T, channel bool, wrap func(http.Handler) http.Handler) (*session, *client.Client) {
+	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "bus.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +107,11 @@ func setup(t *testing.T, channel bool) (*session, *client.Client) {
 		st.CreateAgent(context.Background(), bus.Agent{Name: n, TokenHash: bus.HashToken(n + "-tok"), Delivery: bus.DeliveryPull, CreatedAt: time.Now(), Config: picksSession})
 	}
 	b := bus.New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	api := httptest.NewServer(httpapi.New(b, slog.New(slog.NewTextHandler(io.Discard, nil))))
+	var h http.Handler = httpapi.New(b, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if wrap != nil {
+		h = wrap(h)
+	}
+	api := httptest.NewServer(h)
 	t.Cleanup(api.Close)
 
 	inR, inW := io.Pipe()
