@@ -54,3 +54,64 @@ func isAddressError(err error, code string) bool {
 	e, ok := bus.AsAddressError(err)
 	return ok && e.Code == code
 }
+
+// A message a session took just before birdie restarted is neither lost nor
+// given twice: confirmed afterwards, it stays delivered; never confirmed, it
+// comes back once its lease ends, and only once.
+func TestARestartLosesAndRepeatsNothing(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "bus.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	b := bus.New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := b.ReportSession(ctx, "claude", "s1", bus.SessionInput{Name: "api", Tier: bus.TierPush}); err != nil {
+		t.Fatal(err)
+	}
+	var sent []bus.Message
+	for _, content := range []string{"confirmed after", "never confirmed"} {
+		m, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/s1", Content: content})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sent = append(sent, m)
+	}
+	took, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s1", Lease: 300 * time.Millisecond})
+	if err != nil || len(took) != 2 {
+		t.Fatalf("took %+v, %v", took, err)
+	}
+	st.Close() // birdie stops
+
+	st, err = store.Open(path) // and starts again
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	b = bus.New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := b.Ack(ctx, "claude", sent[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ReportSession(ctx, "claude", "s1", bus.SessionInput{Name: "api", Tier: bus.TierPush}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond) // the lease ends
+	var again []string
+	for range 2 {
+		got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s1", Lease: time.Minute})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range got {
+			again = append(again, m.ID)
+		}
+	}
+	if len(again) != 1 || again[0] != sent[1].ID {
+		t.Fatalf("after the restart: %v, want only %s", again, sent[1].ID)
+	}
+	if got, err := st.GetMessage(ctx, sent[0].ID); err != nil || got.Status != bus.StatusDelivered {
+		t.Fatalf("confirmed one: %+v, %v", got.Status, err)
+	}
+}
