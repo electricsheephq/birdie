@@ -189,8 +189,10 @@ func (c *Client) ReportSession(ctx context.Context, id string, in bus.SessionInp
 		PullOnly bool `json:"pull_only"`
 	}
 	err = c.do(ctx, http.MethodPut, "/v1/sessions/"+url.PathEscape(id), in, &out)
-	if errors.Is(err, io.EOF) {
-		err = nil // a daemon from before pull-only answers with no body
+	if err == io.EOF {
+		// A daemon from before pull-only answers with no body. Compared
+		// exactly: a dropped connection is an EOF wrapped in a *url.Error.
+		err = nil
 	}
 	return out.PullOnly, err
 }
