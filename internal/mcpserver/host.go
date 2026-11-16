@@ -121,8 +121,9 @@ type claudeHost struct {
 
 	mu   sync.Mutex
 	last *claudeEntry // the last entry read whole
-	// failingSince is when whole reads started failing after last.
-	failingSince time.Time
+	// failingSince is when reads started failing one after another, each
+	// soon after the last (lastFailure), since the last whole read.
+	failingSince, lastFailure time.Time
 }
 
 // registryGrace is how long whole reads of the registry may fail before the
@@ -131,6 +132,10 @@ type claudeHost struct {
 // nothing says which conversation the process serves, so messages wait, for
 // check_inbox too, until a whole read does (see conversation).
 const registryGrace = 10 * time.Second
+
+// failureGap is how close failed reads must come to count as one run. The
+// pump retries every unsureRetry while it can't tell, well inside it.
+const failureGap = 2 * time.Second
 
 type claudeEntry struct {
 	SessionID       string `json:"sessionId"`
@@ -168,12 +173,16 @@ func (h *claudeHost) entry() (e claudeEntry, ok, sure bool) {
 		if h.last == nil {
 			return claudeEntry{}, false, true
 		}
-		if h.failingSince.IsZero() {
-			h.failingSince = time.Now()
+		// A failure long after the last one starts a new run: a read cut
+		// short a while ago says nothing about the registry now.
+		now := time.Now()
+		if h.failingSince.IsZero() || now.Sub(h.lastFailure) > failureGap {
+			h.failingSince = now
 		}
+		h.lastFailure = now
 		return *h.last, true, false
 	}
-	h.last, h.failingSince = &e, time.Time{}
+	h.last, h.failingSince, h.lastFailure = &e, time.Time{}, time.Time{}
 	return e, true, true
 }
 
