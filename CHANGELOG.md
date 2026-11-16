@@ -74,7 +74,7 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   10 seconds (#22).
 - Event previews, checks for a notice already sent, and telling a sender a
   message is held no longer copy a whole message, however large (#23).
-  Confirming or returning a message still reads it once, for its event.
+  Confirming or returning a message still reads it whole, once.
 - Mail sent to bare `claude` before the upgrade, in a thread `claude` never
   spoke in or took a message in, is no longer stranded. Its sender is told it
   is held, and it expires after the hold time, counted from then (#24).
