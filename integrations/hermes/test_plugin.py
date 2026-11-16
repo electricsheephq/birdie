@@ -3,6 +3,7 @@ context. `go test ./cmd/birdie` runs this; no Hermes or model is needed."""
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -27,6 +28,7 @@ plugin.POLL_SECONDS = 1
 plugin.WAIT_STEP_SECONDS = 0.2
 
 URL = os.environ["BIRDIE_TEST_URL"]
+DB = os.environ["BIRDIE_TEST_DB"]
 TOKEN_FILE = os.environ["BIRDIE_TEST_TOKEN_FILE"]
 PEER_TOKEN = Path(os.environ["BIRDIE_TEST_PEER_TOKEN_FILE"]).read_text().strip()
 TOKEN = Path(TOKEN_FILE).read_text().strip()
@@ -40,6 +42,12 @@ def peer(method, path, body=None):
     with urllib.request.urlopen(request, timeout=15) as response:
         raw = response.read()
     return json.loads(raw) if raw else {}
+
+
+def pull_only(on):
+    """What `birdie session pull-only hermes/... on|off` does, from another process."""
+    with sqlite3.connect(DB, timeout=10) as db:
+        db.execute("UPDATE sessions SET pull_only = ? WHERE agent = 'hermes'", (int(on),))
 
 
 def peer_inbox(wait=0):
@@ -103,6 +111,7 @@ class PluginTest(unittest.TestCase):
     def tearDown(self):
         for network in self.networks:
             network.close()
+        pull_only(False)
         self.drain()
         self.dir.cleanup()
 
@@ -238,6 +247,59 @@ class PluginTest(unittest.TestCase):
             waiting.join()
         self.assertTrue(wait_until(lambda: ctx.injected, 6), "the reply was lost")
         self.assertIn("the late reply", ctx.injected[0][1])
+
+    def test_a_pull_only_conversation_gets_nothing_pushed(self):
+        self.write_config(True)
+        ctx, _ = self.load()
+        self.turn(ctx)
+        pull_only(True)
+        peer("POST", "/v1/messages", {"to": "hermes", "content": "held for the tool"})
+        time.sleep(1.5)
+        self.assertEqual(ctx.injected, [], "pushed into a pull-only conversation")
+        self.assertIn("held for the tool", self.call(ctx, "birdie_check_inbox"))
+        pull_only(False)  # no new turn, no restart
+        peer("POST", "/v1/messages", {"to": "hermes", "content": "pushed again"})
+        self.assertTrue(wait_until(lambda: ctx.injected, 10), "not pushed once pull-only was off")
+        self.assertIn("pushed again", ctx.injected[0][1])
+
+    def test_a_wait_gets_its_reply_when_made_pull_only_since_the_last_report(self):
+        self.write_config(True)
+        ctx, _ = self.load()
+        self.turn(ctx)
+        sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}))
+        pull_only(True)  # it hasn't reported since, so it still counts as push
+        peer("POST", "/v1/messages", {"in_reply_to": peer_inbox(5)[0]["id"], "content": "the held reply"})
+        result = self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 4})
+        self.assertIn("the held reply", result)
+        self.assertEqual(ctx.injected, [])
+
+    def test_delivery_gives_back_what_comes_once_pull_only(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        self.turn(ctx)
+        pull_only(True)
+        conversation = network.conversation("s1")
+        network.report(conversation)
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "taken just before"})
+        # Taken by delivery just before the switch, as far as Hermes can tell.
+        network.deliver(conversation, {"id": sent["id"], "thread_id": sent["thread_id"], "from": "peer", "content": "taken just before"})
+        self.assertEqual(ctx.injected, [], "pushed into a pull-only conversation")
+        self.assertIn("taken just before", self.call(ctx, "birdie_check_inbox"))
+
+    def test_giving_back_doesnt_spin_when_reports_fail(self):
+        # Wake stays off, so no delivery loop takes the message meanwhile:
+        # only the deliver() call below handles it.
+        ctx, network = self.load()
+        self.turn(ctx)
+        conversation = network.conversation("s1")
+        conversation.pull_only = True  # learned before; reports fail now
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "x"})
+        waited = []
+        with mock.patch.object(network, "report", side_effect=plugin.BusError("down")), \
+                mock.patch.object(conversation.closed, "wait", side_effect=lambda s: waited.append(s)):
+            network.deliver(conversation, {"id": sent["id"], "thread_id": sent["thread_id"], "from": "peer", "content": "x"})
+        self.assertEqual(waited, [plugin.RETRY_SECONDS])
+        self.assertEqual(ctx.injected, [])
 
     def test_a_refused_message_stays_for_the_tool_and_the_next_turn_tries_again(self):
         self.write_config(True)

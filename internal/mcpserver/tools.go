@@ -125,6 +125,10 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 		}
 		out = map[string]string{"message_id": m.ID, "thread_id": m.ThreadID, "status": m.Status, "note": m.Note}
 	case "check_inbox":
+		if h := s.currentHost(); h != nil && s.pushing() {
+			// It may have been made pull-only since it last reported.
+			s.syncSession(context.WithoutCancel(ctx), h)
+		}
 		if s.pushing() {
 			return toolText("New messages come to you on their own in this session, so there is nothing to fetch.", false), nil
 		}
