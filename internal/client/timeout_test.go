@@ -15,12 +15,12 @@ type deadlineTransport func(*http.Request) (*http.Response, error)
 
 func (f deadlineTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func TestSessionCallsHaveADeadline(t *testing.T) {
+func TestSessionAndConfirmationCallsHaveADeadline(t *testing.T) {
 	c := New("http://daemon", "test-token")
 	c.HTTP.Transport = deadlineTransport(func(r *http.Request) (*http.Response, error) {
 		deadline, ok := r.Context().Deadline()
 		if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > 10*time.Second {
-			t.Errorf("%s session call has no deadline within ten seconds", r.Method)
+			t.Errorf("%s %s has no deadline within ten seconds", r.Method, r.URL.Path)
 		}
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
 	})
@@ -28,6 +28,12 @@ func TestSessionCallsHaveADeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := c.EndSession(context.Background(), "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Ack(context.Background(), "m1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Nack(context.Background(), "m1"); err != nil {
 		t.Fatal(err)
 	}
 }

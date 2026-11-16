@@ -22,9 +22,11 @@ import (
 // Lease is how long a session keeps messages it claimed before confirming them.
 const Lease = 2 * time.Minute
 
-// Session reports can outlive the tool call that found a conversation change,
-// but a stalled daemon must not hold up that change forever.
-const sessionTimeout = 10 * time.Second
+// callTimeout bounds the short calls a bridge makes even after its own
+// request has ended: session reports, which can outlive the tool call that
+// found a conversation change, and confirmations, which outlive the delivery.
+// A stalled daemon must not hold them up forever.
+const callTimeout = 10 * time.Second
 
 type Client struct {
 	BaseURL string
@@ -169,11 +171,15 @@ func (c *Client) Thread(ctx context.Context, threadID string) ([]bus.Message, er
 
 // Ack confirms the agent got a claimed message.
 func (c *Client) Ack(ctx context.Context, id string) error {
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
 	return c.do(ctx, http.MethodPost, "/v1/messages/"+url.PathEscape(id)+"/ack", nil, nil)
 }
 
 // Nack returns a claimed message to the queue.
 func (c *Client) Nack(ctx context.Context, id string) error {
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
 	return c.do(ctx, http.MethodPost, "/v1/messages/"+url.PathEscape(id)+"/nack", nil, nil)
 }
 
@@ -189,7 +195,7 @@ func (c *Client) Unread(ctx context.Context) (int, error) {
 
 // ReportSession tells the bus this session is running.
 func (c *Client) ReportSession(ctx context.Context, id string, in bus.SessionInput) (pullOnly bool, err error) {
-	ctx, cancel := context.WithTimeout(ctx, sessionTimeout)
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
 	var out struct {
 		PullOnly bool `json:"pull_only"`
@@ -205,7 +211,7 @@ func (c *Client) ReportSession(ctx context.Context, id string, in bus.SessionInp
 
 // EndSession tells the bus this session has stopped.
 func (c *Client) EndSession(ctx context.Context, id string) error {
-	ctx, cancel := context.WithTimeout(ctx, sessionTimeout)
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
 	return c.do(ctx, http.MethodDelete, "/v1/sessions/"+url.PathEscape(id), nil, nil)
 }
