@@ -154,3 +154,30 @@ func TestAWholeIdIsntRefusedJustAfterAWake(t *testing.T) {
 		t.Fatalf("gone after a wake: %v", err)
 	}
 }
+
+// Once the sessions that were running report again, a session gone long
+// before the restart doesn't become the latest heard, and stays refused.
+func TestALongGoneSessionStaysRefusedOnceOthersReport(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "bus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "claude", nil)
+	recent := time.Now().Add(-10 * time.Minute)
+	for id, seen := range map[string]time.Time{"recent": recent, "gone": recent.Add(-48 * time.Hour)} {
+		if err := st.UpsertSession(ctx, bus.Session{Agent: "claude", ID: id, Name: id, Tier: bus.TierPush, ActiveAt: seen, LastSeen: seen}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := bus.New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	b.QuietFor = time.Minute
+	if err := b.ReportSession(ctx, "claude", "recent", bus.SessionInput{Name: "recent", Tier: bus.TierPush}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/gone", Content: "hi"}); !isAddressError(err, bus.RecipientSessionEnded) {
+		t.Fatalf("gone, once recent reported: %v", err)
+	}
+}
