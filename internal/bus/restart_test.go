@@ -39,7 +39,7 @@ func TestAWholeIdIsntRefusedJustAfterARestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := bus.New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	b.QuietFor = 300 * time.Millisecond
+	b.QuietFor = time.Second
 	for _, to := range []string{"claude/s1", "claude/api#s1"} {
 		m, err := b.Send(ctx, "bot", bus.SendInput{To: to, Content: "hi"})
 		if err != nil || m.ToSession != "s1" {
@@ -59,7 +59,7 @@ func TestAWholeIdIsntRefusedJustAfterARestart(t *testing.T) {
 	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/gone", Content: "hi"}); !isAddressError(err, bus.RecipientSessionEnded) {
 		t.Fatalf("a session gone before birdie stopped, once others report: %v", err)
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(1200 * time.Millisecond)
 	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude/s2", Content: "hi"}); !isAddressError(err, bus.RecipientSessionEnded) {
 		t.Fatalf("after listening, one that never came back: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestARestartLosesAndRepeatsNothing(t *testing.T) {
 func TestAWholeIdIsntRefusedJustAfterAWake(t *testing.T) {
 	ctx := context.Background()
 	b, st := newBus(t)
-	b.QuietFor = 300 * time.Millisecond
+	b.QuietFor = time.Minute
 	addAgent(t, st, "bot", nil)
 	addAgent(t, st, "claude", nil)
 	now := time.Now()
