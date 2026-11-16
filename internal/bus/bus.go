@@ -70,7 +70,7 @@ type Bus struct {
 	// stopped or expires anything: SessionTTL, long enough for every running
 	// session to report. Negative means not at all.
 	QuietFor   time.Duration
-	listening  atomic.Int64 // since when, in Unix ms
+	listening  atomic.Pointer[listening]
 	lastExpire time.Time
 
 	mu      sync.Mutex
@@ -87,7 +87,13 @@ func New(s Store, log *slog.Logger, ds ...Deliverer) *Bus {
 		waiters:    make(map[string]map[chan struct{}]struct{}),
 		kick:       make(chan struct{}, 1),
 	}
-	b.listening.Store(time.Now().UnixMilli())
+	now := time.Now()
+	l := &listening{since: now}
+	// Nothing can have reported to this bus yet.
+	if t, err := s.LastSeenBefore(context.Background(), now); err == nil {
+		l.heard = t
+	}
+	b.listening.Store(l)
 	for _, d := range ds {
 		b.deliverers[d.Kind()] = d
 	}
@@ -331,15 +337,32 @@ func days(d time.Duration) string {
 	return d.String()
 }
 
+// listening is since when the bus has listened (it started or the machine
+// woke), and when it last heard from any session before that: zero if never.
+// Both are taken together, before sessions report again and overwrite their
+// last_seen, and read together.
+type listening struct{ since, heard time.Time }
+
+// woke starts listening again after a sleep: sessions were last heard
+// before it, up to last, when the bus last ran.
+func (b *Bus) woke(last, now time.Time) {
+	b.listening.Store(&listening{since: now, heard: last})
+	b.lastExpire = time.Time{}
+}
+
 // quiet reports whether the bus has listened for too short a time, since it
 // started or the machine woke, to tell that a session it hasn't heard from
 // has stopped.
 func (b *Bus) quiet(now time.Time) bool {
+	return b.quietSince(b.listening.Load(), now)
+}
+
+func (b *Bus) quietSince(l *listening, now time.Time) bool {
 	q := b.QuietFor
 	if q == 0 {
 		q = SessionTTL
 	}
-	return q > 0 && now.UnixMilli()-b.listening.Load() < q.Milliseconds()
+	return q > 0 && now.UnixMilli()-l.since.UnixMilli() < q.Milliseconds()
 }
 
 // noticeHeld tells the senders of messages held for a session that isn't
@@ -995,8 +1018,7 @@ func (b *Bus) RunDelivery(ctx context.Context) {
 	awake := func(waiting bool) {
 		now := time.Now()
 		if asleep(time.Duration(now.UnixMilli()-last.UnixMilli())*time.Millisecond, now.Sub(last), waiting) {
-			b.listening.Store(now.UnixMilli())
-			b.lastExpire = time.Time{}
+			b.woke(last, now)
 		}
 		last = now
 	}

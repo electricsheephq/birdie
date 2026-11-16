@@ -308,6 +308,9 @@ type Store interface {
 	// SessionPullOnly reports whether the session is pull-only; false for one
 	// birdie doesn't know.
 	SessionPullOnly(ctx context.Context, agent, id string) (bool, error)
+	// LastSeenBefore is when birdie last heard from any session before t;
+	// zero if never.
+	LastSeenBefore(ctx context.Context, t time.Time) (time.Time, error)
 	// LiveSessions returns the agent's running sessions: seen since a time,
 	// and not closed.
 	LiveSessions(ctx context.Context, agent string, since time.Time) ([]Session, error)

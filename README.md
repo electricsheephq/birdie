@@ -154,7 +154,9 @@ taking them, with one notice naming every such message. If the session
 doesn't come back within 7 days of stopping, or of the send if that was later
 (`birdie serve --hold-for`), the message expires and the sender is told. After
 `birdie serve` starts, or the machine wakes, nothing is taken as stopped or
-expired until running sessions have had 90 seconds to report. No
+expired until running sessions have had 90 seconds to report. Meanwhile, a
+message to a session's whole id reaches it unless that session said it
+closed. No
 other session gets it. A session can still collect one by
 waiting on its thread.
 

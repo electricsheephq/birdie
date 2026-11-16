@@ -608,6 +608,12 @@ func (s *SQLite) SessionPullOnly(ctx context.Context, agent, id string) (bool, e
 	return on, err
 }
 
+func (s *SQLite) LastSeenBefore(ctx context.Context, t time.Time) (time.Time, error) {
+	var ms int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(last_seen), 0) FROM sessions WHERE last_seen < ?`, t.UnixMilli()).Scan(&ms)
+	return unixMilli(ms), err
+}
+
 func (s *SQLite) LiveSessions(ctx context.Context, agent string, since time.Time) ([]bus.Session, error) {
 	return collectSessions(s.db.QueryContext(ctx, `SELECT `+sessionCols+` FROM sessions
 		WHERE agent = ? AND last_seen >= ? AND ended_at = 0 ORDER BY active_at DESC, id`, agent, since.UnixMilli()))
