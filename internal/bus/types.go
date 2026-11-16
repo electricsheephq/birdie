@@ -332,6 +332,9 @@ type Deliverer interface {
 // running. A session isn't running once it closed; with Lapsed, also once it
 // hasn't been heard from since LiveSince, or was never heard from.
 type HoldQuery struct {
+	// Unrouted lists agents that require a session but have no live default.
+	// Their old unpinned mail must not wait forever after routing rules change.
+	Unrouted []string
 	// Expire picks messages to expire: held since before Before, counted from
 	// when they were sent or their session stopped, whichever is later.
 	// Otherwise SettleHeld picks those whose sender hasn't been told they are

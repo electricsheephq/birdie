@@ -390,15 +390,23 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 const waiting = `(m.status = 'queued' OR (m.status = 'claimed' AND m.lease_until > 0 AND m.lease_until <= ?))`
 
 func (s *SQLite) SettleHeld(ctx context.Context, q bus.HoldQuery, build func([]bus.HeldMessage) []bus.Message) ([]bus.HeldMessage, []bus.Message, error) {
-	where := `m.to_session != '' AND m.sender NOT IN (?, ?) AND ` + waiting + `
+	where := `m.sender NOT IN (?, ?) AND ` + waiting + `
 		AND m.recipient IN (SELECT name FROM agents WHERE delivery = 'pull')`
 	args := []any{bus.SystemSender, bus.LegacySystemSender, q.Now.UnixMilli()}
+	session := `m.to_session != '' AND s.ended_at > 0`
 	if q.Lapsed {
-		where += ` AND (s.id IS NULL OR s.ended_at > 0 OR s.last_seen < ?)`
+		session = `m.to_session != '' AND (s.id IS NULL OR s.ended_at > 0 OR s.last_seen < ?)`
 		args = append(args, q.LiveSince.UnixMilli())
-	} else {
-		where += ` AND s.ended_at > 0`
+		if len(q.Unrouted) > 0 {
+			// Before sessions were required, bare mail could be queued with no
+			// session able to take it. Give its sender the same hold deadline.
+			session = `(` + session + `) OR (m.to_session = '' AND m.recipient IN (?` + strings.Repeat(", ?", len(q.Unrouted)-1) + `))`
+			for _, agent := range q.Unrouted {
+				args = append(args, agent)
+			}
+		}
 	}
+	where += ` AND (` + session + `)`
 	if q.Expire {
 		where += ` AND MAX(m.created_at, COALESCE(CASE WHEN s.ended_at > 0 THEN s.ended_at ELSE s.last_seen END, 0)) < ?`
 		args = append(args, q.Before.UnixMilli())

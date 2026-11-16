@@ -389,6 +389,16 @@ func (b *Bus) settleHeld(ctx context.Context, q HoldQuery) {
 	if list, err := b.store.ListAgents(ctx); err == nil {
 		for _, a := range list {
 			agents[a.Name] = a
+			if q.Lapsed && a.Delivery == DeliveryPull && !PicksSession(a) {
+				live, err := b.store.LiveSessions(ctx, a.Name, q.LiveSince)
+				if err != nil {
+					b.log.Error("find default for held messages", "agent", a.Name, "err", err)
+					return
+				}
+				if defaultSession(live, a) == nil {
+					q.Unrouted = append(q.Unrouted, a.Name)
+				}
+			}
 		}
 	}
 	for {
@@ -465,7 +475,15 @@ func heldNotices(held []HeldMessage, expired bool, agents map[string]Agent, hold
 		subject := plural(len(ids), "your message ", "your messages ") + strings.Join(ids, ", ")
 		verb := plural(len(ids), "is", "are")
 		var text string
-		if expired {
+		if k.toSession == "" {
+			if expired {
+				text = fmt.Sprintf("%s: %s to %s expired. No default session was available within %s, so %s never delivered. Choose a default with birdie session default or turn fallback on, then send a new message; or send to a running session's address (list_agents shows them).",
+					SessionRequired, subject, to.DisplayName(), days(hold), plural(len(ids), "it was", "they were"))
+			} else {
+				text = fmt.Sprintf("%s: %s to %s %s held because no default session is running and fallback is off. Choose a default with birdie session default or turn fallback on so a running session can take %s. After %s from when you sent %s, %s and you'll be told. To reach a session directly, send a new message to its address (list_agents shows them).",
+					SessionRequired, subject, to.DisplayName(), verb, plural(len(ids), "it", "them"), days(hold), plural(len(ids), "it", "them"), plural(len(ids), "it expires", "they expire"))
+			}
+		} else if expired {
 			text = fmt.Sprintf("%s: %s to %s expired. That session stopped and didn't come back within %s, so %s never delivered, and no other session got %s. To reach a session that is running, send a new message to its address (list_agents shows them).",
 				RecipientSessionEnded, subject, label, days(hold), plural(len(ids), "it was", "they were"), plural(len(ids), "it", "them"))
 		} else {
