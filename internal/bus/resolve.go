@@ -193,11 +193,11 @@ func (b *Bus) findSession(ctx context.Context, to Agent, addr Address) (Session,
 // because birdie has only just started or woken and s hasn't reported yet: it
 // was running when birdie last heard from any session before that.
 func (b *Bus) mayStillRun(s Session, now time.Time) bool {
-	heard := b.heard.Load()
-	if !s.EndedAt.IsZero() || !b.quiet(now) || heard == 0 {
+	l := b.listening.Load() // one snapshot: a wake can't mix two
+	if !s.EndedAt.IsZero() || l.heard.IsZero() || !b.quietSince(l, now) {
 		return false
 	}
-	return !s.LastSeen.Before(time.UnixMilli(heard).Add(-SessionTTL))
+	return !s.LastSeen.Before(l.heard.Add(-SessionTTL))
 }
 
 // othersNote tells the sender that name reached one of several sessions.
