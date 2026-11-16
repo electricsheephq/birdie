@@ -197,6 +197,15 @@ class PluginTest(unittest.TestCase):
         time.sleep(1.5)
         self.assertEqual(len(ctx.injected), 1, "an accepted message must not come again")
 
+    def test_a_long_message_is_pushed_as_a_pointer(self):
+        self.write_config(True)
+        ctx, _ = self.load()
+        self.turn(ctx)
+        peer("POST", "/v1/messages", {"to": "hermes", "content": "x" * (200 << 10)})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        self.assertIn("birdie_get_thread", ctx.injected[0][1])
+        self.assertLess(len(ctx.injected[0][1]), 1000)
+
     def test_a_message_that_comes_back_is_not_put_in_again(self):
         self.write_config(True)
         ctx, network = self.load()

@@ -111,6 +111,7 @@ func setup(t *testing.T, channel bool) (*session, *client.Client) {
 	t.Cleanup(func() { inW.Close(); cancel() })
 
 	s := &session{t: t, in: inW, out: bufio.NewScanner(outR)}
+	s.out.Buffer(make([]byte, 64<<10), 64<<20) // long messages
 	init := s.call("initialize", map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "test"}})
 	if init["protocolVersion"] != "2025-06-18" {
 		t.Fatalf("initialize = %v", init)
@@ -230,6 +231,7 @@ func setupHost(t *testing.T, h *fakeHost) (*session, *client.Client, *store.SQLi
 	go srv.Run(ctx, inR, outW)
 	t.Cleanup(func() { inW.Close(); cancel() })
 	s := &session{t: t, in: inW, out: bufio.NewScanner(outR)}
+	s.out.Buffer(make([]byte, 64<<10), 64<<20) // long messages
 	s.call("initialize", map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "test"}})
 	s.send(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
 	return s, client.New(api.URL, "cursor-tok"), st

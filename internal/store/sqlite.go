@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -339,10 +340,33 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 	defer tx.Rollback()
 
 	where, args := inboxWhere(f, now)
+	// Sizes first, so only what fits in one batch is read.
+	rows, err := tx.QueryContext(ctx, `SELECT m.id, length(CAST(m.content AS BLOB)) FROM messages m WHERE`+where+` ORDER BY m.seq LIMIT ?`, append(args, f.Limit)...)
+	if err != nil {
+		return nil, err
+	}
+	var ids []any
+	total := 0
+	for rows.Next() {
+		var id string
+		var size int
+		if err := rows.Scan(&id, &size); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if len(ids) > 0 && total+size > bus.MaxBatchBytes {
+			break
+		}
+		ids, total = append(ids, id), total+size
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(ids) == 0 {
+		return []bus.Message{}, err
+	}
 	msgs, err := collectMessages(tx.QueryContext(ctx,
-		`SELECT `+msgCols+` FROM messages m WHERE`+where+` ORDER BY m.seq LIMIT ?`, append(args, f.Limit)...))
-	if err != nil || len(msgs) == 0 {
-		return msgs, err
+		`SELECT `+msgCols+` FROM messages m WHERE m.id IN (?`+strings.Repeat(", ?", len(ids)-1)+`) ORDER BY m.seq`, ids...))
+	if err != nil {
+		return nil, err
 	}
 	for i := range msgs {
 		if f.LeaseUntil.IsZero() {
