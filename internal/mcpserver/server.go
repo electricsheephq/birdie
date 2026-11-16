@@ -580,10 +580,12 @@ func (s *Server) removeWaiter(thread string, ch chan bus.Message) {
 }
 
 // waitForReply blocks until a message arrives on thread or timeout passes.
-func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.Duration) ([]bus.Message, error) {
+// pushing is whether the session counted as push when the call began; the
+// caller confirms what this returns only if it didn't, so the two must agree.
+func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.Duration, pushing bool) ([]bus.Message, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	if !s.pushing() {
+	if !pushing {
 		for {
 			remaining := time.Until(deadlineOf(ctx))
 			if remaining <= 0 {

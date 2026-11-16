@@ -143,7 +143,9 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, *rpcEr
 		}
 		var msgs []bus.Message
 		pushing := s.pushing()
-		msgs, err = s.waitForReply(ctx, a.ThreadID, seconds(a.TimeoutSeconds, 120*time.Second, maxReplyWait))
+		// One decision for how to wait and whether to confirm what comes
+		// back: the tier can change while the call waits.
+		msgs, err = s.waitForReply(ctx, a.ThreadID, seconds(a.TimeoutSeconds, 120*time.Second, maxReplyWait), pushing)
 		if !pushing {
 			s.ackAll(ctx, msgs, err)
 		}
