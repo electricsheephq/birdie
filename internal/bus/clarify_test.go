@@ -1,6 +1,7 @@
 package bus_test
 
 import (
+	"context"
 	"testing"
 
 	"birdie/internal/bus"
@@ -50,5 +51,54 @@ func TestThreadStatus(t *testing.T) {
 	}
 	if !bus.AsksQuestions(question) || bus.AsksQuestions(ask) || bus.AsksQuestions(answer) {
 		t.Error("AsksQuestions is for messages starting with the marker")
+	}
+}
+
+// The status as each agent reads the thread, which shows it only the messages
+// it sent or got.
+func TestThreadStatusInThreadsWithThreeAgents(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	for _, n := range []string{"a", "b", "c"} {
+		addAgent(t, st, n, nil)
+	}
+	send := func(from string, in bus.SendInput) bus.Message {
+		t.Helper()
+		m, err := b.Send(ctx, from, in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	status := func(thread, reader string) string {
+		t.Helper()
+		msgs, err := b.Thread(ctx, thread, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bus.ThreadStatus(msgs)
+	}
+
+	// c finishing its part doesn't answer b's questions to a.
+	work := send("a", bus.SendInput{To: "b", Content: "implement it"})
+	review := send("a", bus.SendInput{To: "c", ThreadID: work.ThreadID, Content: "review it"})
+	send("c", bus.SendInput{InReplyTo: review.ID, Content: "review complete"})
+	send("b", bus.SendInput{InReplyTo: work.ID, Content: bus.ClarifyMarker + " 1. Which branch?"})
+	for _, reader := range []string{"a", "b"} {
+		if got := status(work.ThreadID, reader); got != bus.ThreadAwaitingClarification {
+			t.Errorf("as %s reads it: %q, want %q", reader, got, bus.ThreadAwaitingClarification)
+		}
+	}
+
+	// c sees only replies in this thread, so it can't tell who started it:
+	// its question about b's result holds up nothing.
+	work = send("a", bus.SendInput{To: "b", Content: "implement it"})
+	send("b", bus.SendInput{InReplyTo: work.ID, Content: "done"})
+	result := send("b", bus.SendInput{InReplyTo: work.ID, To: "c", Content: "the result, for your records"})
+	send("c", bus.SendInput{InReplyTo: result.ID, Content: bus.ClarifyMarker + " 1. Why this approach?"})
+	for _, reader := range []string{"a", "b", "c"} {
+		if got := status(work.ThreadID, reader); got != "" {
+			t.Errorf("after done, as %s reads it: %q, want none", reader, got)
+		}
 	}
 }

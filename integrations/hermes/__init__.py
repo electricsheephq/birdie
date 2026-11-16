@@ -589,8 +589,9 @@ class Network:
         return text
 
     def thread_status(self, thread):
-        """The thread's status from the bus, or None if it can't be read within STATUS_SECONDS.
-        The replies are already taken, so nothing here may fail or hold up the call."""
+        """The thread's status from the bus, or None if it can't be read. Each socket
+        operation may take STATUS_SECONDS. The replies are already taken, so nothing here
+        may fail the call."""
         try:
             path = "/v1/threads/" + urllib.parse.quote(thread, safe="")
             return self.bus.call("GET", path, timeout=STATUS_SECONDS).get("status")
