@@ -409,11 +409,12 @@ class Network:
                 self.bus.ack(message["id"])
                 return
             with conversation.lock:
+                # Under the lock, so a wait that is ending can't miss it: the wait
+                # confirms it once it returns it, or gives it back.
                 waiter = conversation.waiting.get(thread)
+                if waiter is not None:
+                    waiter.put(message)
             if waiter is not None:
-                waiter.put(message)
-                conversation.mark_delivered(message["id"])
-                self.bus.ack(message["id"])
                 return
             accepted = False
             if conversation.wake and not conversation.closed.is_set() and self.wake_allowed():
@@ -461,14 +462,32 @@ class Network:
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
                 try:
-                    return [waiter.get(timeout=min(WAIT_STEP_SECONDS, max(0.01, deadline - time.monotonic())))], False
+                    message = waiter.get(timeout=min(WAIT_STEP_SECONDS, max(0.01, deadline - time.monotonic())))
                 except queue.Empty:
                     if self.interrupted(conversation):
                         raise InterruptedError from None
+                    continue
+                conversation.mark_delivered(message["id"])
+                try:
+                    self.bus.ack(message["id"])
+                except BusError as err:
+                    log.debug("birdie: confirm: %s", err)  # it comes back and is confirmed then
+                return [message], False
             return [], False
         finally:
             with conversation.lock:
                 conversation.waiting.pop(thread, None)
+            # Nothing is handed over after that. Give back what came too late, so
+            # delivery shows it.
+            while True:
+                try:
+                    late = waiter.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self.bus.nack(late["id"])
+                except BusError as err:
+                    log.debug("birdie: give back: %s", err)  # its lease ends and it comes back
 
     def unread_note(self, conversation):
         if conversation.wake or not conversation.is_session:
