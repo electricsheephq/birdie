@@ -334,6 +334,39 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 	return msgs, tx.Commit()
 }
 
+// waiting is the condition for a message still waiting to be taken: queued,
+// or claimed with the lease run out.
+const waiting = `(m.status = 'queued' OR (m.status = 'claimed' AND m.lease_until > 0 AND m.lease_until <= ?))`
+
+func (s *SQLite) Pinned(ctx context.Context, agent, id string, now time.Time) ([]bus.Message, error) {
+	return collectMessages(s.db.QueryContext(ctx,
+		`SELECT `+msgCols+` FROM messages m WHERE m.recipient = ? AND m.to_session = ? AND `+waiting+` ORDER BY m.seq`,
+		agent, id, now.UnixMilli()))
+}
+
+func (s *SQLite) ExpireHeld(ctx context.Context, sentBefore, liveSince, now time.Time, limit int) ([]bus.Message, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	msgs, err := collectMessages(tx.QueryContext(ctx,
+		`SELECT `+msgCols+` FROM messages m WHERE m.to_session != '' AND m.created_at < ? AND `+waiting+`
+		   AND m.to_session NOT IN (SELECT id FROM sessions WHERE agent = m.recipient AND last_seen >= ? AND ended_at = 0)
+		 ORDER BY m.seq LIMIT ?`,
+		sentBefore.UnixMilli(), now.UnixMilli(), liveSince.UnixMilli(), limit))
+	if err != nil || len(msgs) == 0 {
+		return msgs, err
+	}
+	for i := range msgs {
+		if _, err := tx.ExecContext(ctx, `UPDATE messages SET status = 'expired', lease_until = 0 WHERE id = ?`, msgs[i].ID); err != nil {
+			return nil, err
+		}
+		msgs[i].Status = bus.StatusExpired
+	}
+	return msgs, tx.Commit()
+}
+
 func (s *SQLite) CountInbox(ctx context.Context, f bus.ClaimFilter, now time.Time) (int, error) {
 	where, args := inboxWhere(f, now)
 	var n int

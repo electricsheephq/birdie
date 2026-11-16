@@ -31,6 +31,9 @@ const (
 	StatusDelivered = "delivered"
 	StatusReplied   = "replied"
 	StatusFailed    = "failed"
+	// StatusExpired is a message held for a session that closed, and that
+	// didn't come back in time (see Bus.HoldFor).
+	StatusExpired = "expired"
 
 	// DeliveryPull agents fetch their own inbox (MCP, HTTP long-poll).
 	// Any other delivery kind is pushed by the Deliverer registered for it.
@@ -185,6 +188,10 @@ type Message struct {
 	// Note says when the recipient will see the message. Only set on the
 	// result of a send.
 	Note string `json:"note,omitempty"`
+	// Held, on the result of a send, is RecipientSessionEnded when the
+	// session the message is for isn't running: it waits for that session to
+	// come back, and expires if it doesn't in time.
+	Held string `json:"held,omitempty"`
 	// OtherSessions, on the result of a send to a name several running
 	// sessions share, lists the ones that didn't get it, so the sender can
 	// address one of them instead.
@@ -281,6 +288,13 @@ type Store interface {
 	// EndSession records that a session closed. Until it reports again, it no
 	// longer counts as running.
 	EndSession(ctx context.Context, agent, id string, at time.Time) error
+	// Pinned returns the messages waiting for agent's session id: queued, or
+	// claimed with the lease run out.
+	Pinned(ctx context.Context, agent, id string, now time.Time) ([]Message, error)
+	// ExpireHeld marks expired, and returns, up to limit messages sent before
+	// sentBefore that wait for a session that isn't running: closed, or not
+	// seen since liveSince.
+	ExpireHeld(ctx context.Context, sentBefore, liveSince, now time.Time, limit int) ([]Message, error)
 	// MoveSession points everything that names agent's session from at the
 	// session to instead.
 	MoveSession(ctx context.Context, agent, from, to string) error
