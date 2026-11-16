@@ -131,20 +131,37 @@ func (b *Bus) findSession(ctx context.Context, to Agent, addr Address) (Session,
 		}
 		return s.Name == addr.Session
 	}
-	if addr.ID == "" {
-		for _, s := range recent {
-			if s.ID == addr.Session {
-				if s.Live(now) {
-					return s, nil, nil
-				}
-				return ended(s)
-			}
+	// A whole id, alone or after a name, names one session. A session that
+	// isn't running is never swapped for one whose id merely starts the same.
+	whole := addr.Session
+	if addr.ID != "" {
+		whole = addr.ID
+	}
+	for _, s := range recent {
+		if s.ID != whole {
+			continue
 		}
+		if addr.ID != "" && s.Name != addr.Session {
+			return fail(RecipientNotFound, fmt.Sprintf("%s has no session %s: %s is the id of %s", to.DisplayName(), addr, addr.ID, addressOf(to, s)))
+		}
+		if s.Live(now) {
+			return s, nil, nil
+		}
+		return ended(s)
 	}
 	var found []Session
 	for _, s := range live {
 		if matches(s) {
 			found = append(found, s)
+		}
+	}
+	if addr.ID != "" && len(found) > 0 {
+		// The start of an id that also starts one that has stopped could
+		// mean either.
+		for _, s := range recent {
+			if !s.Live(now) && matches(s) {
+				return Session{}, nil, &AddressError{Code: RecipientAmbiguous, Msg: fmt.Sprintf("%s also starts the id of %s, which stopped %s; give the whole id", addr, addressOf(to, s), ago(s.StoppedAt(), now)), Live: refs(to, live), kind: ErrInvalid}
+			}
 		}
 	}
 	switch {
@@ -180,22 +197,24 @@ func othersNote(to Agent, name string, others []SessionRef) string {
 	return fmt.Sprintf("%d other running %s sessions are named %s and didn't get it: %s. To reach one of them, send to its address", len(others), to.DisplayName(), name, strings.Join(list, ", "))
 }
 
-// needsDefault refuses a message for agent to that names none of its
-// sessions, unless a session the user chose to take new conversations is
-// running: to doesn't pick one itself (see PicksSession).
-func (b *Bus) needsDefault(ctx context.Context, to Agent) error {
+// chosenSession is the session the user chose to take messages addressed to
+// agent to alone, which doesn't pick one itself (see PicksSession). The
+// message is pinned to it, so it waits for that session even if another with
+// its name opens later. Without one running, the message is refused, with
+// the sessions that are, so the sender can address one.
+func (b *Bus) chosenSession(ctx context.Context, to Agent) (Session, error) {
 	live, err := b.store.LiveSessions(ctx, to.Name, time.Now().Add(-SessionTTL))
 	if err != nil {
-		return err
+		return Session{}, err
 	}
-	if defaultSession(live, to) != nil {
-		return nil
+	if d := defaultSession(live, to); d != nil {
+		return *d, nil
 	}
 	msg := fmt.Sprintf("%s doesn't pick one of its sessions for a message addressed to %s alone; send it to one of them", to.DisplayName(), to.Name)
 	if len(live) == 0 {
 		msg = fmt.Sprintf("%s has no running session; send to one by its address once it is running", to.DisplayName())
 	}
-	return &AddressError{Code: SessionRequired, Msg: msg, Live: refs(to, live), kind: ErrInvalid}
+	return Session{}, &AddressError{Code: SessionRequired, Msg: msg, Live: refs(to, live), kind: ErrInvalid}
 }
 
 // AsAddressError reports err's AddressError, if it is one.

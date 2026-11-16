@@ -369,13 +369,23 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		}
 	}
 	// A new conversation must name a session. One that answers or follows
-	// up a conversation with no session in it (sent by `birdie send`, or by
-	// an agent with no sessions) waits for whoever waits on its thread or
-	// reads without being a session; no session is picked for it.
+	// up a conversation the recipient is in, with no session of it there
+	// (asked by `birdie send`, or by an agent with no sessions), waits for
+	// whoever waits on its thread or reads without being a session; no
+	// session is picked for it.
+	if joins {
+		if _, member, err := b.store.ThreadAccess(ctx, thread, to.Name); err != nil {
+			return Message{}, err
+		} else if !member {
+			joins = false
+		}
+	}
 	if toSession == "" && !joins && to.Delivery == DeliveryPull && !PicksSession(to) {
-		if err := b.needsDefault(ctx, to); err != nil {
+		s, err := b.chosenSession(ctx, to)
+		if err != nil {
 			return Message{}, err
 		}
+		toSession = s.ID
 	}
 
 	id := randHex(12)
