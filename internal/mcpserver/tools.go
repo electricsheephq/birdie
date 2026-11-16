@@ -158,8 +158,15 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 			return toolText(note, false), nil
 		}
 		reply := map[string]any{"messages": msgs}
-		if status := bus.ThreadStatus(msgs); status != "" {
-			reply["thread_status"] = status // it asks you questions before acting
+		if err == nil && len(msgs) > 0 && bus.AsksFirst(msgs[len(msgs)-1]) {
+			// Only the whole thread tells whether it asks the thread's starter
+			// before acting. The replies are already taken, so a failed read
+			// leaves the status out rather than failing the call.
+			if thread, terr := s.c.Thread(ctx, a.ThreadID); terr == nil {
+				if status := bus.ThreadStatus(thread); status != "" {
+					reply["thread_status"] = status
+				}
+			}
 		}
 		out = reply
 	case "get_thread":

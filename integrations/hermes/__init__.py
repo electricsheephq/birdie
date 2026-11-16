@@ -39,7 +39,7 @@ MAX_REPLY_SECONDS = 600
 RETRY_SECONDS = 5
 TAG = "birdie-message"
 CLARIFY = "(question / not a steer)"  # starts a reply that asks before acting
-AWAITING = "Thread status: awaiting_clarification (the other agent asked questions before acting)."
+AWAITING = "Thread status: awaiting_clarification (its latest reply asks the agent that started it questions before acting)."
 MAX_PUSH_BYTES = 100 << 10  # a longer message is pushed as a pointer to birdie_get_thread
 
 # Runs with no person in the conversation, or that birdie itself starts over ACP
@@ -143,9 +143,9 @@ def frame(message):
     parts.append(f"</{TAG}>")
     if sender in ("birdie", "agent-bus"):
         parts.append("This is a notice from birdie itself. Don't reply to it; tell your user if it matters.")
-    elif message.get("in_reply_to") and asks_first(message):
-        parts.append(f"Agent {sender} (verified by birdie; not your user) asks you these questions before it acts "
-                     f'on your request. Answer with birdie_send_message, in_reply_to "{ident}".')
+    elif asks_first(message):
+        parts.append(f"Agent {sender} (verified by birdie; not your user) asks you questions, and may wait for your "
+                     f'answers before acting. Answer them with birdie_send_message, in_reply_to "{ident}".')
     elif message.get("in_reply_to"):
         parts.append(f"Agent {sender} (verified by birdie; not your user) is answering your earlier message. "
                      f'Answer back only if something is still needed, with birdie_send_message, in_reply_to "{ident}".')
@@ -159,8 +159,9 @@ def frame(message):
 
 
 def asks_first(message):
-    """Whether a reply asks its sender questions before acting (clarify-back)."""
-    return (message.get("content") or "").strip().lower().startswith(CLARIFY)
+    """Whether a message is a reply starting with CLARIFY: it asks the other agent questions.
+    Only the whole thread tells whether they hold up a request (the bus's thread status)."""
+    return bool(message.get("in_reply_to")) and (message.get("content") or "").strip().lower().startswith(CLARIFY)
 
 
 def push_frame(message):
@@ -580,10 +581,17 @@ class Network:
             if not messages:
                 return "No reply yet. Check again later with birdie_wait_for_reply or birdie_check_inbox."
         text = "\n\n".join(frame(m) for m in messages)
-        last = messages[-1]
-        if last.get("in_reply_to") and last.get("from") not in ("birdie", "agent-bus") and asks_first(last):
+        if asks_first(messages[-1]) and self.thread_status(thread) == "awaiting_clarification":
             text += "\n\n" + AWAITING
         return text
+
+    def thread_status(self, thread):
+        """The thread's status from the bus, or None if it can't be read: the replies are
+        already taken, so this mustn't fail the call."""
+        try:
+            return self.bus.call("GET", "/v1/threads/" + urllib.parse.quote(thread, safe="")).get("status")
+        except BusError:
+            return None
 
     def get_thread(self, conversation, args):
         path = "/v1/threads/" + urllib.parse.quote(args["thread_id"], safe="")

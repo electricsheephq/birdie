@@ -76,7 +76,7 @@ func printThread(w io.Writer, agents []bus.Agent, msgs []store.Tracked, full boo
 		plain[i] = m.Message
 	}
 	if bus.ThreadStatus(plain) == bus.ThreadAwaitingClarification {
-		fmt.Fprintf(w, "Awaiting clarification: the latest reply asks questions before acting (%s).\n", bus.ClarifyMarker)
+		fmt.Fprintf(w, "Awaiting clarification: the latest reply asks the agent that started this thread questions before acting (%s).\n", bus.ClarifyMarker)
 	}
 	cut := false
 	for _, m := range msgs {

@@ -52,11 +52,11 @@ func TestClarifyBackNotes(t *testing.T) {
 		t.Fatalf("an ordinary reply shouldn't invite questions: %s", text)
 	}
 	m.Content = "  (Question / not a steer)\n1. Which repo?"
-	if text := mcpserver.MessageText(m); !strings.Contains(text, "asks you these questions before it acts") {
+	if text := mcpserver.MessageText(m); !strings.Contains(text, "asks you questions, and may wait") {
 		t.Fatalf("a clarify-back reply should say it asks questions: %s", text)
 	}
 	m.InReplyTo = ""
-	if text := mcpserver.MessageText(m); strings.Contains(text, "asks you these questions") {
+	if text := mcpserver.MessageText(m); strings.Contains(text, "asks you questions") {
 		t.Fatalf("a new message starting with the marker isn't a clarify-back reply: %s", text)
 	}
 }
