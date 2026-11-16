@@ -13,7 +13,9 @@ permissions:
 
 concurrency:
   group: test-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push to a pull request replaces its run; every commit on main
+  # keeps its own result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   go:
