@@ -414,12 +414,23 @@ func (s *Server) show(ctx context.Context, session string, m bus.Message) error 
 	if h := s.currentHost(); h != nil && h.Tier() == bus.TierPush {
 		return h.Push(ctx, session, m)
 	}
-	s.write(map[string]any{
+	b, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"method":  "notifications/claude/channel",
 		"params":  map[string]any{"content": MessageText(m), "meta": channelMeta(m)},
 	})
-	return nil
+	if err != nil {
+		return err
+	}
+	// The write can wait behind a tool call's answer, and /clear can come
+	// meanwhile, so the conversation is checked holding the output lock.
+	s.outMu.Lock()
+	defer s.outMu.Unlock()
+	if s.moved(session) {
+		return ErrOtherConversation
+	}
+	_, err = s.out.Write(append(b, '\n'))
+	return err
 }
 
 func (s *Server) ack(ctx context.Context, m bus.Message) {

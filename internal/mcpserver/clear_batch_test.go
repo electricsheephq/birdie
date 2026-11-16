@@ -1,8 +1,10 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"log/slog"
@@ -139,3 +141,35 @@ func TestClearDuringAPushedBatchKeepsTheRestForTheOldConversation(t *testing.T) 
 		}
 	}
 }
+
+// In channel mode the notification goes to the MCP connection, which outlives
+// /clear, so it must not be written once the conversation has changed, even
+// if it waited for the output lock while /clear came.
+func TestChannelShowOnlyReachesTheConversationItWasTakenFor(t *testing.T) {
+	h := &batchHost{}
+	h.id.Store("new")
+	c := client.New("http://127.0.0.1:1", "claude-tok")
+	c.SetSession("new")
+	srv := New(c, "claude", "test", true, log.New(io.Discard, "", 0))
+	srv.host = pullHost{h}
+	var out bytes.Buffer
+	srv.out = &out
+	m := bus.Message{ID: "msg_1", ThreadID: "t", From: "peer", Content: "for the old one"}
+	if err := srv.show(context.Background(), "old", m); !errors.Is(err, ErrOtherConversation) {
+		t.Fatalf("show for the old conversation: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("written: %s", out.String())
+	}
+	if err := srv.show(context.Background(), "new", m); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("notifications/claude/channel")) {
+		t.Fatalf("not written: %s", out.String())
+	}
+}
+
+// pullHost is a host that can't be pushed to, so messages use the channel.
+type pullHost struct{ *batchHost }
+
+func (pullHost) Tier() string { return bus.TierPull }
