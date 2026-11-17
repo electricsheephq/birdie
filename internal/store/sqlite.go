@@ -294,13 +294,18 @@ func (s *SQLite) HasNotice(ctx context.Context, threadID, agent, kind string) (b
 
 func (s *SQLite) ThreadSession(ctx context.Context, threadID, from, agent string) (string, error) {
 	var id string
+	// Messages between the two come first. Without one, a follow-up from
+	// someone else in the thread goes to the session agent last used there:
+	// one it sent from, or one that took a message. A session another sender
+	// merely addressed doesn't count, since it may never have seen the thread.
 	err := s.db.QueryRowContext(ctx,
 		`SELECT CASE WHEN m.sender = ? THEN m.from_session WHEN m.taken_by != '' AND m.status != 'queued' THEN m.taken_by ELSE m.to_session END
 		 FROM messages m WHERE m.thread_id = ?
 		   AND ((m.sender = ? AND m.recipient = ? AND ((m.taken_by != '' AND m.status != 'queued') OR m.to_session != ''))
-		     OR (m.sender = ? AND m.recipient = ? AND m.from_session != ''))
-		 ORDER BY m.seq DESC LIMIT 1`,
-		agent, threadID, from, agent, agent, from).Scan(&id)
+		     OR (m.sender = ? AND m.from_session != '')
+		     OR (m.recipient = ? AND m.taken_by != '' AND m.status != 'queued'))
+		 ORDER BY ((m.sender = ? AND m.recipient = ?) OR (m.sender = ? AND m.recipient = ?)) DESC, m.seq DESC LIMIT 1`,
+		agent, threadID, from, agent, agent, agent, from, agent, agent, from).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
