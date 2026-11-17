@@ -10,7 +10,8 @@ import { Select } from '../components/Select';
 import { Button } from '../ds';
 import { Loading, Skeleton, Typing } from '../components/Signal';
 import { TilePair } from '../components/TilePair';
-import { ME, agentOf, labelOf, who } from '../lib/agents';
+import { ME, agentOf, agentsOf, labelOf, who } from '../lib/agents';
+import { isSystem, mentionIn, takeFocus } from '../lib/compose';
 import { href } from '../lib/router';
 import { MAX_TRIES, chipFor, errorText, progress, threadChip, troubled } from '../lib/status';
 import { ago, ms, useNow } from '../lib/time';
@@ -133,6 +134,8 @@ function ThreadDetail({ id, target, query, now }: { id?: string; target?: string
   const atBottom = useRef(true);
   const count = useRef(0);
   const [info, setInfo] = useState(false);
+  // The message the reply box answers, picked with a message's Reply.
+  const [replyTo, setReplyTo] = useState<Tracked | null>(null);
   const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set(target ? [target] : []));
   const toggle = (mid: string) =>
     setOpen((s) => {
@@ -243,6 +246,14 @@ function ThreadDetail({ id, target, query, now }: { id?: string; target?: string
                 toggle={() => toggle(m.id)}
                 kind={kinds.get(agentOf(m.to))}
                 now={now}
+                reply={
+                  canReply(m, me)
+                    ? () => {
+                        setReplyTo(m);
+                        document.getElementById('compose-text')?.focus();
+                      }
+                    : undefined
+                }
               />
             );
           })}
@@ -263,6 +274,9 @@ function ThreadDetail({ id, target, query, now }: { id?: string; target?: string
         threadId={data.id}
         messages={messages}
         me={me}
+        everyone={agentsOf(overview.data).map((a) => ({ name: a.name, label: a.label || a.name }))}
+        replyTo={replyTo}
+        setReplyTo={setReplyTo}
         onSent={() => {
           // Your own message should come into view.
           atBottom.current = true;
@@ -272,13 +286,17 @@ function ThreadDetail({ id, target, query, now }: { id?: string; target?: string
   );
 }
 
-/** What you were writing in each thread, kept while you look at another one. */
+/** What you were writing in each thread, kept while you look at another one. It lasts until the page reloads. */
 const drafts = new Map<string, string>();
 
-/** The thread whose reply box takes focus when it opens, after a send from Agents. */
-let focusThread = '';
-export function focusReplyIn(thread: string) {
-  focusThread = thread;
+/** Whether you can answer m from the reply box: you're in its conversation and it isn't a notice. */
+function canReply(m: Tracked, me: string): boolean {
+  return (m.from === me || m.to === me) && !isSystem(agentOf(m.from)) && !isSystem(agentOf(m.to));
+}
+
+/** The other side of m, as seen from you. */
+function otherSide(m: Tracked, me: string): string {
+  return m.from === me ? agentOf(m.to) : agentOf(m.from);
 }
 
 /** The message a reply to `agent` answers: the latest between you and it, so it reaches the same session. */
@@ -290,27 +308,55 @@ function replyTarget(messages: Tracked[], me: string, agent: string): Tracked | 
   return undefined;
 }
 
-/** Writing into the open thread. It stays open, so the conversation can go on. */
-function Composer({ threadId, messages, me, onSent }: { threadId: string; messages: Tracked[]; me: string; onSent: () => void }) {
+function short(text: string, n = 80): string {
+  const t = text.replace(/\s+/g, ' ').trim();
+  return t.length > n ? t.slice(0, n - 1) + '…' : t;
+}
+
+/**
+ * Writing into the open thread. It stays open, so the conversation can go on.
+ * You can write to anyone in the thread, answer one message with its Reply, or
+ * bring another agent in, from the To picker or by starting with @name.
+ */
+function Composer({
+  threadId,
+  messages,
+  me,
+  everyone,
+  replyTo,
+  setReplyTo,
+  onSent,
+}: {
+  threadId: string;
+  messages: Tracked[];
+  me: string;
+  everyone: { name: string; label: string }[];
+  replyTo: Tracked | null;
+  setReplyTo: (m: Tracked | null) => void;
+  onSent: () => void;
+}) {
   const client = useQueryClient();
-  const others = agentsIn(messages.flatMap((m) => [m.from, m.to])).filter((a) => a !== me && a !== 'birdie' && a !== 'agent-bus');
+  const members = agentsIn(messages.flatMap((m) => [m.from, m.to])).filter((a) => a !== me && !isSystem(a));
+  const outside = everyone.map((a) => a.name).filter((a) => a !== me && !isSystem(a) && !members.includes(a));
   // By default, answer whoever wrote to you last.
   let latest = '';
   for (let i = messages.length - 1; i >= 0 && !latest; i--) {
     const from = agentOf(messages[i].from);
-    if (others.includes(from)) latest = from;
+    if (members.includes(from)) latest = from;
   }
   const [picked, setPicked] = useState('');
-  const to = others.includes(picked) ? picked : latest || others[0] || '';
   const [text, setText] = useState(() => drafts.get(threadId) ?? '');
   const [error, setError] = useState('');
+  const [said, setSaid] = useState('');
+  const mention = useRef('');
   const box = useRef<HTMLTextAreaElement>(null);
 
+  const known = (a: string) => members.includes(a) || outside.includes(a);
+  const to = replyTo ? otherSide(replyTo, me) : known(picked) ? picked : latest || members[0] || '';
+  const joining = !!to && !members.includes(to);
+
   useEffect(() => {
-    if (focusThread === threadId) {
-      focusThread = '';
-      box.current?.focus({ preventScroll: true });
-    }
+    if (box.current && takeFocus(threadId)) box.current.focus({ preventScroll: true });
   }, [threadId]);
 
   // Grow with what you write, up to a few lines; then it scrolls.
@@ -323,16 +369,22 @@ function Composer({ threadId, messages, me, onSent }: { threadId: string; messag
 
   const mutation = useMutation({
     mutationFn: api.send,
-    onSuccess: () => {
+    onSuccess: (_, input) => {
       setText('');
       drafts.delete(threadId);
+      mention.current = '';
       setError('');
+      setReplyTo(null);
+      setSaid('Sent to ' + labelOf(input.to) + '.');
       onSent();
       client.invalidateQueries({ queryKey: keys.thread(threadId) });
       client.invalidateQueries({ queryKey: keys.threads });
       client.invalidateQueries({ queryKey: keys.overview });
     },
-    onError: (err) => setError(err instanceof Error ? err.message : String(err)),
+    onError: (err) => {
+      setSaid('');
+      setError(err instanceof Error ? err.message : String(err));
+    },
   });
 
   if (!messages.some((m) => m.from === me || m.to === me)) {
@@ -340,41 +392,72 @@ function Composer({ threadId, messages, me, onSent }: { threadId: string; messag
   }
   if (!to) return null;
 
+  const pick = (agent: string) => {
+    setPicked(agent);
+    setError('');
+    // A Reply answers one agent; picking another one stops it.
+    if (replyTo && otherSide(replyTo, me) !== agent) setReplyTo(null);
+  };
   const change = (v: string) => {
     setText(v);
+    setError('');
     if (v) drafts.set(threadId, v);
     else drafts.delete(threadId);
+    // Starting with @name picks who it goes to, once per mention, so the picker can still change it.
+    const found = mentionIn(v, everyone);
+    if (found !== mention.current) {
+      mention.current = found;
+      if (found && !found.startsWith('?') && found !== me && !isSystem(found)) pick(found);
+    }
   };
   const submit = (e?: FormEvent) => {
     e?.preventDefault();
     const content = text.trim();
     if (!content || mutation.isPending) return;
-    const parent = replyTarget(messages, me, to);
+    const parent = replyTo ?? (members.includes(to) ? replyTarget(messages, me, to) : undefined);
     mutation.mutate(parent ? { to, content, in_reply_to: parent.id } : { to, content, thread_id: threadId });
   };
   const keyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) submit(e);
+    // Not while an input method is composing a character (Safari reports that as keyCode 229).
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) submit(e);
+    else if (e.key === 'Escape' && replyTo) {
+      e.preventDefault();
+      setReplyTo(null);
+    }
   };
+
+  const unknown = mention.current.startsWith('?') ? mention.current.slice(1) : '';
+  const options = [
+    ...members.map((a) => ({ value: a, label: labelOf(a), hint: 'In this thread', icon: <AgentTile name={a} size={24} /> })),
+    ...outside.map((a) => ({ value: a, label: labelOf(a), hint: 'Add to this thread', icon: <AgentTile name={a} size={24} /> })),
+  ];
+  let hint = 'It goes to ' + labelOf(to) + (replyTo ? ', answering that message.' : ' in this thread.');
+  if (joining) hint = labelOf(to) + ' joins this thread with this message, and can read everything in it.';
 
   return (
     <form className="chat-compose" onSubmit={submit} noValidate aria-label={'Write to ' + labelOf(to)}>
+      <div className="visually-hidden" role="status" aria-live="polite">
+        {said}
+      </div>
       {error && (
-        <p className="chat-compose-error" role="alert">
+        <p id="compose-error" className="chat-compose-error" role="alert">
           Error: {error}. Your message is still in the box.
         </p>
       )}
-      {others.length > 1 && (
-        <div className="chat-compose-to">
-          <span id="compose-to-label">To</span>
-          <Select
-            id="compose-to"
-            labelledBy="compose-to-label"
-            value={to}
-            onChange={setPicked}
-            options={others.map((a) => ({ value: a, label: labelOf(a), icon: <AgentTile name={a} size={24} /> }))}
-          />
+      {replyTo && (
+        <div className="chat-compose-reply">
+          <span className="chat-compose-reply-text">
+            Replying to <strong>{who(replyTo.from === me ? replyTo.to_label : replyTo.from_label)}</strong>: “{short(replyTo.content)}”
+          </span>
+          <button type="button" className="chat-compose-reply-cancel" onClick={() => setReplyTo(null)} aria-label="Stop replying to that message">
+            ✕
+          </button>
         </div>
       )}
+      <div className="chat-compose-to">
+        <span id="compose-to-label">To</span>
+        <Select id="compose-to" labelledBy="compose-to-label" value={to} onChange={pick} options={options} />
+      </div>
       <div className="chat-compose-row">
         <label htmlFor="compose-text" className="visually-hidden">
           Message to {labelOf(to)}
@@ -387,15 +470,17 @@ function Composer({ threadId, messages, me, onSent }: { threadId: string; messag
           value={text}
           onChange={(e) => change(e.target.value)}
           onKeyDown={keyDown}
-          placeholder={'Write to ' + labelOf(to) + '…'}
-          aria-describedby="compose-hint"
+          placeholder={'Write to ' + labelOf(to) + '… (@name picks someone else)'}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={(error ? 'compose-error ' : '') + 'compose-hint'}
         />
-        <Button kind="primary" type="submit" disabled={mutation.isPending || !text.trim()}>
+        <Button kind="primary" type="submit" disabled={!text.trim()}>
           {mutation.isPending ? 'Sending' : 'Send'}
         </Button>
       </div>
       <span id="compose-hint" className="chat-compose-hint">
-        Enter sends, Shift+Enter starts a new line. It goes to {labelOf(to)} in this thread.
+        {unknown ? 'No agent called ' + unknown + ', so it still goes to ' + labelOf(to) + '. ' : ''}
+        {hint} Enter sends, Shift+Enter starts a new line.
       </span>
     </form>
   );
@@ -411,6 +496,7 @@ function Bubble({
   toggle,
   kind,
   now,
+  reply,
 }: {
   m: Tracked;
   day: string;
@@ -421,6 +507,8 @@ function Bubble({
   toggle: () => void;
   kind: Delivery | undefined;
   now: number;
+  /** Answers this message from the reply box; unset when you can't. */
+  reply?: () => void;
 }) {
   const from = agentOf(m.from);
   const chip = chipFor(m.status, !!m.error);
@@ -445,14 +533,21 @@ function Bubble({
           >
             {m.content}
           </div>
-          <button type="button" className={'chat-meta' + (troubled(m) ? ' is-problem' : '')} aria-expanded={open} aria-controls={detailsId} onClick={toggle}>
-            <time dateTime={m.created_at}>{hm(m.created_at)}</time>
-            <span aria-hidden="true">·</span>
-            <span>{chip.label}</span>
-            <svg aria-hidden="true" viewBox="0 0 16 16" width="12" height="12" className="chat-meta-chevron">
-              <path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          </button>
+          <div className="chat-meta-row">
+            <button type="button" className={'chat-meta' + (troubled(m) ? ' is-problem' : '')} aria-expanded={open} aria-controls={detailsId} onClick={toggle}>
+              <time dateTime={m.created_at}>{hm(m.created_at)}</time>
+              <span aria-hidden="true">·</span>
+              <span>{chip.label}</span>
+              <svg aria-hidden="true" viewBox="0 0 16 16" width="12" height="12" className="chat-meta-chevron">
+                <path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            {reply && (
+              <button type="button" className="chat-reply" onClick={reply} aria-label={'Reply to this message from ' + labelOf(from)}>
+                Reply
+              </button>
+            )}
+          </div>
           {open && (
             <dl id={detailsId} className="chat-details">
               <div>

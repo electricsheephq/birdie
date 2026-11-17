@@ -310,11 +310,22 @@ func TestSendKeepsTheConversationInItsThread(t *testing.T) {
 		t.Fatalf("thread = %+v", th.Messages)
 	}
 
-	// The web app can't post into a thread it isn't in.
-	if err := r.st.CreateAgent(ctx, bus.Agent{Name: "carol", TokenHash: "carol", Delivery: bus.DeliveryPull, CreatedAt: time.Now()}); err != nil {
-		t.Fatal(err)
+	// Writing to an agent that isn't in the thread brings it in.
+	for _, name := range []string{"carol", "dave"} {
+		if err := r.st.CreateAgent(ctx, bus.Agent{Name: name, TokenHash: name, Delivery: bus.DeliveryPull, CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
 	}
-	other, err := r.b.Send(ctx, "bob", bus.SendInput{To: "carol", Content: "private"})
+	joined := send(`{"to":"carol","content":"join us","thread_id":"`+first.ThreadID+`"}`, http.StatusCreated)
+	if joined.ThreadID != first.ThreadID {
+		t.Fatalf("carol's message went to thread %s, want %s", joined.ThreadID, first.ThreadID)
+	}
+	if _, err := r.b.Send(ctx, "carol", bus.SendInput{ThreadID: first.ThreadID, To: webui.Me, Content: "here"}); err != nil {
+		t.Fatalf("carol can't post in the thread she joined: %v", err)
+	}
+
+	// The web app can't post into a thread it isn't in.
+	other, err := r.b.Send(ctx, "bob", bus.SendInput{To: "dave", Content: "private"})
 	if err != nil {
 		t.Fatal(err)
 	}
