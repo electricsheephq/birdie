@@ -50,6 +50,13 @@ NOT_SESSIONS = {"subagent", "cron", "api", "api_server", "kanban", "webhook", "m
 WAKE_SURFACES = {"cli", "tui", "desktop", "telegram", "discord", "slack", "whatsapp", "signal", "matrix"}
 
 
+# heartbeat2 asks for a way to tell someone when a wake waits on a closed app window
+# (heartbeat2 docs/voice-bridge.md, Handshake). These are its event names.
+HEARTBEAT2_WANTED = "heartbeat2:notifier_wanted"
+HEARTBEAT2_NOTIFIER = "heartbeat2_notifier"
+NOTIFY_SECONDS = 2
+
+
 class BusError(Exception):
     def __init__(self, message, status=0):
         super().__init__(message)
@@ -221,6 +228,29 @@ class Conversation:
                 self.delivered.popitem(last=False)
 
 
+def notifier(bus):
+    """send(target, text) for heartbeat2. It queues a message from this profile's
+    agent and never raises. ok means the bus accepted the message, not that anyone
+    read it. It is a closure, not a bound method, because Hermes's plugin event bus
+    deep-copies payloads and keeps functions as they are."""
+    def send(target, text):
+        result = {"ok": False, "message_id": None, "status": None, "error": None}
+        try:
+            target = str(target or "").strip()
+            text = "" if text is None else str(text)
+            if not target or not text.strip():
+                result["error"] = "target and text are required"
+                return result
+            message = bus.call("POST", "/v1/messages", {
+                "to": target, "content": text, "meta": {"source": "heartbeat2"},
+            }, timeout=NOTIFY_SECONDS)
+            result.update(ok=True, message_id=message.get("id") or None, status=message.get("status") or "queued")
+        except Exception as err:
+            result["error"] = str(err) or type(err).__name__
+        return result
+    return send
+
+
 class Network:
     def __init__(self, ctx, config):
         self.ctx = ctx
@@ -233,6 +263,8 @@ class Network:
         self.beat = None
         self.intro_in_prompt = False
         self.stopped = set()  # routes whose turn the user stopped
+        self.notifier_stamp = None  # set while heartbeat2 is offered a notifier
+        self.notifier_lock = threading.RLock()  # an offer never follows its own withdraw
 
     # What Hermes offers varies by version. These use its public API where it has
     # one, and otherwise read the turn's session variables.
@@ -400,8 +432,45 @@ class Network:
             except BusError as err:
                 log.debug("birdie: couldn't end a session: %s", err)
 
+    # heartbeat2's handshake: offer send at register and whenever it asks. A forced
+    # reload keeps old subscriptions, so the newest registered_at wins, and close
+    # withdraws this copy's offer. send gets its token as the tools do: at register a
+    # gateway serving several profiles may not have this profile's secret in scope.
+    def offer_notifier(self):
+        emit, subscribe = getattr(self.ctx, "emit", None), getattr(self.ctx, "subscribe", None)
+        if not callable(emit) or not callable(subscribe):
+            return
+        stamp = self.notifier_stamp = time.monotonic_ns()
+        send = notifier(self.bus)
+
+        def announce(**_):
+            with self.notifier_lock:
+                if self.notifier_stamp != stamp:
+                    return
+                try:
+                    emit(HEARTBEAT2_NOTIFIER, {"version": 1, "registered_at": stamp, "send": send})
+                except Exception:
+                    log.warning("birdie: couldn't offer heartbeat2 a notifier", exc_info=True)
+
+        try:
+            subscribe(HEARTBEAT2_WANTED, announce)
+        except Exception:
+            log.warning("birdie: couldn't listen for heartbeat2", exc_info=True)
+        announce()
+
+    def withdraw_notifier(self):
+        with self.notifier_lock:
+            stamp, self.notifier_stamp = self.notifier_stamp, None
+            if stamp is None:
+                return
+            try:
+                self.ctx.emit(HEARTBEAT2_NOTIFIER, {"version": 1, "registered_at": stamp, "withdrawn": True})
+            except Exception:
+                log.warning("birdie: couldn't withdraw the heartbeat2 notifier", exc_info=True)
+
     def close(self):
         self.closed.set()
+        self.withdraw_notifier()
         with self.lock:
             conversations = list(self.conversations.values())
             self.conversations.clear()
@@ -698,6 +767,7 @@ def register(ctx):
         ctx.on_unload(network.close)
     if network:
         network.add_intro()
+        network.offer_notifier()
 
     def idle(**_):
         return None

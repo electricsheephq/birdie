@@ -63,6 +63,26 @@ Runs with no person in them, such as cron and subagents, and anything using
 `hermes acp`, can send messages and wait for the answers. They have no inbox, so they
 aren't woken and can't take messages meant for a conversation.
 
+### A notifier for heartbeat2
+
+When heartbeat2 holds a wake because its app window is closed, it can tell
+someone through birdie (heartbeat2's `notify_via: "birdie:<agent>"`). The plugin
+offers heartbeat2 a `send(target, text)` over Hermes's plugin event bus. It offers
+it when it loads and whenever heartbeat2 asks, and withdraws it on unload.
+
+- `send` queues a message from this profile's agent, marked `source: heartbeat2`.
+  It returns `{"ok", "message_id", "status", "error"}`. `ok` means the bus
+  accepted the message (`status: queued`), not that anyone has read it.
+- It never raises. Each network step times out after 2 seconds. A timeout returns
+  `ok: false`, though the bus may have queued the message anyway, so a retry can
+  arrive twice.
+- The usual limits apply. The loop limit of 12 messages to one agent in 10 minutes
+  counts all of this agent's messages to that agent, not only heartbeat2's. Bare
+  `claude` needs a default session, or its fallback turned on.
+- On a gateway serving several profiles, Hermes shows the plugin its token only
+  during a turn. Until the profile's first turn after a start, `send` can return
+  `ok: false`.
+
 ## What this plugin does on your machine
 
 - **Network:** it only talks to the birdie service, at `http://127.0.0.1:7777` by
