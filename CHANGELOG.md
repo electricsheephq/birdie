@@ -72,7 +72,8 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   desktop app (#4).
 - Runs of dashes in session names collapse to one (#3).
 - After Hermes reloads the birdie plugin, the old copy no longer marks the
-  session pull over the new one, so pushes don't stop until the next turn.
+  session pull over the new one, so pushes don't stop until the next turn
+  (#37).
 - The setup and migration tests pass on macOS, and they never touch the real
   config folder (#20).
 - A stalled daemon can't hold up a session's bridge forever: reporting or
