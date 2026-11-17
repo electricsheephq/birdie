@@ -118,22 +118,116 @@ func TestASessionThatWasOnlyAddressedDoesntGetAThirdPartysFollowUp(t *testing.T)
 // its sender is told at once.
 func TestAThirdPartysFollowUpForAStoppedSessionIsHeld(t *testing.T) {
 	ctx := context.Background()
+	for _, recipient := range []string{"claude", "eva"} {
+		t.Run(recipient, func(t *testing.T) {
+			b, st := newBus(t)
+			for _, n := range []string{"bot", "carol", recipient} {
+				addAgent(t, st, n, nil)
+			}
+			now := time.Now()
+			report(t, b, recipient, "s1", "one", bus.TierPush, now.Add(-time.Minute))
+			thread := threadWithS1(t, b, recipient, "took")
+			report(t, b, recipient, "s2", "two", bus.TierPush, now)
+			if err := b.EndSession(ctx, recipient, "s1"); err != nil {
+				t.Fatal(err)
+			}
+			f, err := b.Send(ctx, "bot", bus.SendInput{To: recipient, ThreadID: thread, Content: "follow-up"})
+			if err != nil || f.ToSession != "s1" || f.Held != bus.RecipientSessionEnded {
+				t.Fatalf("follow-up: to_session %q held %q, err %v; want held for s1", f.ToSession, f.Held, err)
+			}
+			if got := take(t, b, recipient, "s2"); len(got) != 0 {
+				t.Fatalf("the running conversation took %+v", got)
+			}
+		})
+	}
+}
+
+// When the recipient last took part without a session, a follow-up waits for
+// a reader that isn't a session, as before, rather than going to a session
+// that took part earlier.
+func TestAFollowUpAfterTakingPartWithoutASessionWaitsForAReaderWithoutOne(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	for _, n := range []string{"bot", "carol", "claude"} {
+		addAgent(t, st, n, nil)
+	}
+	report(t, b, "claude", "s1", "one", bus.TierPush, time.Now())
+	thread := threadWithS1(t, b, "claude", "took")
+	if _, err := b.Send(ctx, "claude", bus.SendInput{To: "bot", ThreadID: thread, Content: "asked without a session"}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: thread, Content: "follow-up"})
+	if err != nil || f.ToSession != "" {
+		t.Fatalf("follow-up: to_session %q, err %v; want none", f.ToSession, err)
+	}
+	if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Thread: thread}); err != nil || len(got) != 1 || got[0].ID != f.ID {
+		t.Fatalf("a reader without a session: %+v, %v", got, err)
+	}
+}
+
+// A message the recipient sent itself without a session, and took with one,
+// counts for the session that took it.
+func TestAMessageToItselfCountsForTheSessionThatTookIt(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	for _, n := range []string{"bot", "carol", "claude"} {
+		addAgent(t, st, n, nil)
+	}
+	now := time.Now()
+	report(t, b, "claude", "s1", "one", bus.TierPush, now)
+	report(t, b, "claude", "s3", "three", bus.TierPush, now)
+	thread := threadWithS1(t, b, "claude", "took")
+	note, err := b.Send(ctx, "claude", bus.SendInput{To: "claude/s3", ThreadID: thread, Content: "over to you"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := take(t, b, "claude", "s3"); len(got) != 1 || got[0].ID != note.ID {
+		t.Fatalf("s3 took %+v", got)
+	}
+	if err := b.Ack(ctx, "claude", note.ID); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: thread, Content: "follow-up"}); err != nil || f.ToSession != "s3" {
+		t.Fatalf("follow-up: to_session %q, err %v; want s3", f.ToSession, err)
+	}
+}
+
+// A message a session gave back doesn't count as taken, even once it has
+// expired: a nack and an expiry both keep taken_by.
+func TestAMessageGivenBackDoesntCountAsTaken(t *testing.T) {
+	ctx := context.Background()
 	b, st := newBus(t)
 	for _, n := range []string{"bot", "carol", "eva"} {
 		addAgent(t, st, n, nil)
 	}
 	now := time.Now()
 	report(t, b, "eva", "s1", "one", bus.TierPush, now.Add(-time.Minute))
-	thread := threadWithS1(t, b, "eva", "took")
 	report(t, b, "eva", "s2", "two", bus.TierPush, now)
-	if err := b.EndSession(ctx, "eva", "s1"); err != nil {
+	thread := threadWithS1(t, b, "eva", "took")
+	later, err := b.Send(ctx, "carol", bus.SendInput{To: "eva/s2", ThreadID: thread, Content: "for s2"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := b.Send(ctx, "bot", bus.SendInput{To: "eva", ThreadID: thread, Content: "follow-up"})
-	if err != nil || f.ToSession != "s1" || f.Held != bus.RecipientSessionEnded {
-		t.Fatalf("follow-up: to_session %q held %q, err %v; want held for s1", f.ToSession, f.Held, err)
+	if got := take(t, b, "eva", "s2"); len(got) != 1 || got[0].ID != later.ID {
+		t.Fatalf("s2 took %+v", got)
 	}
-	if got := take(t, b, "eva", "s2"); len(got) != 0 {
-		t.Fatalf("the running conversation took %+v", got)
+	if err := b.Nack(ctx, "eva", later.ID); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := b.Send(ctx, "bot", bus.SendInput{To: "eva", ThreadID: thread, Content: "after the nack"}); err != nil || f.ToSession != "s1" {
+		t.Fatalf("after the nack: to_session %q, err %v; want s1", f.ToSession, err)
+	}
+	if err := b.EndSession(ctx, "eva", "s2"); err != nil {
+		t.Fatal(err)
+	}
+	q := bus.HoldQuery{Expire: true, Lapsed: true, LiveSince: now.Add(-bus.SessionTTL), Before: time.Now().Add(time.Hour), Now: time.Now(), Limit: 50}
+	if held, _, err := st.SettleHeld(ctx, q, func([]bus.HeldMessage) []bus.Message { return nil }); err != nil || len(held) == 0 {
+		t.Fatalf("expire: %+v, %v", held, err)
+	}
+	if m, err := st.GetMessage(ctx, later.ID); err != nil || m.Status != bus.StatusExpired {
+		t.Fatalf("s2's message: %s, %v; want expired", m.Status, err)
+	}
+	if f, err := b.Send(ctx, "bot", bus.SendInput{To: "eva", ThreadID: thread, Content: "after the expiry"}); err != nil || f.ToSession != "s1" {
+		t.Fatalf("after the expiry: to_session %q, err %v; want s1", f.ToSession, err)
 	}
 }

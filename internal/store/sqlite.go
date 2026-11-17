@@ -294,18 +294,27 @@ func (s *SQLite) HasNotice(ctx context.Context, threadID, agent, kind string) (b
 
 func (s *SQLite) ThreadSession(ctx context.Context, threadID, from, agent string) (string, error) {
 	var id string
-	// Messages between the two come first. Without one, a follow-up from
-	// someone else in the thread goes to the session agent last used there:
-	// one it sent from, or one that took a message. A session another sender
-	// merely addressed doesn't count, since it may never have seen the thread.
+	// A session of agent that took part with from comes first. Without one,
+	// a follow-up from someone else goes where agent last took part in the
+	// thread with anyone: the session it sent from or took a message with,
+	// or no session if it did so without one, so a reader that isn't a
+	// session can take it. A session another sender merely addressed doesn't
+	// count, since it may never have seen the thread, and neither does a
+	// message given back (a nack or expiry keeps taken_by).
+	const took = `m.status IN ('claimed', 'delivered', 'replied')`
+	pair := `((m.sender = ? AND m.recipient = ? AND ((m.taken_by != '' AND ` + took + `) OR m.to_session != ''))
+		     OR (m.sender = ? AND m.recipient = ? AND m.from_session != ''))`
 	err := s.db.QueryRowContext(ctx,
-		`SELECT CASE WHEN m.sender = ? THEN m.from_session WHEN m.taken_by != '' AND m.status != 'queued' THEN m.taken_by ELSE m.to_session END
+		`SELECT CASE WHEN m.sender = ? AND m.from_session != '' THEN m.from_session
+		             WHEN m.recipient = ? AND `+took+` THEN m.taken_by
+		             WHEN m.sender = ? THEN ''
+		             ELSE m.to_session END
 		 FROM messages m WHERE m.thread_id = ?
-		   AND ((m.sender = ? AND m.recipient = ? AND ((m.taken_by != '' AND m.status != 'queued') OR m.to_session != ''))
-		     OR (m.sender = ? AND m.from_session != '')
-		     OR (m.recipient = ? AND m.taken_by != '' AND m.status != 'queued'))
-		 ORDER BY ((m.sender = ? AND m.recipient = ?) OR (m.sender = ? AND m.recipient = ?)) DESC, m.seq DESC LIMIT 1`,
-		agent, threadID, from, agent, agent, agent, from, agent, agent, from).Scan(&id)
+		   AND (`+pair+` OR m.sender = ? OR (m.recipient = ? AND `+took+`))
+		 ORDER BY `+pair+` DESC, m.seq DESC LIMIT 1`,
+		agent, agent, agent, threadID,
+		from, agent, agent, from, agent, agent,
+		from, agent, agent, from).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
