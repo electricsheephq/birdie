@@ -297,6 +297,11 @@ a:focus-visible, button:focus-visible, select:focus-visible, textarea:focus-visi
 }
 .dd-list[hidden] { display: none; }
 @keyframes dd-in { from { opacity: 0; transform: translateY(-4px); } }
+/* Opening upward, for a control at the bottom of a panel. */
+.dd-up .dd-list { top: auto; bottom: calc(100% + 6px); max-height: min(300px, 45vh); box-shadow: 0 -12px 28px rgb(0 0 0 / 0.14); animation-name: dd-up-in; }
+.dd-up .dd-chevron { transform: rotate(180deg); }
+.dd-up.is-open .dd-chevron { transform: none; }
+@keyframes dd-up-in { from { opacity: 0; transform: translateY(4px); } }
 .dd-option { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 6px 10px; border-radius: var(--radius-sm); cursor: pointer; }
 .dd-option.is-active { background: var(--bubble-in); }
 .dd-check { flex: none; color: var(--accent); visibility: hidden; }

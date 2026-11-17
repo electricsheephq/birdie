@@ -20,6 +20,8 @@ interface Props {
   placeholder?: string;
   disabled?: boolean;
   describedBy?: string;
+  /** Which way the list opens; "up" for a control at the bottom of a panel. */
+  placement?: 'down' | 'up';
 }
 
 /**
@@ -28,7 +30,7 @@ interface Props {
  * keys move through the options, Enter or Space picks, Escape closes, and
  * typing jumps to an option starting with those letters.
  */
-export function Select({ id, labelledBy, value, options, onChange, placeholder = 'Pick one', disabled, describedBy }: Props) {
+export function Select({ id, labelledBy, value, options, onChange, placeholder = 'Pick one', disabled, describedBy, placement = 'down' }: Props) {
   const auto = useId();
   const base = id || 'select' + auto.replace(/:/g, '');
   const listId = base + '-list';
@@ -118,7 +120,7 @@ export function Select({ id, labelledBy, value, options, onChange, placeholder =
   };
 
   return (
-    <div ref={root} className={'dd' + (open ? ' is-open' : '')}>
+    <div ref={root} className={'dd' + (placement === 'up' ? ' dd-up' : '') + (open ? ' is-open' : '')}>
       <div
         id={base}
         role="combobox"
