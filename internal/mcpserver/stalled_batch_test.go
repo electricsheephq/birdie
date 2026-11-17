@@ -7,7 +7,9 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,29 +61,44 @@ func TestABatchStopsCallingADaemonThatCantBeReached(t *testing.T) {
 }
 
 // A stalled daemon holds a batch for one call's deadline, not one per
-// message.
+// message, whether it never answers or stops while giving its reason.
 func TestAStalledDaemonHoldsABatchForOneDeadline(t *testing.T) {
-	t.Parallel() // waits out the real ten-second deadline
-	var calls atomic.Int32
-	release := make(chan struct{})
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		calls.Add(1)
-		select {
-		case <-r.Context().Done():
-		case <-release:
-		}
-	}))
-	defer api.Close()
-	defer close(release)
-	s := New(client.New(api.URL, "test-token"), "claude", "test", false, log.New(io.Discard, "", 0))
-	start := time.Now()
-	b := s.newBatch(context.Background())
-	for _, id := range []string{"m1", "m2", "m3"} {
-		b.ack(bus.Message{ID: id})
-	}
-	if took := time.Since(start); took > 15*time.Second || calls.Load() != 1 {
-		t.Fatalf("a batch of 3 took %s and %d calls; want one deadline and 1 call", took, calls.Load())
+	for _, tc := range []struct {
+		name  string
+		stall func(w http.ResponseWriter)
+	}{
+		{"no answer", func(http.ResponseWriter) {}},
+		{"answer without its reason", func(w http.ResponseWriter) {
+			w.WriteHeader(http.StatusInternalServerError)
+			io.WriteString(w, `{"error":`)
+			w.(http.Flusher).Flush()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel() // waits out the real ten-second deadline
+			var calls atomic.Int32
+			release := make(chan struct{})
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.Copy(io.Discard, r.Body)
+				calls.Add(1)
+				tc.stall(w)
+				select {
+				case <-r.Context().Done():
+				case <-release:
+				}
+			}))
+			defer api.Close()
+			defer close(release)
+			s := New(client.New(api.URL, "test-token"), "claude", "test", false, log.New(io.Discard, "", 0))
+			start := time.Now()
+			b := s.newBatch(context.Background())
+			for _, id := range []string{"m1", "m2", "m3"} {
+				b.ack(bus.Message{ID: id})
+			}
+			if took := time.Since(start); took > 15*time.Second || calls.Load() != 1 {
+				t.Fatalf("a batch of 3 took %s and %d calls; want one deadline and 1 call", took, calls.Load())
+			}
+		})
 	}
 }
 
@@ -90,33 +107,70 @@ type pullTierHost struct{ *pullOnlyHost }
 
 func (pullTierHost) Tier() string { return bus.TierPull }
 
-// check_inbox doesn't show again what was shown before: its confirmation
-// was lost and its lease ran out. It is confirmed again, though (#26).
-func TestCheckInboxDoesntShowAgainWhatItShowedBefore(t *testing.T) {
+// pullAPI hands out m1, which the session was shown before (its
+// confirmation was lost and its lease ran out), then m2 on the next claim.
+// It records what is confirmed.
+func pullAPI(t *testing.T) (*Server, func() []string) {
+	t.Helper()
+	var claims atomic.Int32
+	var mu sync.Mutex
+	acked := []string{}
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
-		if r.URL.Path == "/v1/inbox" {
-			io.WriteString(w, `{"messages":[{"id":"m1","thread_id":"t1","from":"bot","content":"old"},{"id":"m2","thread_id":"t2","from":"bot","content":"new"}]}`)
-			return
+		switch {
+		case r.URL.Path == "/v1/inbox":
+			switch claims.Add(1) {
+			case 1:
+				io.WriteString(w, `{"messages":[{"id":"m1","thread_id":"t1","from":"bot","content":"old"}]}`)
+			case 2:
+				io.WriteString(w, `{"messages":[{"id":"m2","thread_id":"t1","from":"bot","content":"new"}]}`)
+			default:
+				io.WriteString(w, `{"messages":[]}`)
+			}
+		case strings.HasSuffix(r.URL.Path, "/ack"):
+			mu.Lock()
+			acked = append(acked, strings.Split(r.URL.Path, "/")[3])
+			mu.Unlock()
+			io.WriteString(w, `{}`)
+		default:
+			io.WriteString(w, `{}`)
 		}
-		io.WriteString(w, `{}`)
 	}))
-	defer api.Close()
+	t.Cleanup(api.Close)
 	c := client.New(api.URL, "test-token")
 	c.SetSession("s1")
 	s := New(c, "claude", "test", false, log.New(io.Discard, "", 0))
 	s.host = pullTierHost{&pullOnlyHost{}}
 	s.markShown("m1")
-	var taken []bus.Message
-	res, rerr := s.callTool(context.Background(), json.RawMessage(`{"name":"check_inbox","arguments":{}}`), &taken)
-	if rerr != nil {
-		t.Fatal(rerr)
+	return s, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(acked)
 	}
-	b, _ := json.Marshal(res)
-	if strings.Contains(string(b), "m1") || !strings.Contains(string(b), "m2") {
-		t.Fatalf("check_inbox answer: %s; want m2 only", b)
-	}
-	if len(taken) != 2 {
-		t.Fatalf("taken: %+v; want both, so both are confirmed", taken)
+}
+
+// check_inbox and wait_for_reply don't show again what was shown before.
+// They confirm it and go on waiting for something new (#26).
+func TestAPullCallConfirmsWhatItShowedBeforeAndWaitsOn(t *testing.T) {
+	for _, call := range []string{
+		`{"name":"check_inbox","arguments":{"wait_seconds":5}}`,
+		`{"name":"wait_for_reply","arguments":{"thread_id":"t1","timeout_seconds":5}}`,
+	} {
+		s, acked := pullAPI(t)
+		var taken []bus.Message
+		res, rerr := s.callTool(context.Background(), json.RawMessage(call), &taken)
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		b, _ := json.Marshal(res)
+		if strings.Contains(string(b), `m1`) || !strings.Contains(string(b), `m2`) {
+			t.Fatalf("%s answer: %s; want m2 only", call, b)
+		}
+		if len(taken) != 1 || taken[0].ID != "m2" {
+			t.Fatalf("%s taken: %+v; want m2, to confirm once answered", call, taken)
+		}
+		if got := acked(); len(got) != 1 || got[0] != "m1" {
+			t.Fatalf("%s confirmed %v; want m1", call, got)
+		}
 	}
 }

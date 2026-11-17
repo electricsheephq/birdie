@@ -656,13 +656,14 @@ func (b *batch) settle(m bus.Message, verb string, call func(context.Context, st
 	}
 }
 
-// unseen leaves out what this call took that was shown already: its
-// confirmation was lost and its lease ran out, so it came back. It is still
-// confirmed with the rest, so it doesn't come back again.
-func (s *Server) unseen(msgs, took []bus.Message) []bus.Message {
+// confirmSeen confirms, and leaves out, what a tool call took that was shown
+// before: its confirmation was lost and its lease ran out, so it came back.
+// The push path does the same (#26).
+func (s *Server) confirmSeen(b *batch, msgs []bus.Message) []bus.Message {
 	out := msgs[:0:0]
 	for _, m := range msgs {
-		if s.wasPushed(m.ID) && slices.ContainsFunc(took, func(t bus.Message) bool { return t.ID == m.ID }) {
+		if s.wasPushed(m.ID) {
+			b.ack(m)
 			continue
 		}
 		out = append(out, m)
@@ -802,12 +803,15 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if !pushing {
+		seen := s.newBatch(ctx)
 		for {
 			remaining := time.Until(deadlineOf(ctx))
 			if remaining <= 0 {
 				return nil, nil, nil
 			}
 			msgs, err := s.c.Inbox(ctx, thread, min(remaining, bus.MaxWait-5*time.Second))
+			// What was shown before is confirmed, and the wait goes on.
+			msgs = s.confirmSeen(seen, msgs)
 			if err != nil || len(msgs) > 0 {
 				if ctx.Err() != nil && len(msgs) == 0 {
 					return nil, nil, nil

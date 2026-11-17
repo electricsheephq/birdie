@@ -141,10 +141,18 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 			}
 		}
 		var msgs []bus.Message
-		msgs, err = s.c.Inbox(ctx, "", seconds(a.WaitSeconds, 0, bus.MaxWait))
+		until := time.Now().Add(seconds(a.WaitSeconds, 0, bus.MaxWait))
+		seen := s.newBatch(ctx)
+		for {
+			msgs, err = s.c.Inbox(ctx, "", max(time.Until(until), 0))
+			// What was shown before is confirmed, and the wait goes on.
+			msgs = s.confirmSeen(seen, msgs)
+			if err != nil || len(msgs) > 0 || time.Until(until) <= 0 {
+				break
+			}
+		}
 		if err == nil {
 			*taken = msgs
-			msgs = s.unseen(msgs, *taken)
 		}
 		out = map[string]any{"messages": msgs}
 	case "wait_for_reply":
@@ -156,7 +164,6 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 		// One decision for how to wait and whether to confirm what comes
 		// back: the tier can change while the call waits.
 		msgs, *taken, err = s.waitForReply(ctx, a.ThreadID, seconds(a.TimeoutSeconds, 120*time.Second, maxReplyWait), pushing)
-		msgs = s.unseen(msgs, *taken)
 		if err == nil && len(msgs) == 0 {
 			note := "No reply yet. Check again later with wait_for_reply or check_inbox."
 			if s.pushing() {
