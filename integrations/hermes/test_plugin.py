@@ -141,6 +141,13 @@ class PluginTest(unittest.TestCase):
         self.assertIn("not your user", text)
         self.assertIn('in_reply_to "m1"', text)
 
+    def test_a_message_into_a_running_thread_points_at_its_history(self):
+        joined = plugin.frame({"from": "peer", "id": "msg_b", "thread_id": "thr_a", "content": "x"})
+        self.assertIn('birdie_get_thread "thr_a"', joined)
+        for message in ({"from": "peer", "id": "msg_a", "thread_id": "thr_a", "content": "x"},
+                        {"from": "peer", "id": "msg_b", "thread_id": "thr_a", "in_reply_to": "msg_a", "content": "x"}):
+            self.assertNotIn("earlier messages", plugin.frame(message))
+
     def test_notice_from_the_bus_asks_for_no_reply(self):
         for sender in ("birdie", "agent-bus"):
             self.assertIn("Don't reply", plugin.frame({"from": sender, "id": "m", "thread_id": "t", "content": "x"}))

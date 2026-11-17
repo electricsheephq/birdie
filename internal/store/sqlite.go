@@ -258,10 +258,17 @@ func (s *SQLite) ThreadAccess(ctx context.Context, threadID, agent string) (bool
 	return total > 0, mine > 0, err
 }
 
+// Thread is the whole thread as agent may read it: every message in it,
+// including those from before agent joined and between other members, once
+// agent has sent or received one there. birdie's notices to other members
+// about their own deliveries are left out. Nothing, for anyone else.
 func (s *SQLite) Thread(ctx context.Context, threadID, agent string) ([]bus.Message, error) {
 	return collectMessages(s.db.QueryContext(ctx,
-		`SELECT `+msgCols+` FROM messages m WHERE m.thread_id = ? AND (m.sender = ? OR m.recipient = ?) ORDER BY m.seq`,
-		threadID, agent, agent))
+		`SELECT `+msgCols+` FROM messages m WHERE m.thread_id = ?
+			AND EXISTS (SELECT 1 FROM messages x WHERE x.thread_id = m.thread_id AND (x.sender = ? OR x.recipient = ?))
+			AND (m.sender NOT IN (?, ?) OR m.recipient = ?)
+		ORDER BY m.seq`,
+		threadID, agent, agent, bus.SystemSender, bus.LegacySystemSender, agent))
 }
 
 // inboxWhere is the condition for messages a ClaimFilter may take. It uses the

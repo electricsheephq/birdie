@@ -468,7 +468,7 @@ func (b *Bus) Notice(ctx context.Context, m Message, kind, text string) error {
 	}
 	if msgs, err := b.store.Thread(ctx, m.ThreadID, m.From); err == nil {
 		for _, old := range msgs {
-			if IsSystemSender(old.From) && old.Meta[noticeKey] == kind {
+			if IsSystemSender(old.From) && old.To == m.From && old.Meta[noticeKey] == kind {
 				return nil
 			}
 		}

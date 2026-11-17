@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,6 +115,51 @@ func TestOutsidersCannotJoinThread(t *testing.T) {
 	}
 	if _, err := b.Send(ctx, "alice", bus.SendInput{To: "nobody", Content: "x"}); !errors.Is(err, bus.ErrNotFound) {
 		t.Fatalf("unknown recipient: err = %v", err)
+	}
+}
+
+func TestNewMembersReadTheWholeThread(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	for _, n := range []string{"alice", "bob", "carol", "mallory"} {
+		addAgent(t, st, n, nil)
+	}
+	ask, err := b.Send(ctx, "alice", bus.SendInput{To: "bob", Content: "plan?"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Send(ctx, "bob", bus.SendInput{InReplyTo: ask.ID, Content: "this plan"}); err != nil {
+		t.Fatal(err)
+	}
+	// A notice to alice about her own delivery stays hers.
+	if err := b.Notice(ctx, ask, "test", "about your message"); err != nil {
+		t.Fatal(err)
+	}
+	join, err := b.Send(ctx, "bob", bus.SendInput{ThreadID: ask.ThreadID, To: "carol", Content: "carol, have a look"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bus.JoinsThread(join) || bus.JoinsThread(ask) {
+		t.Fatalf("JoinsThread: join %v, ask %v", bus.JoinsThread(join), bus.JoinsThread(ask))
+	}
+
+	got, err := b.Thread(ctx, ask.ThreadID, "carol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var texts []string
+	for _, m := range got {
+		texts = append(texts, m.Content)
+	}
+	if want := "plan?|this plan|carol, have a look"; strings.Join(texts, "|") != want {
+		t.Fatalf("carol reads %q, want %q", strings.Join(texts, "|"), want)
+	}
+	// Alice sees what bob and carol said, and her own notice.
+	if got, err := b.Thread(ctx, ask.ThreadID, "alice"); err != nil || len(got) != 4 {
+		t.Fatalf("alice reads %d messages, err %v; want 4", len(got), err)
+	}
+	if _, err := b.Thread(ctx, ask.ThreadID, "mallory"); !errors.Is(err, bus.ErrNotFound) {
+		t.Fatalf("outsider: err = %v, want ErrNotFound", err)
 	}
 }
 

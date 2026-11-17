@@ -26,6 +26,13 @@ func TestMessageText(t *testing.T) {
 	if !strings.Contains(MessageText(m), "only if something is still needed") {
 		t.Fatalf("reply text = %s", MessageText(m))
 	}
+	if strings.Contains(MessageText(m), "earlier messages") {
+		t.Fatalf("a reply or a new thread shouldn't point at history: %s", MessageText(m))
+	}
+	joined := bus.Message{ID: "msg_2", ThreadID: "thr_1", From: "me", Content: "join us"}
+	if !strings.Contains(MessageText(joined), `get_thread "thr_1"`) {
+		t.Fatalf("joining text = %s", MessageText(joined))
+	}
 	m.From = bus.SystemSender
 	if !strings.Contains(MessageText(m), "Don't reply") {
 		t.Fatalf("notice text = %s", MessageText(m))

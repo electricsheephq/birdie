@@ -58,6 +58,13 @@ var namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
 // ValidName reports whether name is usable as an agent name. Names double as
 // token file names, so the pattern is deliberately strict.
+// JoinsThread reports whether m is posted into a thread that was already
+// going, other than as a reply, so its recipient may not have seen the
+// earlier messages. A message that starts a thread shares its id.
+func JoinsThread(m Message) bool {
+	return m.InReplyTo == "" && !IsSystemSender(m.From) && strings.TrimPrefix(m.ThreadID, "thr_") != strings.TrimPrefix(m.ID, "msg_")
+}
+
 // IsSystemSender says whether a sender name means the bus itself.
 func IsSystemSender(name string) bool { return name == SystemSender || name == LegacySystemSender }
 
