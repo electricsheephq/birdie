@@ -12,17 +12,20 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 - **Choose where bare `claude` mail goes.** A new conversation sent to plain
   `claude` is now refused unless you pick a session for it:
   `birdie session default claude NAME`, or `birdie session fallback claude on`
-  to let birdie pick the most recently active one. The refusal lists the
-  running sessions, so the sender can address one instead.
+  to let birdie pick a running session: one that takes pushes first, then the
+  most recently active. The refusal lists the running sessions, so the sender
+  can address one instead.
 - **Claude Code sessions in the desktop app are now recognised.** That covers
   a path with a space in it. Those sessions start getting messages pushed to
   them, and `/clear` is tracked.
 - **Expect one burst of notices on first start.** Messages held for a session
   that stopped more than 7 days ago (`serve --hold-for`) expire, and each
-  sender is told once. Mail sent to bare `claude` before the upgrade, which
-  no session can take, is held too: its sender is told, and it expires 7 days
-  after that unless you choose a default or turn fallback on first, which
-  lets a session take it.
+  sender is told once. Mail sent to bare `claude` before the upgrade, in a
+  thread `claude` never spoke in or took a message in, is held too: its
+  sender is told, and it expires 7 days after that unless you choose a
+  default or turn fallback on first, which lets a session take it. Bare mail
+  in a thread a `claude` session already took part in isn't covered yet
+  (#27).
 - **The database gains two columns on start:** `messages.held_at` and
   `sessions.pull_only`, both 0 by default.
 - **Rolling back:** the bbcdfcc binary runs on the upgraded database and
@@ -69,10 +72,13 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 - A stalled daemon can't hold up a session's bridge forever: reporting or
   ending a session, and confirming or returning a message, each give up after
   10 seconds (#22).
-- A very large message no longer costs a full read each time birdie makes an
-  event preview, checks whether a notice was already sent, or tells a sender
-  it is held (#23).
-- Mail sent to bare `claude` before the upgrade is no longer stranded when no
-  session can take it. Its sender is told it is held, and it expires after the
-  hold time, counted from then. Answers and follow-ups in a thread `claude`
-  already spoke in, or took a message in, aren't affected (#24).
+- Event previews, checks for a notice already sent, and telling a sender a
+  message is held no longer copy a whole message, however large (#23).
+  Confirming or returning a message still reads it whole, once.
+- Mail sent to bare `claude` before the upgrade, in a thread `claude` never
+  spoke in or took a message in, is no longer stranded. Its sender is told it
+  is held, and it expires after the hold time, counted from then (#24).
+  Answers to what `claude` asked without a session, and follow-ups a reader
+  without a session can take, are left as they are. One case is still open:
+  a pre-upgrade follow-up in a thread a `claude` session took. Plain
+  `check_inbox` doesn't take it, and its sender isn't told (#27).
