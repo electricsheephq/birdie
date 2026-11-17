@@ -80,7 +80,9 @@ type toolArgs struct {
 	TimeoutSeconds float64 `json:"timeout_seconds"`
 }
 
-func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus.Message) (any, *rpcError) {
+// callTool runs a tool call. What it takes goes in taken, and shownIn gets the
+// conversation the call acts for, where its answer is shown.
+func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus.Message, shownIn *string) (any, *rpcError) {
 	var p callParams
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, &rpcError{-32602, "invalid params"}
@@ -98,6 +100,9 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 			s.syncSession(context.WithoutCancel(ctx), h)
 		}
 	}
+	// Read once: /clear can switch the bridge to another conversation while
+	// the call runs, but its answer goes to this one.
+	*shownIn = s.c.Session()
 	var a toolArgs
 	if len(p.Arguments) > 0 {
 		if err := json.Unmarshal(p.Arguments, &a); err != nil {

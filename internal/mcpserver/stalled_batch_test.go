@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -164,7 +165,7 @@ func TestAPullCallConfirmsWhatItShowedBeforeAndWaitsOn(t *testing.T) {
 		call := tc.call
 		s, acked := claimAPI(t, tc.host)
 		var taken []bus.Message
-		res, rerr := s.callTool(context.Background(), json.RawMessage(call), &taken)
+		res, rerr := s.callTool(context.Background(), json.RawMessage(call), &taken, new(string))
 		if rerr != nil {
 			t.Fatal(rerr)
 		}
@@ -187,7 +188,7 @@ func TestAMessageShownBeforeClearIsShownAgainAfterIt(t *testing.T) {
 	s, acked := claimAPI(t, pullTierHost{&pullOnlyHost{}})
 	s.markShown("m1", "s0") // shown in the conversation before /clear
 	var taken []bus.Message
-	res, rerr := s.callTool(context.Background(), json.RawMessage(`{"name":"check_inbox","arguments":{}}`), &taken)
+	res, rerr := s.callTool(context.Background(), json.RawMessage(`{"name":"check_inbox","arguments":{}}`), &taken, new(string))
 	if rerr != nil {
 		t.Fatal(rerr)
 	}
@@ -197,5 +198,57 @@ func TestAMessageShownBeforeClearIsShownAgainAfterIt(t *testing.T) {
 	}
 	if got := acked(); len(got) != 0 {
 		t.Fatalf("confirmed %v before answering", got)
+	}
+}
+
+// What the conversation was shown under its stand-in id counts as shown once
+// its real id is known: it is the same conversation (#26).
+func TestAMessageShownUnderTheStandInCountsOnceTheRealIDIsKnown(t *testing.T) {
+	s, acked := claimAPI(t, pullTierHost{&pullOnlyHost{}})
+	s.c.SetSession(procID())
+	s.markShown("m1", procID())
+	var taken []bus.Message
+	res, rerr := s.callTool(context.Background(), json.RawMessage(`{"name":"check_inbox","arguments":{"wait_seconds":5}}`), &taken, new(string))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	b, _ := json.Marshal(res)
+	if strings.Contains(string(b), `m1`) || !strings.Contains(string(b), `m2`) {
+		t.Fatalf("check_inbox answer: %s; want m2 only", b)
+	}
+	if got := acked(); len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("confirmed %v; want m1", got)
+	}
+}
+
+// A call's answer is recorded for the conversation that made the call, even
+// if /clear switches the bridge to another one while it runs (#26).
+func TestAnAnswerIsRecordedForTheConversationThatAsked(t *testing.T) {
+	var c atomic.Pointer[client.Client]
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		if r.URL.Path == "/v1/inbox" {
+			c.Load().SetSession("s2") // /clear lands while the call runs
+			io.WriteString(w, `{"messages":[{"id":"m2","thread_id":"t1","from":"bot","content":"new"}]}`)
+			return
+		}
+		io.WriteString(w, `{}`)
+	}))
+	defer api.Close()
+	c.Store(client.New(api.URL, "test-token"))
+	c.Load().SetSession("s1")
+	s := New(c.Load(), "claude", "test", false, log.New(io.Discard, "", 0))
+	s.host = pullTierHost{&pullOnlyHost{}}
+	var out bytes.Buffer
+	s.out = &out
+	s.handle(context.Background(), request{ID: json.RawMessage(`1`), Method: "tools/call", Params: json.RawMessage(`{"name":"check_inbox","arguments":{}}`)})
+	if !bytes.Contains(out.Bytes(), []byte(`m2`)) {
+		t.Fatalf("answer: %s", out.String())
+	}
+	s.waitMu.Lock()
+	in := s.pushed["m2"]
+	s.waitMu.Unlock()
+	if in != "s1" {
+		t.Fatalf("m2 recorded as shown in %q; want s1, the conversation that asked", in)
 	}
 }

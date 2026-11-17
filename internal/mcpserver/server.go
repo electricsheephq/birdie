@@ -227,6 +227,7 @@ func (s *Server) handle(ctx context.Context, req request) {
 	var result any
 	var rerr *rpcError
 	var taken []bus.Message // claimed by a tool call, to confirm once answered
+	var shownIn string      // the conversation the call's answer goes to
 	switch req.Method {
 	case "initialize":
 		result = s.initialize(req.Params)
@@ -235,7 +236,7 @@ func (s *Server) handle(ctx context.Context, req request) {
 	case "tools/list":
 		result = map[string]any{"tools": tools}
 	case "tools/call":
-		result, rerr = s.callTool(ctx, req.Params, &taken)
+		result, rerr = s.callTool(ctx, req.Params, &taken, &shownIn)
 	default:
 		rerr = &rpcError{-32601, "method not found: " + req.Method}
 	}
@@ -252,7 +253,7 @@ func (s *Server) handle(ctx context.Context, req request) {
 	b := s.newBatch(ctx)
 	for _, m := range taken {
 		if written {
-			s.markShown(m.ID, s.c.Session()) // if this confirmation is lost, it isn't shown again
+			s.markShown(m.ID, shownIn) // if this confirmation is lost, it isn't shown again
 			b.ack(m)
 		} else {
 			b.nack(m)
@@ -389,8 +390,9 @@ func (s *Server) syncSession(ctx context.Context, h Host) {
 		switch {
 		case old == procID():
 			// The same conversation, now known by its real id: what was
-			// pinned to the stand-in moves with it.
+			// pinned to the stand-in moves with it, and what it was shown.
 			s.replaces = old
+			s.moveShown(old, info.ID)
 		case old != "":
 			// A new conversation (/clear): what was pinned to the old one
 			// waits for it, including a stand-in's move not yet reported.
@@ -712,6 +714,18 @@ func (s *Server) wasPushed(id string) bool {
 	defer s.waitMu.Unlock()
 	_, ok := s.pushed[id]
 	return ok
+}
+
+// moveShown files what was shown in conversation from under to: the same
+// conversation, now known by its real id.
+func (s *Server) moveShown(from, to string) {
+	s.waitMu.Lock()
+	defer s.waitMu.Unlock()
+	for id, in := range s.pushed {
+		if in == from {
+			s.pushed[id] = to
+		}
+	}
 }
 
 // shownHere reports whether the message with id was shown in the
