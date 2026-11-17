@@ -26,7 +26,7 @@ import { href } from '../lib/router';
 import { errorText } from '../lib/status';
 import { ago, ms, span, until, useNow } from '../lib/time';
 import { Signal } from '../components/Signal';
-import { focusReplyIn } from './Messages';
+import { focusReplyIn } from '../lib/compose';
 import { Select } from '../components/Select';
 
 export function AgentsPage({ section, to: pickTo }: { section?: 'send' | 'add'; to?: string }) {
