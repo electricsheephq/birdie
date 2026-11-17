@@ -183,11 +183,25 @@ func TestHeldBareMailRechecksItsRouteWhenSettled(t *testing.T) {
 	}
 }
 
-// A third party's follow-up in a thread a claude session took is queued for
-// no session (Send pins only follow-ups between the same two agents). Its
-// sender is told it is held, and a session that waits on the thread still
-// takes it. Before the upgrade, a bare follow-up there was queued the same
-// way (#27).
+// bareFollowUp queues mail for no session in thread, as a bare follow-up was
+// queued before the upgrade (#27). Send no longer queues one there: since #29
+// a follow-up goes to the session the recipient used in the thread.
+func bareFollowUp(t *testing.T, st interface {
+	InsertMessage(context.Context, bus.Message) error
+}, thread, from, to string) bus.Message {
+	t.Helper()
+	// A second old, so a sweep that starts at once already counts it as older
+	// than now.
+	m := bus.Message{ID: "msg_bare_" + from, ThreadID: thread, From: from, To: to, Content: "follow-up",
+		Status: bus.StatusQueued, CreatedAt: time.Now().Add(-time.Second)}
+	if err := st.InsertMessage(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// Mail for no session in a thread a claude session took is held: its sender
+// is told, and a session that waits on the thread still takes it (#30).
 func TestAFollowUpInAThreadASessionTookIsHeldYetStillTaken(t *testing.T) {
 	ctx := context.Background()
 	b, st := newBus(t)
@@ -207,10 +221,7 @@ func TestAFollowUpInAThreadASessionTookIsHeldYetStillTaken(t *testing.T) {
 	if _, err := b.Send(ctx, "carol", bus.SendInput{To: "bot", ThreadID: first.ThreadID, Content: "fyi"}); err != nil {
 		t.Fatal(err)
 	}
-	f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: first.ThreadID, Content: "follow-up"})
-	if err != nil || f.ToSession != "" {
-		t.Fatalf("follow-up: to_session %q, err %v; want queued for no session", f.ToSession, err)
-	}
+	f := bareFollowUp(t, st, first.ThreadID, "bot", "claude")
 	// No grace: the follow-up is new, and nothing waits on the thread.
 	b.HoldFor, b.QuietFor, b.UnpinnedGrace = time.Hour, -1, -1
 	run, cancel := context.WithCancel(ctx)
@@ -267,10 +278,7 @@ func TestNewMailForNoSessionIsntHeldDuringTheGrace(t *testing.T) {
 	if _, err := b.Send(ctx, "carol", bus.SendInput{To: "bot", ThreadID: first.ThreadID, Content: "fyi"}); err != nil {
 		t.Fatal(err)
 	}
-	f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: first.ThreadID, Content: "follow-up"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	f := bareFollowUp(t, st, first.ThreadID, "bot", "claude")
 	now := time.Now()
 	q := bus.HoldQuery{Lapsed: true, Unrouted: []string{"claude"}, LiveSince: now.Add(-bus.SessionTTL), Now: now, Limit: 50}
 	none := func([]bus.HeldMessage) []bus.Message { return nil }
@@ -314,9 +322,7 @@ func TestTheSweepGivesNewMailForNoSessionItsGrace(t *testing.T) {
 	if _, err := b.Send(ctx, "carol", bus.SendInput{To: "bot", ThreadID: first.ThreadID, Content: "fyi"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: first.ThreadID, Content: "follow-up"}); err != nil {
-		t.Fatal(err)
-	}
+	bareFollowUp(t, st, first.ThreadID, "bot", "claude")
 	// Mail for a stopped session: its held notice proves the sweep's notice
 	// pass ran, and that pass also decided on the follow-up.
 	if err := st.InsertMessage(ctx, bus.Message{ID: "sentinel", ThreadID: "sentinel", From: "bot", To: "claude", ToSession: "gone",

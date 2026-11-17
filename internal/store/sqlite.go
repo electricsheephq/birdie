@@ -294,13 +294,34 @@ func (s *SQLite) HasNotice(ctx context.Context, threadID, agent, kind string) (b
 
 func (s *SQLite) ThreadSession(ctx context.Context, threadID, from, agent string) (string, error) {
 	var id string
+	// The pair comes first, as it always did: the session of agent that last
+	// took part with from, or no session if they only exchanged messages
+	// without one. Only when the two never exchanged a message here does a
+	// follow-up go where agent last took part in the thread with anyone: the
+	// session it sent from or took a message with, or no session if it did
+	// so without one, so a reader that isn't a session can take it. A
+	// session another sender merely addressed doesn't count there, since it
+	// may never have seen the thread, and neither does a message given back
+	// (a nack or expiry keeps taken_by). An agent following up to itself
+	// gets no fallback, so a session can't hand mail back to itself. ?1 is
+	// from, ?2 agent, ?3 the thread.
+	const (
+		pairSession = `((m.sender = ?1 AND m.recipient = ?2 AND ((m.taken_by != '' AND m.status != 'queued') OR m.to_session != ''))
+		     OR (m.sender = ?2 AND m.recipient = ?1 AND m.from_session != ''))`
+		pair = `((m.sender = ?1 AND m.recipient = ?2) OR (m.sender = ?2 AND m.recipient = ?1))`
+		took = `m.status IN ('claimed', 'delivered', 'replied')`
+	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT CASE WHEN m.sender = ? THEN m.from_session WHEN m.taken_by != '' AND m.status != 'queued' THEN m.taken_by ELSE m.to_session END
-		 FROM messages m WHERE m.thread_id = ?
-		   AND ((m.sender = ? AND m.recipient = ? AND ((m.taken_by != '' AND m.status != 'queued') OR m.to_session != ''))
-		     OR (m.sender = ? AND m.recipient = ? AND m.from_session != ''))
-		 ORDER BY m.seq DESC LIMIT 1`,
-		agent, threadID, from, agent, agent, from).Scan(&id)
+		`SELECT CASE WHEN `+pairSession+` THEN
+		          CASE WHEN m.sender = ?2 THEN m.from_session WHEN m.taken_by != '' AND m.status != 'queued' THEN m.taken_by ELSE m.to_session END
+		        WHEN `+pair+` THEN ''
+		        WHEN m.sender = ?2 AND m.from_session != '' THEN m.from_session
+		        WHEN m.recipient = ?2 AND `+took+` THEN m.taken_by
+		        ELSE '' END
+		 FROM messages m WHERE m.thread_id = ?3
+		   AND (`+pair+` OR (?1 != ?2 AND (m.sender = ?2 OR (m.recipient = ?2 AND `+took+`))))
+		 ORDER BY CASE WHEN `+pairSession+` THEN 2 WHEN `+pair+` THEN 1 ELSE 0 END DESC, m.seq DESC LIMIT 1`,
+		from, agent, threadID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}

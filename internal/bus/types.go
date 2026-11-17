@@ -267,7 +267,11 @@ type Store interface {
 	HasNotice(ctx context.Context, threadID, agent, kind string) (bool, error)
 	// ThreadSession returns the session of agent that last took part in
 	// thread with from: the one that sent a message, or else took one (and
-	// didn't give it back) or was due one. It returns "" if none did.
+	// didn't give it back) or was due one, or "" if they only exchanged
+	// messages without a session. If the two never exchanged a message in
+	// the thread, it returns the session agent last sent or took a message
+	// with there, with anyone, or "" if it did that without a session or
+	// took no part.
 	ThreadSession(ctx context.Context, threadID, from, agent string) (string, error)
 	// ClaimInbox takes up to f.Limit messages for f.Agent, oldest first:
 	// queued ones and claimed ones whose lease ran out.
