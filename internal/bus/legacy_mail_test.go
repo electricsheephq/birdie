@@ -211,7 +211,8 @@ func TestAFollowUpInAThreadASessionTookIsHeldYetStillTaken(t *testing.T) {
 	if err != nil || f.ToSession != "" {
 		t.Fatalf("follow-up: to_session %q, err %v; want queued for no session", f.ToSession, err)
 	}
-	b.HoldFor, b.QuietFor = time.Hour, -1
+	// No grace: the follow-up is new, and nothing waits on the thread.
+	b.HoldFor, b.QuietFor, b.UnpinnedGrace = time.Hour, -1, -1
 	run, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
@@ -241,5 +242,53 @@ func TestAFollowUpInAThreadASessionTookIsHeldYetStillTaken(t *testing.T) {
 	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s1", Thread: first.ThreadID})
 	if err != nil || len(got) != 1 || got[0].ID != f.ID {
 		t.Fatalf("a session waiting on the thread: %+v, %v", got, err)
+	}
+}
+
+// A session already waiting on the thread takes new mail for no session
+// within seconds, so the sweep leaves such mail alone for a grace period
+// rather than tell its sender it is held.
+func TestNewMailForNoSessionIsntHeldDuringTheGrace(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "carol", nil)
+	addAgent(t, st, "claude", nil)
+	report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
+	first, err := b.Send(ctx, "carol", bus.SendInput{To: "claude/s1", Content: "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range take(t, b, "claude", "s1") {
+		if err := b.Ack(ctx, "claude", m.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := b.Send(ctx, "carol", bus.SendInput{To: "bot", ThreadID: first.ThreadID, Content: "fyi"}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: first.ThreadID, Content: "follow-up"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	q := bus.HoldQuery{Lapsed: true, Unrouted: []string{"claude"}, LiveSince: now.Add(-bus.SessionTTL), Now: now, Limit: 50}
+	none := func([]bus.HeldMessage) []bus.Message { return nil }
+	q.UnpinnedBefore = now.Add(-bus.DefaultUnpinnedGrace)
+	if held, _, err := st.SettleHeld(ctx, q, none); err != nil || len(held) != 0 {
+		t.Fatalf("within the grace: held %d, err %v; want none", len(held), err)
+	}
+	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s1", Thread: first.ThreadID, Lease: time.Minute})
+	if err != nil || len(got) != 1 || got[0].ID != f.ID {
+		t.Fatalf("the waiting session: %+v, %v", got, err)
+	}
+	// Once the grace has passed, mail nobody took is held: here the session
+	// gives it back.
+	if err := b.Nack(ctx, "claude", f.ID); err != nil {
+		t.Fatal(err)
+	}
+	q.UnpinnedBefore = time.Now().Add(time.Second)
+	if held, _, err := st.SettleHeld(ctx, q, none); err != nil || len(held) != 1 || held[0].ID != f.ID {
+		t.Fatalf("after the grace: %+v, %v; want the follow-up held", held, err)
 	}
 }

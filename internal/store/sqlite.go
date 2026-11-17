@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -422,11 +423,16 @@ func (s *SQLite) SettleHeld(ctx context.Context, q bus.HoldQuery, build func([]b
 					AND (p.sender = m.recipient OR (p.recipient = m.recipient AND p.status IN ('claimed', 'delivered', 'replied') AND p.taken_by = '')))
 				AND NOT EXISTS (SELECT 1 FROM agents a LEFT JOIN sessions d ON d.agent = a.name AND d.ended_at = 0
 					AND d.last_seen >= ? AND d.name = json_extract(a.config, '$.default_session')
-					WHERE a.name = m.recipient AND (json_extract(a.config, '$.fallback') = 'on' OR d.id IS NOT NULL)))`
+					WHERE a.name = m.recipient AND (json_extract(a.config, '$.fallback') = 'on' OR d.id IS NOT NULL))
+				AND m.created_at < ?)`
 			for _, agent := range q.Unrouted {
 				args = append(args, agent)
 			}
-			args = append(args, q.LiveSince.UnixMilli())
+			before := int64(math.MaxInt64)
+			if !q.UnpinnedBefore.IsZero() {
+				before = q.UnpinnedBefore.UnixMilli()
+			}
+			args = append(args, q.LiveSince.UnixMilli(), before)
 		}
 	}
 	where += ` AND (` + session + `)`

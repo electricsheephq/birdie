@@ -79,7 +79,10 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   is held, and it expires after the hold time, counted from then (#24).
   Answers to what `claude` asked without a session, and follow-ups a reader
   without a session can take, are left as they are.
-- Mail for no session in a thread a `claude` session took a message in is
-  held the same way, and its sender is told. That covers a bare follow-up
-  from before the upgrade, and a third party's follow-up in a multi-party
-  thread. A session that waits on the thread still takes it (#30).
+- Mail for no session in a thread a `claude` session took a message in, and
+  `claude` hasn't spoken in, is held the same way once it has waited 2
+  minutes, and its sender is told. That covers a third party's follow-up in a
+  multi-party thread, and a bare follow-up from before the upgrade if the
+  database was written by v0.4.0 or later (earlier versions didn't record
+  which session took a message). A session that waits on the thread still
+  takes it (#30).
