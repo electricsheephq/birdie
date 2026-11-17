@@ -313,3 +313,14 @@
 @media (prefers-reduced-motion: reduce) {
   .feed li.feed-pop, .feed li.feed-pop .feed-body, .feed li.feed-in { animation: none; }
 }
+
+/* Messages: the reply box under the open thread. */
+.chat-compose { flex: none; display: flex; flex-direction: column; gap: 8px; padding: 12px 20px 16px; border-top: 1px solid var(--divider); }
+.chat-compose-row { display: flex; align-items: flex-end; gap: 10px; }
+.chat-compose-text { flex: 1 1 auto; min-height: 48px; max-height: 180px; resize: none; overflow-y: auto; }
+.chat-compose-row > button { flex: none; min-height: 48px; }
+.chat-compose-to { display: flex; align-items: center; gap: 10px; font-family: var(--font-mono); font-size: 13px; font-weight: 500; }
+.chat-compose-to > div { flex: 1 1 auto; min-width: 0; }
+.chat-compose-hint { font-family: var(--font-mono); font-size: 12px; color: var(--ink-muted); }
+.chat-compose-error { margin: 0; font-size: 13px; color: var(--danger); font-weight: 500; overflow-wrap: anywhere; }
+.chat-compose-note { flex: none; margin: 0; padding: 12px 20px 16px; border-top: 1px solid var(--divider); font-size: 14px; color: var(--ink-muted); }

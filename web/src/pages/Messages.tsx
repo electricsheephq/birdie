@@ -1,10 +1,13 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type RefObject } from 'react';
-import { ApiFailure } from '../api/client';
-import { useOverview, useThread, useThreads } from '../api/hooks';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent, type MouseEvent, type RefObject } from 'react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { ApiFailure, api } from '../api/client';
+import { keys, useOverview, useThread, useThreads } from '../api/hooks';
 import type { Delivery, ThreadSummary, Tracked } from '../api/types';
 import { AgentTile } from '../components/AgentTile';
 import { StatusChip } from '../components/bits';
 import { Scroller } from '../components/Scroller';
+import { Select } from '../components/Select';
+import { Button } from '../ds';
 import { Loading, Skeleton, Typing } from '../components/Signal';
 import { TilePair } from '../components/TilePair';
 import { ME, agentOf, labelOf, who } from '../lib/agents';
@@ -255,7 +258,146 @@ function ThreadDetail({ id, target, query, now }: { id?: string; target?: string
           )}
         </ol>
       </Scroller>
+      <Composer
+        key={data.id}
+        threadId={data.id}
+        messages={messages}
+        me={me}
+        onSent={() => {
+          // Your own message should come into view.
+          atBottom.current = true;
+        }}
+      />
     </section>
+  );
+}
+
+/** What you were writing in each thread, kept while you look at another one. */
+const drafts = new Map<string, string>();
+
+/** The thread whose reply box takes focus when it opens, after a send from Agents. */
+let focusThread = '';
+export function focusReplyIn(thread: string) {
+  focusThread = thread;
+}
+
+/** The message a reply to `agent` answers: the latest between you and it, so it reaches the same session. */
+function replyTarget(messages: Tracked[], me: string, agent: string): Tracked | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if ((m.to === me && agentOf(m.from) === agent) || (m.from === me && agentOf(m.to) === agent)) return m;
+  }
+  return undefined;
+}
+
+/** Writing into the open thread. It stays open, so the conversation can go on. */
+function Composer({ threadId, messages, me, onSent }: { threadId: string; messages: Tracked[]; me: string; onSent: () => void }) {
+  const client = useQueryClient();
+  const others = agentsIn(messages.flatMap((m) => [m.from, m.to])).filter((a) => a !== me && a !== 'birdie' && a !== 'agent-bus');
+  // By default, answer whoever wrote to you last.
+  let latest = '';
+  for (let i = messages.length - 1; i >= 0 && !latest; i--) {
+    const from = agentOf(messages[i].from);
+    if (others.includes(from)) latest = from;
+  }
+  const [picked, setPicked] = useState('');
+  const to = others.includes(picked) ? picked : latest || others[0] || '';
+  const [text, setText] = useState(() => drafts.get(threadId) ?? '');
+  const [error, setError] = useState('');
+  const box = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (focusThread === threadId) {
+      focusThread = '';
+      box.current?.focus({ preventScroll: true });
+    }
+  }, [threadId]);
+
+  // Grow with what you write, up to a few lines; then it scrolls.
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 180) + 'px';
+  }, [text]);
+
+  const mutation = useMutation({
+    mutationFn: api.send,
+    onSuccess: () => {
+      setText('');
+      drafts.delete(threadId);
+      setError('');
+      onSent();
+      client.invalidateQueries({ queryKey: keys.thread(threadId) });
+      client.invalidateQueries({ queryKey: keys.threads });
+      client.invalidateQueries({ queryKey: keys.overview });
+    },
+    onError: (err) => setError(err instanceof Error ? err.message : String(err)),
+  });
+
+  if (!messages.some((m) => m.from === me || m.to === me)) {
+    return <p className="chat-compose-note">You're not in this thread, so you can't write in it. Only the agents in a thread can.</p>;
+  }
+  if (!to) return null;
+
+  const change = (v: string) => {
+    setText(v);
+    if (v) drafts.set(threadId, v);
+    else drafts.delete(threadId);
+  };
+  const submit = (e?: FormEvent) => {
+    e?.preventDefault();
+    const content = text.trim();
+    if (!content || mutation.isPending) return;
+    const parent = replyTarget(messages, me, to);
+    mutation.mutate(parent ? { to, content, in_reply_to: parent.id } : { to, content, thread_id: threadId });
+  };
+  const keyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) submit(e);
+  };
+
+  return (
+    <form className="chat-compose" onSubmit={submit} noValidate aria-label={'Write to ' + labelOf(to)}>
+      {error && (
+        <p className="chat-compose-error" role="alert">
+          Error: {error}. Your message is still in the box.
+        </p>
+      )}
+      {others.length > 1 && (
+        <div className="chat-compose-to">
+          <span id="compose-to-label">To</span>
+          <Select
+            id="compose-to"
+            labelledBy="compose-to-label"
+            value={to}
+            onChange={setPicked}
+            options={others.map((a) => ({ value: a, label: labelOf(a), icon: <AgentTile name={a} size={24} /> }))}
+          />
+        </div>
+      )}
+      <div className="chat-compose-row">
+        <label htmlFor="compose-text" className="visually-hidden">
+          Message to {labelOf(to)}
+        </label>
+        <textarea
+          id="compose-text"
+          ref={box}
+          className="textarea chat-compose-text"
+          rows={1}
+          value={text}
+          onChange={(e) => change(e.target.value)}
+          onKeyDown={keyDown}
+          placeholder={'Write to ' + labelOf(to) + '…'}
+          aria-describedby="compose-hint"
+        />
+        <Button kind="primary" type="submit" disabled={mutation.isPending || !text.trim()}>
+          {mutation.isPending ? 'Sending' : 'Send'}
+        </Button>
+      </div>
+      <span id="compose-hint" className="chat-compose-hint">
+        Enter sends, Shift+Enter starts a new line. It goes to {labelOf(to)} in this thread.
+      </span>
+    </form>
   );
 }
 
