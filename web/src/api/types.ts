@@ -128,7 +128,14 @@ export interface Thread { id: string; messages: Tracked[] }
 export interface RecentMessages { messages: Tracked[] }
 
 /** POST /ui/api/messages */
-export interface SendInput { to: string; content: string }
+export interface SendInput {
+  to: string;
+  content: string;
+  /** Posts into this thread, which the web app must be in. */
+  thread_id?: string;
+  /** Answers this message: same thread, and back to the session that sent it. */
+  in_reply_to?: string;
+}
 export interface SendResult {
   id: string;
   thread_id: string;
