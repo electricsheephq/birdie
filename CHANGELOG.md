@@ -70,7 +70,14 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   config folder (#20).
 - A stalled daemon can't hold up a session's bridge forever: reporting or
   ending a session, and confirming or returning a message, each give up after
-  10 seconds (#22).
+  10 seconds (#22). Once one of a batch's confirmations can't reach the
+  daemon, the bridge stops trying the rest: they go back to the queue when
+  their leases end, so a stalled daemon holds a batch, and the bridge's exit,
+  for one deadline instead of one per message. One already shown isn't shown
+  again (#26).
+- `check_inbox` and `wait_for_reply` don't show again a message they showed
+  before whose confirmation was lost; it is confirmed instead, as pushed
+  messages already were (#26).
 - Event previews, checks for a notice already sent, and telling a sender a
   message is held no longer copy a whole message, however large (#23).
   Confirming or returning a message still reads it whole, once.
