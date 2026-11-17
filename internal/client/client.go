@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -102,7 +103,14 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 			Code     string
 			Sessions []bus.SessionRef
 		}
-		json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&e)
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&e); err != nil {
+			// A stall while the reason comes in isn't a refusal, whatever
+			// the status said.
+			var netErr net.Error
+			if ctx.Err() != nil || errors.As(err, &netErr) {
+				return fmt.Errorf("%s, and its reason didn't arrive: %w", resp.Status, err)
+			}
+		}
 		if e.Error == "" {
 			e.Error = resp.Status
 		}

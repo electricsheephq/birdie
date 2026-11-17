@@ -80,7 +80,9 @@ type toolArgs struct {
 	TimeoutSeconds float64 `json:"timeout_seconds"`
 }
 
-func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus.Message) (any, *rpcError) {
+// callTool runs a tool call. What it takes goes in taken, and shownIn gets the
+// conversation the call acts for, where its answer is shown.
+func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus.Message, shownIn *uint64) (any, *rpcError) {
 	var p callParams
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, &rpcError{-32602, "invalid params"}
@@ -98,6 +100,9 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 			s.syncSession(context.WithoutCancel(ctx), h)
 		}
 	}
+	// Read once: /clear can switch the bridge to another conversation while
+	// the call runs, but its answer goes to this one.
+	*shownIn = s.convNow()
 	var a toolArgs
 	if len(p.Arguments) > 0 {
 		if err := json.Unmarshal(p.Arguments, &a); err != nil {
@@ -141,7 +146,16 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 			}
 		}
 		var msgs []bus.Message
-		msgs, err = s.c.Inbox(ctx, "", seconds(a.WaitSeconds, 0, bus.MaxWait))
+		until := time.Now().Add(seconds(a.WaitSeconds, 0, bus.MaxWait))
+		seen := s.newBatch(ctx)
+		for {
+			msgs, err = s.c.Inbox(ctx, "", max(time.Until(until), 0))
+			// What was shown before is confirmed, and the wait goes on.
+			msgs = s.confirmSeen(seen, msgs, *shownIn)
+			if err != nil || len(msgs) > 0 || time.Until(until) <= 0 {
+				break
+			}
+		}
 		if err == nil {
 			*taken = msgs
 		}
@@ -154,7 +168,7 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 		pushing := s.pushing()
 		// One decision for how to wait and whether to confirm what comes
 		// back: the tier can change while the call waits.
-		msgs, *taken, err = s.waitForReply(ctx, a.ThreadID, seconds(a.TimeoutSeconds, 120*time.Second, maxReplyWait), pushing)
+		msgs, *taken, err = s.waitForReply(ctx, a.ThreadID, seconds(a.TimeoutSeconds, 120*time.Second, maxReplyWait), pushing, *shownIn)
 		if err == nil && len(msgs) == 0 {
 			note := "No reply yet. Check again later with wait_for_reply or check_inbox."
 			if s.pushing() {
