@@ -44,6 +44,20 @@ for platform in "$@"; do
 done
 cut -f1,2 "$tmp/packages" | sort -u >"$tmp/modules"
 
+# The binaries also embed the web app when it has been built (`make web`), and
+# with it the npm packages it bundles: every package in the lockfile that isn't
+# only a dev dependency.
+: >"$tmp/npm"
+if [ -f internal/webui/dist/index.html ]; then
+	command -v node >/dev/null || die "the web app is built but node isn't installed"
+	node -e '
+		const lock = require("./web/package-lock.json");
+		for (const [path, pkg] of Object.entries(lock.packages))
+			if (path && !pkg.dev) console.log(path + "\t" + pkg.version);
+	' >"$tmp/npm.unsorted"
+	sort "$tmp/npm.unsorted" >"$tmp/npm"
+fi
+
 {
 	echo "THIRD-PARTY NOTICES"
 	echo
@@ -52,6 +66,7 @@ cut -f1,2 "$tmp/packages" | sort -u >"$tmp/modules"
 	echo "of each one follow in full, so some mention code birdie doesn't compile in."
 	echo
 	cut -f1 "$tmp/modules" | sed 's/^/  /'
+	sed "s|^node_modules/||; s|$tab| |; s|\$| (web app)|; s|^|  |" "$tmp/npm"
 } >"$tmp/notices"
 
 while IFS="$tab" read -r module root; do
@@ -69,5 +84,24 @@ while IFS="$tab" read -r module root; do
 		cat "$file"
 	done <"$tmp/licenses"
 done <"$tmp/modules" >>"$tmp/notices"
+
+if [ -s "$tmp/npm" ]; then
+	while IFS="$tab" read -r path version; do
+		dir="web/$path"
+		[ -d "$dir" ] || die "$dir is missing; run make web first"
+		find "$dir" -maxdepth 1 -type f \( \
+			-iname 'licen[cs]e*' -o -iname 'copying*' -o -iname 'copyright*' -o \
+			-iname 'notice*' -o -iname 'patents*' -o -iname 'unlicense*' \) |
+			sort >"$tmp/licenses"
+		[ -s "$tmp/licenses" ] || die "no license file found for npm package ${path#node_modules/} in $dir"
+
+		printf '\n================================================================================\n'
+		printf '%s %s (web app)\n' "${path#node_modules/}" "$version"
+		while IFS= read -r file; do
+			printf '\n--- %s\n\n' "${file#"$dir"/}"
+			cat "$file"
+		done <"$tmp/licenses"
+	done <"$tmp/npm" >>"$tmp/notices"
+fi
 
 cat "$tmp/notices"
