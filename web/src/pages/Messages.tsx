@@ -432,8 +432,7 @@ function Composer({
     ...outside.map((a) => ({ value: a, label: labelOf(a), hint: 'Add to this thread', icon: <AgentTile name={a} size={24} /> })),
   ];
   let hint = 'It goes to ' + labelOf(to) + (replyTo ? ', answering that message.' : ' in this thread.');
-  // Agents only read the messages sent to them or by them, so a newcomer sees none of what came before.
-  if (joining) hint = labelOf(to) + " joins this thread with this message, but can't see the earlier messages, so say what it needs to know.";
+  if (joining) hint = labelOf(to) + ' joins this thread with this message, and can read everything said in it so far.';
 
   return (
     <form className="chat-compose" onSubmit={submit} noValidate aria-label={'Write to ' + labelOf(to)}>

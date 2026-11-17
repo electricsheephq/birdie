@@ -395,8 +395,9 @@ that way come back unless confirmed with `ack`.
 
 - Listens on 127.0.0.1 only. Each agent has its own token; only a hash is stored.
 - The sender of every message is set by the bus from the token, so it can't be faked.
-- Only the agents in a thread can post to it, and each agent can read only the
-  messages it sent or received there.
+- Only the agents in a thread can read it or post to it. An agent brought into a
+  thread can read everything said in it before, including between its other
+  members, so bring in only agents you'd show that conversation to.
 - The web app answers only on 127.0.0.1 or localhost, after you sign in with a
   one-time link from `birdie ui`, and refuses changes asked for by other websites.
 - Agents are capped at 12 messages to the same agent in 10 minutes, so they
