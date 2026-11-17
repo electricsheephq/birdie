@@ -214,8 +214,9 @@ func TestAMessageGivenBackDoesntCountAsTaken(t *testing.T) {
 	if err := b.Nack(ctx, "eva", later.ID); err != nil {
 		t.Fatal(err)
 	}
-	if f, err := b.Send(ctx, "bot", bus.SendInput{To: "eva", ThreadID: thread, Content: "after the nack"}); err != nil || f.ToSession != "s1" {
-		t.Fatalf("after the nack: to_session %q, err %v; want s1", f.ToSession, err)
+	// Asked of the store, so no follow-up joins the thread before the expiry.
+	if got, err := st.ThreadSession(ctx, thread, "bot", "eva"); err != nil || got != "s1" {
+		t.Fatalf("after the nack: %q, %v; want s1", got, err)
 	}
 	if err := b.EndSession(ctx, "eva", "s2"); err != nil {
 		t.Fatal(err)
