@@ -10,7 +10,7 @@ make test                 # go vet ./... and go test -race ./...
 go test ./internal/...    # quick: bus, store, HTTP API, MCP server, adapters, web app API
 go test ./cmd/birdie -run TestHermesPlugin   # the Hermes plugin's Python tests (needs python3)
 make build                # bin/birdie
-make web                  # the web app (Node 22), embedded into the binary
+make web                  # the web app (Node 22.12+), embedded into the binary
 ```
 
 - Go version: `go.mod`. The binary is built with `CGO_ENABLED=0`; SQLite is
