@@ -394,7 +394,7 @@ func TestCheckInboxWaitsWhileTheConversationIsUnknown(t *testing.T) {
 	srv.host = h
 
 	var taken []bus.Message
-	res, rerr := srv.callTool(ctx, json.RawMessage(`{"name":"check_inbox","arguments":{}}`), &taken, new(string))
+	res, rerr := srv.callTool(ctx, json.RawMessage(`{"name":"check_inbox","arguments":{}}`), &taken, new(uint64))
 	if rerr != nil {
 		t.Fatal(rerr.Message)
 	}

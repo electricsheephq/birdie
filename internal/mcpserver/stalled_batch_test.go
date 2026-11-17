@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -108,30 +109,56 @@ type pullTierHost struct{ *pullOnlyHost }
 
 func (pullTierHost) Tier() string { return bus.TierPull }
 
-// claimAPI hands out m1, which the session was shown before (its
-// confirmation was lost and its lease ran out), then m2 on the next claim.
-// It records what is confirmed.
-func claimAPI(t *testing.T, h Host) (*Server, func() []string) {
+// convHost is a pull-tier host whose conversation id changes, as /clear or
+// the real id arriving changes it.
+type convHost struct {
+	pullOnlyHost
+	id atomic.Pointer[string]
+}
+
+func newConvHost(id string) *convHost {
+	h := &convHost{}
+	h.set(id)
+	return h
+}
+
+func (h *convHost) set(id string)        { h.id.Store(&id) }
+func (h *convHost) Session() SessionInfo { return SessionInfo{ID: *h.id.Load(), Name: "api"} }
+func (h *convHost) Tier() string         { return bus.TierPull }
+
+// claims is a daemon that hands out ids, one per claim, and records what is
+// confirmed. during, if set, runs inside the first claim: what changes while
+// a call waits. The first confirmation of lost is refused: it is lost.
+func claims(t *testing.T, h Host, ids []string, lost string, during func(*Server)) (*Server, func() []string) {
 	t.Helper()
-	var claims atomic.Int32
+	var srv atomic.Pointer[Server]
+	var n atomic.Int32
 	var mu sync.Mutex
 	acked := []string{}
+	refused := false
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		switch {
 		case r.URL.Path == "/v1/inbox":
-			switch claims.Add(1) {
-			case 1:
-				io.WriteString(w, `{"messages":[{"id":"m1","thread_id":"t1","from":"bot","content":"old"}]}`)
-			case 2:
-				io.WriteString(w, `{"messages":[{"id":"m2","thread_id":"t1","from":"bot","content":"new"}]}`)
-			default:
-				io.WriteString(w, `{"messages":[]}`)
+			i := int(n.Add(1)) - 1
+			if i == 0 && during != nil {
+				during(srv.Load())
 			}
+			if i >= len(ids) {
+				io.WriteString(w, `{"messages":[]}`)
+				return
+			}
+			fmt.Fprintf(w, `{"messages":[{"id":%q,"thread_id":"t1","from":"bot","content":"hi"}]}`, ids[i])
 		case strings.HasSuffix(r.URL.Path, "/ack"):
+			id := strings.Split(r.URL.Path, "/")[3]
 			mu.Lock()
-			acked = append(acked, strings.Split(r.URL.Path, "/")[3])
-			mu.Unlock()
+			defer mu.Unlock()
+			if id == lost && !refused {
+				refused = true
+				http.Error(w, `{"error":"lost"}`, http.StatusConflict)
+				return
+			}
+			acked = append(acked, id)
 			io.WriteString(w, `{}`)
 		default:
 			io.WriteString(w, `{}`)
@@ -139,15 +166,45 @@ func claimAPI(t *testing.T, h Host) (*Server, func() []string) {
 	}))
 	t.Cleanup(api.Close)
 	c := client.New(api.URL, "test-token")
-	c.SetSession("s1")
+	c.SetSession(h.Session().ID)
 	s := New(c, "claude", "test", false, log.New(io.Discard, "", 0))
 	s.host = h
-	s.markShown("m1", "s1")
+	srv.Store(s)
 	return s, func() []string {
 		mu.Lock()
 		defer mu.Unlock()
 		return slices.Clone(acked)
 	}
+}
+
+// claimAPI hands out m1, which the conversation was shown before (its
+// confirmation was lost and its lease ran out), then m2 on the next claim.
+func claimAPI(t *testing.T, h Host) (*Server, func() []string) {
+	t.Helper()
+	s, acked := claims(t, h, []string{"m1", "m2"}, "", nil)
+	s.markShown("m1", s.convNow())
+	return s, acked
+}
+
+// ask makes a check_inbox call the way the client does, and returns what was
+// written back.
+func ask(s *Server) string {
+	var out bytes.Buffer
+	s.out = &out
+	s.handle(context.Background(), request{ID: json.RawMessage(`1`), Method: "tools/call", Params: json.RawMessage(`{"name":"check_inbox","arguments":{}}`)})
+	return out.String()
+}
+
+// fetch makes a check_inbox call and returns its answer and what it took.
+func fetch(t *testing.T, s *Server, call string) (string, []bus.Message) {
+	t.Helper()
+	var taken []bus.Message
+	res, rerr := s.callTool(context.Background(), json.RawMessage(call), &taken, new(uint64))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	b, _ := json.Marshal(res)
+	return string(b), taken
 }
 
 // check_inbox and wait_for_reply don't show again what was shown before.
@@ -162,22 +219,16 @@ func TestAPullCallConfirmsWhatItShowedBeforeAndWaitsOn(t *testing.T) {
 		{`{"name":"wait_for_reply","arguments":{"thread_id":"t1","timeout_seconds":5}}`, pullTierHost{&pullOnlyHost{}}},
 		{`{"name":"wait_for_reply","arguments":{"thread_id":"t1","timeout_seconds":5}}`, &pullOnlyHost{}},
 	} {
-		call := tc.call
 		s, acked := claimAPI(t, tc.host)
-		var taken []bus.Message
-		res, rerr := s.callTool(context.Background(), json.RawMessage(call), &taken, new(string))
-		if rerr != nil {
-			t.Fatal(rerr)
-		}
-		b, _ := json.Marshal(res)
-		if strings.Contains(string(b), `m1`) || !strings.Contains(string(b), `m2`) {
-			t.Fatalf("%s answer: %s; want m2 only", call, b)
+		answer, taken := fetch(t, s, tc.call)
+		if strings.Contains(answer, `m1`) || !strings.Contains(answer, `m2`) {
+			t.Fatalf("%s answer: %s; want m2 only", tc.call, answer)
 		}
 		if len(taken) != 1 || taken[0].ID != "m2" {
-			t.Fatalf("%s taken: %+v; want m2, to confirm once answered", call, taken)
+			t.Fatalf("%s taken: %+v; want m2, to confirm once answered", tc.call, taken)
 		}
 		if got := acked(); len(got) != 1 || got[0] != "m1" {
-			t.Fatalf("%s confirmed %v; want m1", call, got)
+			t.Fatalf("%s confirmed %v; want m1", tc.call, got)
 		}
 	}
 }
@@ -185,16 +236,12 @@ func TestAPullCallConfirmsWhatItShowedBeforeAndWaitsOn(t *testing.T) {
 // What an earlier conversation was shown, before /clear, is shown in the new
 // one: the new conversation hasn't seen it (#26).
 func TestAMessageShownBeforeClearIsShownAgainAfterIt(t *testing.T) {
-	s, acked := claimAPI(t, pullTierHost{&pullOnlyHost{}})
-	s.markShown("m1", "s0") // shown in the conversation before /clear
-	var taken []bus.Message
-	res, rerr := s.callTool(context.Background(), json.RawMessage(`{"name":"check_inbox","arguments":{}}`), &taken, new(string))
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
-	b, _ := json.Marshal(res)
-	if !strings.Contains(string(b), `m1`) || len(taken) != 1 || taken[0].ID != "m1" {
-		t.Fatalf("check_inbox answer: %s, taken %+v; want m1, to confirm once answered", b, taken)
+	h := newConvHost("s1")
+	s, acked := claimAPI(t, h)
+	h.set("s2") // /clear
+	answer, taken := fetch(t, s, `{"name":"check_inbox","arguments":{}}`)
+	if !strings.Contains(answer, `m1`) || len(taken) != 1 || taken[0].ID != "m1" {
+		t.Fatalf("check_inbox answer: %s, taken %+v; want m1, to confirm once answered", answer, taken)
 	}
 	if got := acked(); len(got) != 0 {
 		t.Fatalf("confirmed %v before answering", got)
@@ -204,51 +251,78 @@ func TestAMessageShownBeforeClearIsShownAgainAfterIt(t *testing.T) {
 // What the conversation was shown under its stand-in id counts as shown once
 // its real id is known: it is the same conversation (#26).
 func TestAMessageShownUnderTheStandInCountsOnceTheRealIDIsKnown(t *testing.T) {
-	s, acked := claimAPI(t, pullTierHost{&pullOnlyHost{}})
-	s.c.SetSession(procID())
-	s.markShown("m1", procID())
-	var taken []bus.Message
-	res, rerr := s.callTool(context.Background(), json.RawMessage(`{"name":"check_inbox","arguments":{"wait_seconds":5}}`), &taken, new(string))
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
-	b, _ := json.Marshal(res)
-	if strings.Contains(string(b), `m1`) || !strings.Contains(string(b), `m2`) {
-		t.Fatalf("check_inbox answer: %s; want m2 only", b)
+	h := newConvHost(procID())
+	s, acked := claimAPI(t, h)
+	h.set("s1") // the real id arrives
+	answer, _ := fetch(t, s, `{"name":"check_inbox","arguments":{"wait_seconds":5}}`)
+	if strings.Contains(answer, `m1`) || !strings.Contains(answer, `m2`) {
+		t.Fatalf("check_inbox answer: %s; want m2 only", answer)
 	}
 	if got := acked(); len(got) != 1 || got[0] != "m1" {
 		t.Fatalf("confirmed %v; want m1", got)
 	}
 }
 
-// A call's answer is recorded for the conversation that made the call, even
-// if /clear switches the bridge to another one while it runs (#26).
-func TestAnAnswerIsRecordedForTheConversationThatAsked(t *testing.T) {
-	var c atomic.Pointer[client.Client]
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		if r.URL.Path == "/v1/inbox" {
-			c.Load().SetSession("s2") // /clear lands while the call runs
-			io.WriteString(w, `{"messages":[{"id":"m2","thread_id":"t1","from":"bot","content":"new"}]}`)
-			return
-		}
-		io.WriteString(w, `{}`)
-	}))
-	defer api.Close()
-	c.Store(client.New(api.URL, "test-token"))
-	c.Load().SetSession("s1")
-	s := New(c.Load(), "claude", "test", false, log.New(io.Discard, "", 0))
-	s.host = pullTierHost{&pullOnlyHost{}}
-	var out bytes.Buffer
-	s.out = &out
-	s.handle(context.Background(), request{ID: json.RawMessage(`1`), Method: "tools/call", Params: json.RawMessage(`{"name":"check_inbox","arguments":{}}`)})
-	if !bytes.Contains(out.Bytes(), []byte(`m2`)) {
-		t.Fatalf("answer: %s", out.String())
+// A call made under the stand-in id that answers after the real id arrived
+// counts for the same conversation: what it showed isn't shown again (#26).
+func TestAStandInCallsAnswerCountsOnceTheRealIDIsKnown(t *testing.T) {
+	h := newConvHost(procID())
+	s, acked := claims(t, h, []string{"m1", "m1", "m2"}, "m1", func(s *Server) {
+		h.set("s1") // another call brings the real id while this one waits
+		s.syncSession(context.Background(), h)
+	})
+	if out := ask(s); !strings.Contains(out, `m1`) {
+		t.Fatalf("first answer: %s; want m1", out)
 	}
-	s.waitMu.Lock()
-	in := s.pushed["m2"]
-	s.waitMu.Unlock()
-	if in != "s1" {
-		t.Fatalf("m2 recorded as shown in %q; want s1, the conversation that asked", in)
+	answer, _ := fetch(t, s, `{"name":"check_inbox","arguments":{"wait_seconds":5}}`)
+	if strings.Contains(answer, `m1`) || !strings.Contains(answer, `m2`) {
+		t.Fatalf("check_inbox answer: %s; want m2 only", answer)
+	}
+	if got := acked(); len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("confirmed %v; want m1", got)
+	}
+}
+
+// When the stand-in id comes back after the real one, it is a new
+// conversation: what a call showed before is shown in it, not confirmed
+// unseen (#26).
+func TestAMessageShownBeforeTheStandInCameBackIsShownAgain(t *testing.T) {
+	h := newConvHost(procID())
+	s, acked := claims(t, h, []string{"m1", "m1"}, "m1", func(s *Server) {
+		h.set("s1") // the real id arrives
+		s.syncSession(context.Background(), h)
+		h.set(procID()) // and goes: a new conversation
+		s.syncSession(context.Background(), h)
+	})
+	if out := ask(s); !strings.Contains(out, `m1`) {
+		t.Fatalf("first answer: %s; want m1", out)
+	}
+	answer, taken := fetch(t, s, `{"name":"check_inbox","arguments":{}}`)
+	if !strings.Contains(answer, `m1`) || len(taken) != 1 || taken[0].ID != "m1" {
+		t.Fatalf("check_inbox answer: %s, taken %+v; want m1, to confirm once answered", answer, taken)
+	}
+	if got := acked(); len(got) != 0 {
+		t.Fatalf("confirmed %v before answering", got)
+	}
+}
+
+// A call's answer is recorded for the conversation that made the call, even
+// if /clear switches the bridge to another one while it runs: the new one
+// is shown it (#26).
+func TestAnAnswerIsRecordedForTheConversationThatAsked(t *testing.T) {
+	h := newConvHost("s1")
+	s, acked := claims(t, h, []string{"m2", "m2"}, "m2", func(s *Server) {
+		h.set("s2") // /clear lands while the call runs
+		s.syncSession(context.Background(), h)
+	})
+	if out := ask(s); !strings.Contains(out, `m2`) {
+		t.Fatalf("first answer: %s; want m2", out)
+	}
+	answer, taken := fetch(t, s, `{"name":"check_inbox","arguments":{}}`)
+	if !strings.Contains(answer, `m2`) || len(taken) != 1 || taken[0].ID != "m2" {
+		t.Fatalf("check_inbox answer in the new conversation: %s, taken %+v; want m2", answer, taken)
+	}
+	if got := acked(); len(got) != 0 {
+		t.Fatalf("confirmed %v before answering", got)
 	}
 }

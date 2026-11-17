@@ -124,8 +124,8 @@ func TestWhatACallReturnedIsntPushedAgain(t *testing.T) {
 func TestAWaitDoesntSettleWhatThePumpShowed(t *testing.T) {
 	srv, _, _, _ := bridge(t)
 	shown := bus.Message{ID: "msg_shown", ThreadID: "thr_x"}
-	srv.remember(shown, srv.c.Session())
-	msgs, took, err := srv.waitForReply(context.Background(), "thr_x", time.Second, true)
+	srv.remember(shown, srv.convNow())
+	msgs, took, err := srv.waitForReply(context.Background(), "thr_x", time.Second, true, srv.convNow())
 	if err != nil || len(msgs) != 1 || msgs[0].ID != shown.ID || len(took) != 0 {
 		t.Fatalf("msgs %+v, took %+v, %v", msgs, took, err)
 	}

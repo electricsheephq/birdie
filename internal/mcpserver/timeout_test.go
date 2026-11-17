@@ -48,7 +48,7 @@ func TestAStalledDaemonDoesntHoldCheckInboxOrTheSessionLockForever(t *testing.T)
 			go func() {
 				defer close(done)
 				var taken []bus.Message
-				s.callTool(ctx, json.RawMessage(`{"name":"check_inbox","arguments":{}}`), &taken, new(string))
+				s.callTool(ctx, json.RawMessage(`{"name":"check_inbox","arguments":{}}`), &taken, new(uint64))
 			}()
 			// Cancellation must still let the conversation change reach the
 			// daemon, even though the daemon can no longer hold it forever.

@@ -55,10 +55,16 @@ type Server struct {
 	// wait_for_reply that starts just after doesn't wait for what already came.
 	shown map[string][]bus.Message
 	// pushed holds the ids of the messages shown most recently, oldest
-	// first, with the conversation each was shown in, so one that comes
-	// back is confirmed, not shown again.
-	pushed      map[string]string
+	// first, with the number of the conversation each was shown in (conv),
+	// so one that comes back is confirmed, not shown again.
+	pushed      map[string]uint64
 	pushedOrder []string
+
+	// conv numbers the conversation the bridge acts for. It changes with
+	// /clear, not when a stand-in id becomes the real one: that is the same
+	// conversation. convMu keeps it in step with the client's session id.
+	convMu sync.Mutex
+	conv   uint64
 
 	pumpOnce sync.Once
 
@@ -84,7 +90,7 @@ func New(c *client.Client, name, version string, channel bool, logger *log.Logge
 	// it is always taken under a lease, session or not.
 	c.Leased = true
 	return &Server{c: c, name: name, version: version, channel: channel, log: logger,
-		waiters: map[string][]chan bus.Message{}, shown: map[string][]bus.Message{}, pushed: map[string]string{}, beat: make(chan struct{}, 1),
+		waiters: map[string][]chan bus.Message{}, shown: map[string][]bus.Message{}, pushed: map[string]uint64{}, beat: make(chan struct{}, 1),
 		calls: map[string]*call{}}
 }
 
@@ -227,7 +233,7 @@ func (s *Server) handle(ctx context.Context, req request) {
 	var result any
 	var rerr *rpcError
 	var taken []bus.Message // claimed by a tool call, to confirm once answered
-	var shownIn string      // the conversation the call's answer goes to
+	var shownIn uint64      // the conversation the call's answer goes to
 	switch req.Method {
 	case "initialize":
 		result = s.initialize(req.Params)
@@ -385,14 +391,22 @@ func (s *Server) syncSession(ctx context.Context, h Host) {
 	s.syncMu.Lock()
 	defer s.syncMu.Unlock()
 	info := h.Session()
-	if old := s.c.Session(); old != info.ID {
+	s.convMu.Lock()
+	old := s.c.Session()
+	if old != info.ID {
 		s.c.SetSession(info.ID)
+		if old != "" && old != procID() {
+			// A new conversation: what the old one was shown, it wasn't.
+			s.conv++
+		}
+	}
+	s.convMu.Unlock()
+	if old != info.ID {
 		switch {
 		case old == procID():
 			// The same conversation, now known by its real id: what was
-			// pinned to the stand-in moves with it, and what it was shown.
+			// pinned to the stand-in moves with it.
 			s.replaces = old
-			s.moveShown(old, info.ID)
 		case old != "":
 			// A new conversation (/clear): what was pinned to the old one
 			// waits for it, including a stand-in's move not yet reported.
@@ -459,7 +473,7 @@ func (s *Server) pump(ctx context.Context) {
 			pause(ctx, 5*time.Second)
 			continue
 		}
-		polled := s.c.Session()
+		polled, pollConv := s.acting()
 		msgs, err := s.c.PushInbox(ctx, pollWait)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -516,7 +530,7 @@ func (s *Server) pump(ctx context.Context) {
 				b.nack(m)
 				continue
 			}
-			s.remember(m, polled)
+			s.remember(m, pollConv)
 			b.ack(m)
 		}
 		if relearn {
@@ -660,12 +674,13 @@ func (b *batch) settle(m bus.Message, verb string, call func(context.Context, st
 }
 
 // confirmSeen confirms, and leaves out, what a tool call took that was shown
-// before in this conversation: its confirmation was lost and its lease ran
-// out, so it came back. The push path does the same (#26).
-func (s *Server) confirmSeen(b *batch, msgs []bus.Message) []bus.Message {
+// before in conversation conv, the one the call acts for: its confirmation
+// was lost and its lease ran out, so it came back. The push path does the
+// same (#26).
+func (s *Server) confirmSeen(b *batch, msgs []bus.Message, conv uint64) []bus.Message {
 	out := msgs[:0:0]
 	for _, m := range msgs {
-		if s.shownHere(m.ID) {
+		if s.shownIn(m.ID, conv) {
 			b.ack(m)
 			continue
 		}
@@ -674,27 +689,27 @@ func (s *Server) confirmSeen(b *batch, msgs []bus.Message) []bus.Message {
 	return out
 }
 
-func (s *Server) remember(m bus.Message, session string) {
+func (s *Server) remember(m bus.Message, conv uint64) {
 	s.waitMu.Lock()
 	defer s.waitMu.Unlock()
 	if len(s.shown) > 64 {
 		clear(s.shown)
 	}
 	s.shown[m.ThreadID] = append(s.shown[m.ThreadID], m)
-	s.markShownLocked(m.ID, session)
+	s.markShownLocked(m.ID, conv)
 }
 
 // markShown records that a tool call's answer showed the message with id in
-// the conversation session.
-func (s *Server) markShown(id, session string) {
+// conversation conv.
+func (s *Server) markShown(id string, conv uint64) {
 	s.waitMu.Lock()
 	defer s.waitMu.Unlock()
-	s.markShownLocked(id, session)
+	s.markShownLocked(id, conv)
 }
 
-func (s *Server) markShownLocked(id, session string) {
+func (s *Server) markShownLocked(id string, conv uint64) {
 	_, known := s.pushed[id]
-	s.pushed[id] = session
+	s.pushed[id] = conv
 	if !known {
 		s.pushedOrder = append(s.pushedOrder, id)
 		if len(s.pushedOrder) > maxPushed {
@@ -716,26 +731,27 @@ func (s *Server) wasPushed(id string) bool {
 	return ok
 }
 
-// moveShown files what was shown in conversation from under to: the same
-// conversation, now known by its real id.
-func (s *Server) moveShown(from, to string) {
-	s.waitMu.Lock()
-	defer s.waitMu.Unlock()
-	for id, in := range s.pushed {
-		if in == from {
-			s.pushed[id] = to
-		}
-	}
-}
-
-// shownHere reports whether the message with id was shown in the
-// conversation the bridge acts for now. One shown before /clear wasn't: the
-// new conversation hasn't seen it.
-func (s *Server) shownHere(id string) bool {
+// shownIn reports whether the message with id was shown in conversation
+// conv. One shown before /clear wasn't: the new conversation hasn't seen it.
+func (s *Server) shownIn(id string, conv uint64) bool {
 	s.waitMu.Lock()
 	defer s.waitMu.Unlock()
 	in, ok := s.pushed[id]
-	return ok && in == s.c.Session()
+	return ok && in == conv
+}
+
+// acting is the session id the bridge acts for and its conversation's
+// number, read together.
+func (s *Server) acting() (string, uint64) {
+	s.convMu.Lock()
+	defer s.convMu.Unlock()
+	return s.c.Session(), s.conv
+}
+
+// convNow is the number of the conversation the bridge acts for.
+func (s *Server) convNow() uint64 {
+	_, conv := s.acting()
+	return conv
 }
 
 const messageTag = "birdie-message"
@@ -826,8 +842,8 @@ func (s *Server) removeWaiter(thread string, ch chan bus.Message) {
 // pushing is whether the session counted as push when the call began. It
 // returns what arrived, and of that, what this call took: the caller confirms
 // those once it has answered, or gives them back. The rest the pump already
-// showed and confirmed.
-func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.Duration, pushing bool) (msgs, took []bus.Message, err error) {
+// showed and confirmed. conv is the conversation the call acts for.
+func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.Duration, pushing bool, conv uint64) (msgs, took []bus.Message, err error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if !pushing {
@@ -839,7 +855,7 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 			}
 			msgs, err := s.c.Inbox(ctx, thread, min(remaining, bus.MaxWait-5*time.Second))
 			// What was shown before is confirmed, and the wait goes on.
-			msgs = s.confirmSeen(seen, msgs)
+			msgs = s.confirmSeen(seen, msgs, conv)
 			if err != nil || len(msgs) > 0 {
 				if ctx.Err() != nil && len(msgs) == 0 {
 					return nil, nil, nil
@@ -885,7 +901,7 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 	for {
 		msgs, err := s.c.Inbox(ctx, thread, 0)
 		// What was shown before is confirmed, and the wait goes on.
-		msgs = s.confirmSeen(seen, msgs)
+		msgs = s.confirmSeen(seen, msgs, conv)
 		if err == nil && len(msgs) > 0 {
 			// Taken, even if the deadline passed meanwhile: return them, or
 			// they sit leased to this session until the lease ends.

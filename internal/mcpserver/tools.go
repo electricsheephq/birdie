@@ -82,7 +82,7 @@ type toolArgs struct {
 
 // callTool runs a tool call. What it takes goes in taken, and shownIn gets the
 // conversation the call acts for, where its answer is shown.
-func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus.Message, shownIn *string) (any, *rpcError) {
+func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus.Message, shownIn *uint64) (any, *rpcError) {
 	var p callParams
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, &rpcError{-32602, "invalid params"}
@@ -102,7 +102,7 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 	}
 	// Read once: /clear can switch the bridge to another conversation while
 	// the call runs, but its answer goes to this one.
-	*shownIn = s.c.Session()
+	*shownIn = s.convNow()
 	var a toolArgs
 	if len(p.Arguments) > 0 {
 		if err := json.Unmarshal(p.Arguments, &a); err != nil {
@@ -151,7 +151,7 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 		for {
 			msgs, err = s.c.Inbox(ctx, "", max(time.Until(until), 0))
 			// What was shown before is confirmed, and the wait goes on.
-			msgs = s.confirmSeen(seen, msgs)
+			msgs = s.confirmSeen(seen, msgs, *shownIn)
 			if err != nil || len(msgs) > 0 || time.Until(until) <= 0 {
 				break
 			}
@@ -168,7 +168,7 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 		pushing := s.pushing()
 		// One decision for how to wait and whether to confirm what comes
 		// back: the tier can change while the call waits.
-		msgs, *taken, err = s.waitForReply(ctx, a.ThreadID, seconds(a.TimeoutSeconds, 120*time.Second, maxReplyWait), pushing)
+		msgs, *taken, err = s.waitForReply(ctx, a.ThreadID, seconds(a.TimeoutSeconds, 120*time.Second, maxReplyWait), pushing, *shownIn)
 		if err == nil && len(msgs) == 0 {
 			note := "No reply yet. Check again later with wait_for_reply or check_inbox."
 			if s.pushing() {
