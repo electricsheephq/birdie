@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperti
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ApiFailure, api } from '../api/client';
 import { keys, useOverview, useThread, useThreads } from '../api/hooks';
-import type { Delivery, ThreadSummary, Tracked } from '../api/types';
+import type { Agent, Delivery, ThreadSummary, Tracked } from '../api/types';
 import { AgentTile } from '../components/AgentTile';
 import { StatusChip } from '../components/bits';
 import { Scroller } from '../components/Scroller';
@@ -10,7 +10,7 @@ import { Select } from '../components/Select';
 import { Button } from '../ds';
 import { Loading, Skeleton, Typing } from '../components/Signal';
 import { TilePair } from '../components/TilePair';
-import { ME, agentOf, agentsOf, labelOf, who } from '../lib/agents';
+import { ME, agentOf, agentsOf, defaultSession, homePath, labelOf, liveSessions, who } from '../lib/agents';
 import { isSystem, mentionIn, mentionQuery, takeFocus } from '../lib/compose';
 import { href } from '../lib/router';
 import { MAX_TRIES, chipFor, errorText, progress, threadChip, troubled } from '../lib/status';
@@ -274,7 +274,7 @@ function ThreadDetail({ id, target, query, now }: { id?: string; target?: string
         threadId={data.id}
         messages={messages}
         me={me}
-        everyone={agentsOf(overview.data).map((a) => ({ name: a.name, label: a.label || a.name }))}
+        everyone={agentsOf(overview.data)}
         replyTo={replyTo}
         setReplyTo={setReplyTo}
         onSent={() => {
@@ -308,6 +308,22 @@ function replyTarget(messages: Tracked[], me: string, agent: string): Tracked | 
   return undefined;
 }
 
+/**
+ * How an agent would get a message now. Interactive agents are online while a
+ * session of theirs runs, and offline otherwise; their messages then wait.
+ * Webhook and headless agents are reached whenever a message comes.
+ */
+function reachOf(a: Agent | undefined): { text: string; offline: boolean } {
+  if (!a) return { text: '', offline: false };
+  if (a.delivery === 'webhook') return { text: 'Webhook, answers in its own time', offline: false };
+  if (a.delivery === 'acp') return { text: 'Starts when a message comes', offline: false };
+  const live = liveSessions(a);
+  if (!live.length) return { text: 'Offline, gets it when a session opens', offline: true };
+  const s = defaultSession(a)?.session ?? live[0];
+  const more = live.length > 1 ? ' +' + (live.length - 1) + ' more' : '';
+  return { text: 'Online · ' + (s.name || 'a session') + (s.state ? ', ' + s.state : '') + more, offline: false };
+}
+
 function short(text: string, n = 80): string {
   const t = text.replace(/\s+/g, ' ').trim();
   return t.length > n ? t.slice(0, n - 1) + '…' : t;
@@ -330,14 +346,18 @@ function Composer({
   threadId: string;
   messages: Tracked[];
   me: string;
-  everyone: { name: string; label: string }[];
+  everyone: Agent[];
   replyTo: Tracked | null;
   setReplyTo: (m: Tracked | null) => void;
   onSent: () => void;
 }) {
   const client = useQueryClient();
-  const members = agentsIn(messages.flatMap((m) => [m.from, m.to])).filter((a) => a !== me && !isSystem(a));
-  const outside = everyone.map((a) => a.name).filter((a) => a !== me && !isSystem(a) && !members.includes(a));
+  const byName = new Map(everyone.map((a) => [a.name, a]));
+  const reach = (name: string) => reachOf(byName.get(name));
+  // Offline agents go last in each group, keeping the order otherwise.
+  const onlineFirst = (names: string[]) => [...names.filter((a) => !reach(a).offline), ...names.filter((a) => reach(a).offline)];
+  const members = onlineFirst(agentsIn(messages.flatMap((m) => [m.from, m.to])).filter((a) => a !== me && !isSystem(a)));
+  const outside = onlineFirst(everyone.map((a) => a.name).filter((a) => a !== me && !isSystem(a) && !members.includes(a)));
   // By default, answer whoever wrote to you last.
   let latest = '';
   for (let i = messages.length - 1; i >= 0 && !latest; i--) {
@@ -345,6 +365,8 @@ function Composer({
     if (members.includes(from)) latest = from;
   }
   const [picked, setPicked] = useState('');
+  // A session picked by hand, for an agent with more than one running.
+  const [pickedSession, setPickedSession] = useState('');
   const [text, setText] = useState(() => drafts.get(threadId) ?? '');
   const [error, setError] = useState('');
   const [said, setSaid] = useState('');
@@ -396,8 +418,17 @@ function Composer({
   }
   if (!to) return null;
 
+  // The sessions you can choose between, and the one it would reach on its own:
+  // the one in your exchange with that agent here, else the agent's default.
+  const sessions = byName.get(to)?.delivery === 'pull' ? liveSessions(byName.get(to)!) : [];
+  const parent = replyTo ?? (members.includes(to) ? replyTarget(messages, me, to) : undefined);
+  const pinned = parent ? (agentOf(parent.from) === to ? parent.from_session : parent.to_session) : '';
+  const auto = sessions.find((s) => s.id === pinned) ?? defaultSession(byName.get(to)!)?.session ?? sessions[0];
+  const session = sessions.find((s) => s.id === pickedSession) ?? auto;
+
   const pick = (agent: string) => {
     setPicked(agent);
+    if (agent !== to) setPickedSession('');
     setError('');
     // A Reply answers one agent; picking another one stops it.
     if (replyTo && otherSide(replyTo, me) !== agent) setReplyTo(null);
@@ -410,7 +441,7 @@ function Composer({
     if (v) drafts.set(threadId, v);
     else drafts.delete(threadId);
     // Starting with @name picks who it goes to, once per mention, so the picker can still change it.
-    const found = mentionIn(v, everyone);
+    const found = mentionIn(v, everyone.map((a) => ({ name: a.name, label: a.label || a.name })));
     if (found !== mention.current) {
       mention.current = found;
       if (found && !found.startsWith('?') && found !== me && !isSystem(found)) pick(found);
@@ -420,8 +451,9 @@ function Composer({
     e?.preventDefault();
     const content = text.trim();
     if (!content || mutation.isPending) return;
-    const parent = replyTo ?? (members.includes(to) ? replyTarget(messages, me, to) : undefined);
-    mutation.mutate(parent ? { to, content, in_reply_to: parent.id } : { to, content, thread_id: threadId });
+    // Name the session only when you chose one other than where it would go anyway.
+    const address = sessions.length > 1 && session && session.id !== auto?.id ? to + '/' + session.id : to;
+    mutation.mutate(parent ? { to: address, content, in_reply_to: parent.id } : { to: address, content, thread_id: threadId });
   };
   const query = mentionQuery(text, caret);
   const q = query ? query.q.toLowerCase() : '';
@@ -475,12 +507,15 @@ function Composer({
   };
 
   const unknown = mention.current.startsWith('?') ? mention.current.slice(1) : '';
-  const options = [
-    ...members.map((a) => ({ value: a, label: labelOf(a), hint: 'In this thread', icon: <AgentTile name={a} size={24} /> })),
-    ...outside.map((a) => ({ value: a, label: labelOf(a), hint: 'Add to this thread', icon: <AgentTile name={a} size={24} /> })),
-  ];
+  const option = (a: string, where: string) => {
+    const r = reach(a);
+    return { value: a, label: labelOf(a), hint: where + ' · ' + r.text, dim: r.offline, icon: <AgentTile name={a} size={24} /> };
+  };
+  const options = [...members.map((a) => option(a, 'In this thread')), ...outside.map((a) => option(a, 'Add to this thread'))];
   let hint = 'It goes to ' + labelOf(to) + (replyTo ? ', answering that message.' : ' in this thread.');
   if (joining) hint = labelOf(to) + ' joins this thread with this message, and can read everything said in it so far.';
+  if (reach(to).offline) hint += ' ' + labelOf(to) + " has no session open, so it waits until one starts.";
+  else if (sessions.length > 1 && session) hint = hint.replace(labelOf(to), labelOf(to) + ' · ' + (session.name || 'session ' + session.id.slice(0, 8)));
 
   return (
     <form className="chat-compose" onSubmit={submit} noValidate aria-label={'Write to ' + labelOf(to)}>
@@ -505,6 +540,26 @@ function Composer({
       <div className="chat-compose-to">
         <span id="compose-to-label">To</span>
         <Select id="compose-to" labelledBy="compose-to-label" value={to} onChange={pick} options={options} placement="up" />
+        {sessions.length > 1 && session && (
+          <>
+            <span id="compose-session-label" className="visually-hidden">
+              Session of {labelOf(to)}
+            </span>
+            <Select
+              id="compose-session"
+              labelledBy="compose-session-label"
+              value={session.id}
+              onChange={setPickedSession}
+              placement="up"
+              options={sessions.map((s) => ({
+                value: s.id,
+                // Two sessions can share a name, such as two windows in one folder; their ids tell them apart.
+                label: !s.name ? 'Session ' + s.id.slice(0, 8) : sessions.filter((x) => x.name === s.name).length > 1 ? s.name + ' · ' + s.id.slice(0, 8) : s.name,
+                hint: [s.id === auto?.id ? (pinned === s.id ? 'talking with you' : 'default') : '', s.state, s.branch, homePath(s.cwd)].filter(Boolean).join(' · '),
+              }))}
+            />
+          </>
+        )}
       </div>
       <div className="chat-compose-row">
         {suggestions.length > 0 && (
@@ -515,7 +570,7 @@ function Composer({
                 id={'compose-mention-' + i}
                 role="option"
                 aria-selected={i === current}
-                className={'dd-option' + (i === current ? ' is-active' : '')}
+                className={'dd-option' + (i === current ? ' is-active' : '') + (reach(a).offline ? ' is-dim' : '')}
                 onPointerDown={(e) => e.preventDefault()}
                 onPointerMove={() => i !== current && setActive(i)}
                 onClick={() => choose(a)}
@@ -527,7 +582,7 @@ function Composer({
                   <span className="dd-text">
                     <span className="dd-label">{labelOf(a)}</span>
                     <span className="dd-hint">
-                      @{a} · {members.includes(a) ? 'In this thread' : 'Add to this thread'}
+                      @{a} · {members.includes(a) ? 'In this thread' : 'Add to this thread'} · {reach(a).text}
                     </span>
                   </span>
                 </span>
@@ -552,7 +607,7 @@ function Composer({
           aria-autocomplete="list"
           aria-controls={suggestions.length ? 'compose-mentions' : undefined}
           aria-activedescendant={suggestions.length ? 'compose-mention-' + current : undefined}
-          placeholder={'Write to ' + labelOf(to) + '… (@name picks someone else)'}
+          placeholder={'Write to ' + labelOf(to) + '…'}
           aria-invalid={error ? true : undefined}
           aria-describedby={(error ? 'compose-error ' : '') + 'compose-hint'}
         />
@@ -562,7 +617,7 @@ function Composer({
       </div>
       <span id="compose-hint" className="chat-compose-hint">
         {unknown ? 'No agent called ' + unknown + ', so it still goes to ' + labelOf(to) + '. ' : ''}
-        {hint} Enter sends, Shift+Enter starts a new line.
+        {hint} Enter sends, Shift+Enter starts a new line, @name picks someone else.
       </span>
     </form>
   );

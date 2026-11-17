@@ -320,7 +320,11 @@
 .chat-compose-text { flex: 1 1 auto; min-height: 48px; max-height: 180px; resize: none; overflow-y: auto; }
 .chat-compose-row > button { flex: none; min-height: 48px; }
 .chat-compose-to { display: flex; align-items: center; gap: 10px; font-family: var(--font-mono); font-size: 13px; font-weight: 500; }
-.chat-compose-to > div { flex: 1 1 auto; min-width: 0; }
+.chat-compose-to > div { flex: 1 1 220px; min-width: 0; }
+/* The session picker sits beside To, and drops below it on a narrow screen. */
+.chat-compose-to { flex-wrap: wrap; }
+.chat-compose-to > .dd ~ .dd { flex: 0 1 260px; min-width: 180px; }
+@media (max-width: 560px) { .chat-compose-to > .dd ~ .dd { flex: 1 1 100%; margin-left: 28px; } }
 .chat-compose-hint { font-family: var(--font-mono); font-size: 12px; color: var(--ink-muted); }
 .chat-compose-error { margin: 0; font-size: 13px; color: var(--danger); font-weight: 500; overflow-wrap: anywhere; }
 .chat-compose-note { flex: none; margin: 0; padding: 12px 20px 16px; border-top: 1px solid var(--divider); font-size: 14px; color: var(--ink-muted); }

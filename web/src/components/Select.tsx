@@ -7,6 +7,8 @@ export interface SelectOption {
   hint?: string;
   /** Drawn before the label, such as an agent's tile. Decorative. */
   icon?: ReactNode;
+  /** Shown faded, for a choice that's available but not right now, such as an agent with nothing running. */
+  dim?: boolean;
 }
 
 interface Props {
@@ -149,7 +151,7 @@ export function Select({ id, labelledBy, value, options, onChange, placeholder =
             data-index={i}
             role="option"
             aria-selected={i === current}
-            className={'dd-option' + (i === active ? ' is-active' : '')}
+            className={'dd-option' + (i === active ? ' is-active' : '') + (o.dim ? ' is-dim' : '')}
             onPointerMove={() => i !== active && setActive(i)}
             onPointerDown={(e) => e.preventDefault()}
             onClick={() => pick(i)}
@@ -167,7 +169,7 @@ export function Select({ id, labelledBy, value, options, onChange, placeholder =
 
 function Choice({ option }: { option: SelectOption }) {
   return (
-    <span className="dd-choice">
+    <span className={'dd-choice' + (option.dim ? ' is-dim' : '')}>
       {option.icon && <span className="dd-icon">{option.icon}</span>}
       <span className="dd-text">
         <span className="dd-label">{option.label}</span>

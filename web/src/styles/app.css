@@ -304,6 +304,9 @@ a:focus-visible, button:focus-visible, select:focus-visible, textarea:focus-visi
 @keyframes dd-up-in { from { opacity: 0; transform: translateY(4px); } }
 .dd-option { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 6px 10px; border-radius: var(--radius-sm); cursor: pointer; }
 .dd-option.is-active { background: var(--bubble-in); }
+/* Available, but not right now: an agent with nothing running. The hint stays readable. */
+.is-dim .dd-icon { opacity: 0.45; filter: grayscale(0.6); }
+.is-dim .dd-label { color: var(--ink-muted); }
 .dd-check { flex: none; color: var(--accent); visibility: hidden; }
 .dd-option[aria-selected="true"] .dd-check { visibility: visible; }
 .dd-option[aria-selected="true"] .dd-label { color: var(--accent); }
