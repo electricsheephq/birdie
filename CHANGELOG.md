@@ -85,12 +85,13 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   follow-up from before the upgrade if the database was written by v0.4.0 or
   later (earlier versions didn't record which session took a message). A
   session that waits on the thread still takes it (#30).
-- A `thread_id`-only follow-up from someone the recipient's sessions didn't
-  talk with in that thread now goes to the session the recipient last sent
+- A `thread_id`-only follow-up from someone the recipient never exchanged a
+  message with in that thread now goes to the session the recipient last sent
   from, or took a message with, there. Before, it was queued for no session:
   `claude` got it only from a session waiting on the thread or a reader
   without one, and an agent that picks its own session gave it to its newest
-  conversation, often an unrelated one. If the recipient last took part
-  without a session, the follow-up still waits for a reader without one. If
-  that session has stopped, the follow-up is held for it like an answer, and
-  its sender is told (#29).
+  conversation, often an unrelated one. A follow-up from someone the
+  recipient did exchange messages with goes where it went before. If the
+  recipient last took part without a session, the follow-up stays for no
+  session, as before. If that session has stopped, the follow-up is held for
+  it like an answer, and its sender is told (#29).

@@ -142,10 +142,36 @@ func TestAThirdPartysFollowUpForAStoppedSessionIsHeld(t *testing.T) {
 	}
 }
 
-// When the recipient last took part without a session, a follow-up waits for
-// a reader that isn't a session, as before, rather than going to a session
-// that took part earlier.
+// When the recipient last took part without a session, with the sender or
+// with anyone else, a follow-up waits for a reader that isn't a session, as
+// before, rather than going to a session that took part earlier.
 func TestAFollowUpAfterTakingPartWithoutASessionWaitsForAReaderWithoutOne(t *testing.T) {
+	ctx := context.Background()
+	for _, asked := range []string{"bot", "carol"} {
+		t.Run("asked "+asked, func(t *testing.T) {
+			b, st := newBus(t)
+			for _, n := range []string{"bot", "carol", "claude"} {
+				addAgent(t, st, n, nil)
+			}
+			report(t, b, "claude", "s1", "one", bus.TierPush, time.Now())
+			thread := threadWithS1(t, b, "claude", "took")
+			if _, err := b.Send(ctx, "claude", bus.SendInput{To: asked, ThreadID: thread, Content: "asked without a session"}); err != nil {
+				t.Fatal(err)
+			}
+			f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: thread, Content: "follow-up"})
+			if err != nil || f.ToSession != "" {
+				t.Fatalf("follow-up: to_session %q, err %v; want none", f.ToSession, err)
+			}
+			if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Thread: thread}); err != nil || len(got) != 1 || got[0].ID != f.ID {
+				t.Fatalf("a reader without a session: %+v, %v", got, err)
+			}
+		})
+	}
+}
+
+// A session that writes to its own agent in the thread isn't handed its
+// message back.
+func TestAFollowUpToItselfDoesntComeBackToTheSender(t *testing.T) {
 	ctx := context.Background()
 	b, st := newBus(t)
 	for _, n := range []string{"bot", "carol", "claude"} {
@@ -153,15 +179,9 @@ func TestAFollowUpAfterTakingPartWithoutASessionWaitsForAReaderWithoutOne(t *tes
 	}
 	report(t, b, "claude", "s1", "one", bus.TierPush, time.Now())
 	thread := threadWithS1(t, b, "claude", "took")
-	if _, err := b.Send(ctx, "claude", bus.SendInput{To: "bot", ThreadID: thread, Content: "asked without a session"}); err != nil {
-		t.Fatal(err)
-	}
-	f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: thread, Content: "follow-up"})
-	if err != nil || f.ToSession != "" {
-		t.Fatalf("follow-up: to_session %q, err %v; want none", f.ToSession, err)
-	}
-	if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Thread: thread}); err != nil || len(got) != 1 || got[0].ID != f.ID {
-		t.Fatalf("a reader without a session: %+v, %v", got, err)
+	f, err := b.Send(ctx, "claude", bus.SendInput{To: "claude", FromSession: "s1", ThreadID: thread, Content: "for another session"})
+	if err != nil || f.ToSession == "s1" {
+		t.Fatalf("note to itself: to_session %q, err %v; want not s1", f.ToSession, err)
 	}
 }
 
