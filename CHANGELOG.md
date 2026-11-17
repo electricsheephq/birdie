@@ -21,11 +21,10 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 - **Expect one burst of notices on first start.** Messages held for a session
   that stopped more than 7 days ago (`serve --hold-for`) expire, and each
   sender is told once. Mail sent to bare `claude` before the upgrade, in a
-  thread `claude` never spoke in or took a message in, is held too: its
+  thread `claude` never spoke in or read without a session, is held too: its
   sender is told, and it expires 7 days after that unless you choose a
-  default or turn fallback on first, which lets a session take it. Bare mail
-  in a thread a `claude` session already took part in isn't covered yet
-  (#27).
+  default or turn fallback on first, which lets a session take it (#24,
+  #30).
 - **The database gains two columns on start:** `messages.held_at` and
   `sessions.pull_only`, both 0 by default.
 - **Rolling back:** the bbcdfcc binary runs on the upgraded database and
@@ -79,6 +78,11 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   spoke in or took a message in, is no longer stranded. Its sender is told it
   is held, and it expires after the hold time, counted from then (#24).
   Answers to what `claude` asked without a session, and follow-ups a reader
-  without a session can take, are left as they are. One case is still open:
-  a pre-upgrade follow-up in a thread a `claude` session took. Plain
-  `check_inbox` doesn't take it, and its sender isn't told (#27).
+  without a session can take, are left as they are.
+- Mail for no session in a thread a `claude` session took a message in, and
+  `claude` hasn't spoken in, is held the same way once it has waited 2
+  minutes, and its sender is told. That covers a third party's follow-up in a
+  multi-party thread, and a bare follow-up from before the upgrade if the
+  database was written by v0.4.0 or later (earlier versions didn't record
+  which session took a message). A session that waits on the thread still
+  takes it (#30).

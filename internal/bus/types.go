@@ -337,10 +337,13 @@ type Deliverer interface {
 type HoldQuery struct {
 	// Unrouted lists agents that require a session but have no live default.
 	// With Lapsed, their mail for no session counts as held too, in threads
-	// they haven't spoken or taken a message in: new conversations queued
-	// before sessions were required, which no session takes now. SettleHeld
-	// checks again that no default is live and fallback is off.
+	// they haven't spoken in or taken a message in without a session: no
+	// session takes it unless one waits on the thread. SettleHeld checks
+	// again that no default is live and fallback is off.
 	Unrouted []string
+	// UnpinnedBefore, if set, holds such mail only once it was sent before
+	// this, so a session already waiting on its thread takes it first.
+	UnpinnedBefore time.Time
 	// Expire picks messages to expire: held since before Before, counted from
 	// when they were sent or their session stopped, whichever is later; mail
 	// for no session counts from when its sender was told it is held.

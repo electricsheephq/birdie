@@ -69,9 +69,13 @@ type Bus struct {
 	// machine wakes, before it takes a session it hasn't heard from as
 	// stopped or expires anything: SessionTTL, long enough for every running
 	// session to report. Negative means not at all.
-	QuietFor   time.Duration
-	listening  atomic.Pointer[listening]
-	lastExpire time.Time
+	QuietFor time.Duration
+	// UnpinnedGrace overrides how long mail for no session, for an agent that
+	// needs one, waits before it counts as held: DefaultUnpinnedGrace, so a
+	// session waiting on its thread takes it first. Negative means none.
+	UnpinnedGrace time.Duration
+	listening     atomic.Pointer[listening]
+	lastExpire    time.Time
 
 	mu      sync.Mutex
 	waiters map[string]map[chan struct{}]struct{}
@@ -318,6 +322,19 @@ func (b *Bus) EndSession(ctx context.Context, agent, id string) error {
 	return nil
 }
 
+// DefaultUnpinnedGrace is several of wait_for_reply's thread checks.
+const DefaultUnpinnedGrace = 2 * time.Minute
+
+func (b *Bus) unpinnedBefore(now time.Time) time.Time {
+	switch {
+	case b.UnpinnedGrace < 0:
+		return now
+	case b.UnpinnedGrace > 0:
+		return now.Add(-b.UnpinnedGrace)
+	}
+	return now.Add(-DefaultUnpinnedGrace)
+}
+
 func (b *Bus) holdFor() time.Duration {
 	if b.HoldFor > 0 {
 		return b.HoldFor
@@ -371,7 +388,7 @@ func (b *Bus) quietSince(l *listening, now time.Time) bool {
 // too, not only those that closed.
 func (b *Bus) noticeHeld(ctx context.Context, lapsed bool) {
 	now := time.Now()
-	b.settleHeld(ctx, HoldQuery{Lapsed: lapsed && !b.quiet(now), LiveSince: now.Add(-SessionTTL), Now: now, Limit: inboxBatch})
+	b.settleHeld(ctx, HoldQuery{Lapsed: lapsed && !b.quiet(now), LiveSince: now.Add(-SessionTTL), UnpinnedBefore: b.unpinnedBefore(now), Now: now, Limit: inboxBatch})
 }
 
 // expireHeld expires messages held longer than HoldFor for a session that
@@ -381,7 +398,7 @@ func (b *Bus) expireHeld(ctx context.Context) {
 	if b.quiet(now) {
 		return
 	}
-	b.settleHeld(ctx, HoldQuery{Expire: true, Lapsed: true, LiveSince: now.Add(-SessionTTL), Before: now.Add(-b.holdFor()), Now: now, Limit: inboxBatch})
+	b.settleHeld(ctx, HoldQuery{Expire: true, Lapsed: true, LiveSince: now.Add(-SessionTTL), UnpinnedBefore: b.unpinnedBefore(now), Before: now.Add(-b.holdFor()), Now: now, Limit: inboxBatch})
 }
 
 func (b *Bus) settleHeld(ctx context.Context, q HoldQuery) {
