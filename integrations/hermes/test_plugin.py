@@ -321,6 +321,44 @@ class PluginTest(PluginCase):
         self.assertTrue(wait_until(lambda: len(ctx.injected) >= 2), "the refused message wasn't delivered")
         self.assertIn("refused", ctx.injected[-1][1])
 
+    def test_a_closed_copy_doesnt_report_over_the_next_one(self):
+        # A reload: the old copy's delivery poll can still be waiting at the bus
+        # when the new copy starts, and both copies use the same session id.
+        self.write_config(True)
+        old_ctx, old = self.load()
+        self.turn(old_ctx)
+        conversation = old.conversation("s1")
+        old.close()
+        ctx, _ = self.load()
+        self.turn(ctx)
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "after the reload"})
+        self.assertTrue(wait_until(lambda: ctx.injected), "the new copy didn't get the message")
+        # As if the old copy's poll had taken it: it gives it back and reports nothing.
+        old.deliver(conversation, {"id": sent["id"], "thread_id": sent["thread_id"], "from": "peer",
+                                   "content": "after the reload"})
+        self.assertEqual(old_ctx.injected, [])
+        self.assertEqual(self.sessions()[0]["tier"], "push", "the closed copy reported over the live one")
+
+    def test_an_unloaded_copys_turn_doesnt_report_over_the_next_one(self):
+        self.write_config(True)
+        old_ctx, old = self.load(inject=False)  # it would report pull
+        self.turn(old_ctx)
+        old.close()
+        ctx, _ = self.load()
+        self.turn(ctx)
+        self.turn(old_ctx)  # Hermes calling a hook of the copy it unloaded
+        self.assertEqual(self.sessions()[0]["tier"], "push", "the unloaded copy reported over the live one")
+
+    def test_an_ended_conversation_isnt_brought_back(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        self.turn(ctx)
+        conversation = network.conversation("s1")
+        ctx.hooks["on_session_finalize"](session_id="s1")
+        self.assertEqual(self.sessions(), [])
+        network.report(conversation)  # a late report, e.g. from its delivery poll
+        self.assertEqual(self.sessions(), [], "the ended session came back")
+
     def test_turning_wake_off_applies_while_idle(self):
         self.write_config(True)
         ctx, _ = self.load()

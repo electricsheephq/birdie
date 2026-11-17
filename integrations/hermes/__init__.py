@@ -344,6 +344,11 @@ class Network:
             return conversation
 
     def report(self, conversation):
+        if conversation.closed.is_set() or self.closed.is_set():
+            # An ended conversation, or a copy Hermes has unloaded, speaks for
+            # nothing: its session id may belong to the next copy already, and
+            # reporting would bring an ended session back.
+            return
         reply = self.bus.call("PUT", "/v1/sessions/" + urllib.parse.quote(conversation.id, safe=""), {
             "name": conversation.name, "cwd": conversation.cwd,
             "tier": "push" if conversation.wake else "pull", "active_at": conversation.active_at,
