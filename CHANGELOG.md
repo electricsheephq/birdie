@@ -58,7 +58,7 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   alerts on Vite's dev server. One build-time picomatch advisory has no fix
   yet. Building it needs Node.js 22.12 or later. The app looks and works the
   same, and it now targets browsers from Chrome 111, Firefox 114 and
-  Safari 16.4 on.
+  Safari 16.4 on (#36).
 
 ### Fixed
 
