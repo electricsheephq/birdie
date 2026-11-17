@@ -321,6 +321,25 @@ class PluginTest(PluginCase):
         self.assertTrue(wait_until(lambda: len(ctx.injected) >= 2), "the refused message wasn't delivered")
         self.assertIn("refused", ctx.injected[-1][1])
 
+    def test_a_closed_copy_doesnt_report_over_the_next_one(self):
+        # A reload: the old copy's delivery poll can still be waiting at the bus
+        # when the new copy starts, and both copies use the same session id.
+        self.write_config(True)
+        old_ctx, old = self.load()
+        self.turn(old_ctx)
+        conversation = old.conversation("s1")
+        self.assertTrue(wait_until(lambda: conversation.poller is not None and conversation.poller.is_alive()))
+        time.sleep(0.5)  # its poll is waiting at the bus
+        old.close()
+        ctx, _ = self.load()
+        self.turn(ctx)
+        self.assertEqual(self.sessions()[0]["tier"], "push")
+        peer("POST", "/v1/messages", {"to": "hermes", "content": "after the reload"})
+        self.assertTrue(wait_until(lambda: ctx.injected), "the new copy didn't get the message")
+        self.assertEqual(old_ctx.injected, [])
+        self.assertFalse(wait_until(lambda: self.sessions()[0]["tier"] != "push", seconds=2),
+                         "the closed copy reported over the live one")
+
     def test_turning_wake_off_applies_while_idle(self):
         self.write_config(True)
         ctx, _ = self.load()
