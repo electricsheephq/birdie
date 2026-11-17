@@ -1,5 +1,6 @@
 """Tests the Hermes plugin against a real bus and a stand-in for Hermes's plugin
 context. `go test ./cmd/birdie` runs this; no Hermes or model is needed."""
+import copy
 import importlib.util
 import json
 import os
@@ -570,6 +571,77 @@ class PluginTest(unittest.TestCase):
         ctx, _ = self.load()
         self.turn(ctx)
         self.assertIn("error", json.loads(self.call(ctx, "birdie_send_message", {})))
+
+
+class EventContext(Context):
+    """Hermes's per-profile plugin event bus: emit publishes under this plugin's id,
+    and payloads are deep-copied, as Hermes delivers them."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.emitted = []
+        self.subscriptions = {}
+
+    def emit(self, event, payload):
+        self.emitted.append((event, copy.deepcopy(payload)))
+
+    def subscribe(self, event, callback):
+        self.subscriptions.setdefault(event, []).append(callback)
+
+
+class Heartbeat2NotifierTest(PluginTest):
+    def load_with_events(self):
+        ctx = EventContext()
+        plugin.register(ctx)
+        self.networks.append(ctx.unload.__self__)
+        return ctx
+
+    def test_heartbeat2_is_offered_a_notifier_that_queues_mail(self):
+        ctx = self.load_with_events()
+        self.assertEqual(len(ctx.emitted), 1)
+        event, offer = ctx.emitted[0]
+        self.assertEqual(event, plugin.HEARTBEAT2_NOTIFIER)
+        self.assertEqual(offer["version"], 1)
+        self.assertIsInstance(offer["registered_at"], int)
+        self.assertNotIn("withdrawn", offer)
+        result = offer["send"]("peer", "HeartBeat: 'standup' is waiting in the Desktop app.")
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["message_id"].startswith("msg_"))
+        self.assertEqual(result["status"], "queued")
+        self.assertIsNone(result["error"])
+        got = peer_inbox(wait=2)
+        self.assertEqual([(m["from"], m["content"], (m.get("meta") or {}).get("source")) for m in got],
+                         [("hermes", "HeartBeat: 'standup' is waiting in the Desktop app.", "heartbeat2")])
+
+    def test_heartbeat2_asking_again_gets_the_same_offer_and_unload_withdraws_it(self):
+        ctx = self.load_with_events()
+        stamp = ctx.emitted[0][1]["registered_at"]
+        for callback in ctx.subscriptions[plugin.HEARTBEAT2_WANTED]:
+            callback(version=1)
+        self.assertEqual(len(ctx.emitted), 2)
+        self.assertEqual(ctx.emitted[1][1]["registered_at"], stamp)
+        ctx.unload()
+        event, withdrawn = ctx.emitted[-1]
+        self.assertEqual((event, withdrawn), (plugin.HEARTBEAT2_NOTIFIER,
+                                              {"version": 1, "registered_at": stamp, "withdrawn": True}))
+        # A withdrawn copy doesn't answer heartbeat2 any more.
+        for callback in ctx.subscriptions[plugin.HEARTBEAT2_WANTED]:
+            callback(version=1)
+        self.assertEqual(len(ctx.emitted), 3)
+
+    def test_the_notifier_reports_failures_and_never_raises(self):
+        ctx = self.load_with_events()
+        send = ctx.emitted[0][1]["send"]
+        for target, text in (("nobody-by-this-name", "x"), ("", "x"), ("peer", "  "), (None, None)):
+            result = send(target, text)
+            self.assertFalse(result["ok"], (target, result))
+            self.assertIsNone(result["message_id"])
+            self.assertTrue(result["error"])
+        self.assertEqual(peer_inbox(), [])
+
+    def test_without_an_event_bus_nothing_is_offered(self):
+        ctx, _ = self.load()
+        self.assertFalse(hasattr(ctx, "emitted"))
 
 
 if __name__ == "__main__":
