@@ -248,12 +248,13 @@ func (s *Server) handle(ctx context.Context, req request) {
 	// that was cancelled, or cut off because the bridge is stopping, isn't
 	// answered, and gives back what it took.
 	written := s.writeLive(ctx, resp)
+	b := s.newBatch(ctx)
 	for _, m := range taken {
 		if written {
-			s.markShown(m.ID) // if this confirmation is lost, it isn't pushed again
-			s.ack(ctx, m)
+			s.markShown(m.ID) // if this confirmation is lost, it isn't shown again
+			b.ack(m)
 		} else {
-			s.nack(ctx, m)
+			b.nack(m)
 		}
 	}
 }
@@ -470,6 +471,7 @@ func (s *Server) pump(ctx context.Context) {
 		// one, or the bridge can't tell which conversation it serves.
 		var stop error
 		failed, relearn := false, false
+		b := s.newBatch(ctx)
 		for _, m := range msgs {
 			// Checked before each message, not once per batch: /clear can
 			// come while one is being shown.
@@ -477,13 +479,13 @@ func (s *Server) pump(ctx context.Context) {
 				stop = s.check(polled)
 			}
 			if stop != nil {
-				s.nack(ctx, m)
+				b.nack(m)
 				continue
 			}
 			if s.wasPushed(m.ID) {
 				// Shown already, but its confirmation was lost and its lease
 				// ran out: confirm it, and don't show it again.
-				s.ack(ctx, m)
+				b.ack(m)
 				continue
 			}
 			if s.route(m) {
@@ -492,13 +494,13 @@ func (s *Server) pump(ctx context.Context) {
 			if s.pullOnly.Load() {
 				// Taken just before it was made pull-only: back to the queue
 				// for check_inbox.
-				s.nack(ctx, m)
+				b.nack(m)
 				relearn = true
 				continue
 			}
 			if failed {
 				// Back to the queue for the next try, or for check_inbox.
-				s.nack(ctx, m)
+				b.nack(m)
 				continue
 			}
 			if err := s.show(ctx, polled, m); err != nil {
@@ -508,11 +510,11 @@ func (s *Server) pump(ctx context.Context) {
 					s.log.Printf("push %s: %v", m.ID, err)
 					failed = true
 				}
-				s.nack(ctx, m)
+				b.nack(m)
 				continue
 			}
 			s.remember(m)
-			s.ack(ctx, m)
+			b.ack(m)
 		}
 		if relearn {
 			// The bus handed these out, so it may say pull-only is off now:
@@ -617,16 +619,55 @@ func (s *Server) show(ctx context.Context, session string, m bus.Message) error 
 	return err
 }
 
-func (s *Server) ack(ctx context.Context, m bus.Message) {
-	if err := s.c.Ack(context.WithoutCancel(ctx), m.ID); err != nil {
-		s.log.Printf("ack %s: %v", m.ID, err)
+// batch confirms or gives back the messages one claim took. Once a call
+// can't reach the daemon (a timeout or a broken connection, not a refusal),
+// it makes no more for that batch: against a stalled daemon each would wait
+// out its own timeout, so 50 messages could hold the bridge, and its exit,
+// for minutes (#26). A message left alone goes back to the queue when its
+// lease ends, as a nack would send it, and one already shown isn't shown
+// again (wasPushed).
+type batch struct {
+	s       *Server
+	ctx     context.Context
+	stalled bool
+}
+
+func (s *Server) newBatch(ctx context.Context) *batch {
+	// Confirmations go out even while the bridge stops.
+	return &batch{s: s, ctx: context.WithoutCancel(ctx)}
+}
+
+func (b *batch) ack(m bus.Message)  { b.settle(m, "ack", b.s.c.Ack) }
+func (b *batch) nack(m bus.Message) { b.settle(m, "nack", b.s.c.Nack) }
+
+func (b *batch) settle(m bus.Message, verb string, call func(context.Context, string) error) {
+	if b.stalled {
+		return
+	}
+	err := call(b.ctx, m.ID)
+	if err == nil {
+		return
+	}
+	b.s.log.Printf("%s %s: %v", verb, m.ID, err)
+	var refused *client.APIError
+	if !errors.As(err, &refused) {
+		b.stalled = true
+		b.s.log.Printf("birdie isn't answering: the rest of this batch goes back to the queue when its leases end")
 	}
 }
 
-func (s *Server) nack(ctx context.Context, m bus.Message) {
-	if err := s.c.Nack(context.WithoutCancel(ctx), m.ID); err != nil {
-		s.log.Printf("nack %s: %v", m.ID, err)
+// unseen leaves out what this call took that was shown already: its
+// confirmation was lost and its lease ran out, so it came back. It is still
+// confirmed with the rest, so it doesn't come back again.
+func (s *Server) unseen(msgs, took []bus.Message) []bus.Message {
+	out := msgs[:0:0]
+	for _, m := range msgs {
+		if s.wasPushed(m.ID) && slices.ContainsFunc(took, func(t bus.Message) bool { return t.ID == m.ID }) {
+			continue
+		}
+		out = append(out, m)
 	}
+	return out
 }
 
 func (s *Server) remember(m bus.Message) {
