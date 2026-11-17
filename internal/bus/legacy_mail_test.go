@@ -292,3 +292,55 @@ func TestNewMailForNoSessionIsntHeldDuringTheGrace(t *testing.T) {
 		t.Fatalf("after the grace: %+v, %v; want the follow-up held", held, err)
 	}
 }
+
+// The same through the delivery loop with the default grace: a sweep that
+// runs while the follow-up is new tells no one it is held.
+func TestTheSweepGivesNewMailForNoSessionItsGrace(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "carol", nil)
+	addAgent(t, st, "claude", nil)
+	report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
+	first, err := b.Send(ctx, "carol", bus.SendInput{To: "claude/s1", Content: "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range take(t, b, "claude", "s1") {
+		if err := b.Ack(ctx, "claude", m.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := b.Send(ctx, "carol", bus.SendInput{To: "bot", ThreadID: first.ThreadID, Content: "fyi"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: first.ThreadID, Content: "follow-up"}); err != nil {
+		t.Fatal(err)
+	}
+	// Mail for a stopped session: its held notice proves the sweep's notice
+	// pass ran, and that pass also decided on the follow-up.
+	if err := st.InsertMessage(ctx, bus.Message{ID: "sentinel", ThreadID: "sentinel", From: "bot", To: "claude", ToSession: "gone",
+		Content: "for a stopped session", Status: bus.StatusQueued, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	b.HoldFor, b.QuietFor = time.Hour, -1
+	run, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.RunDelivery(run)
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: "sentinel", Wait: 3 * time.Second}); err != nil || len(got) != 1 || got[0].Meta["notice"] != "held" {
+		t.Fatalf("sentinel notice: %+v, %v", got, err)
+	}
+	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: first.ThreadID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range got {
+		if m.From == bus.SystemSender {
+			t.Fatalf("held within the grace: %+v", m)
+		}
+	}
+}
