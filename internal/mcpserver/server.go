@@ -62,9 +62,11 @@ type Server struct {
 
 	// conv numbers the conversation the bridge acts for. It changes with
 	// /clear, not when a stand-in id becomes the real one: that is the same
-	// conversation. convMu keeps it in step with the client's session id.
-	convMu sync.Mutex
-	conv   uint64
+	// conversation. fellBack says the stand-in came back after a real id.
+	// convMu keeps both in step with the client's session id.
+	convMu   sync.Mutex
+	conv     uint64
+	fellBack bool
 
 	pumpOnce sync.Once
 
@@ -395,10 +397,14 @@ func (s *Server) syncSession(ctx context.Context, h Host) {
 	old := s.c.Session()
 	if old != info.ID {
 		s.c.SetSession(info.ID)
-		if old != "" && old != procID() {
-			// A new conversation: what the old one was shown, it wasn't.
+		// A new conversation: what the old one was shown, it wasn't. The
+		// stand-in becoming the real id is the same conversation, unless the
+		// stand-in came back after a real id: then which conversation it
+		// served can't be told, so it counts as new both ways.
+		if old != "" && (old != procID() || s.fellBack) {
 			s.conv++
 		}
+		s.fellBack = info.ID == procID() && old != ""
 	}
 	s.convMu.Unlock()
 	if old != info.ID {
@@ -493,7 +499,7 @@ func (s *Server) pump(ctx context.Context) {
 			// Checked before each message, not once per batch: /clear can
 			// come while one is being shown.
 			if stop == nil {
-				stop = s.check(polled)
+				stop = s.check(polled, pollConv)
 			}
 			if stop != nil {
 				b.nack(m)
@@ -520,7 +526,7 @@ func (s *Server) pump(ctx context.Context) {
 				b.nack(m)
 				continue
 			}
-			if err := s.show(ctx, polled, m); err != nil {
+			if err := s.show(ctx, polled, pollConv, m); err != nil {
 				if errors.Is(err, ErrOtherConversation) || errors.Is(err, errUnsure) {
 					stop = err
 				} else {
@@ -545,7 +551,7 @@ func (s *Server) pump(ctx context.Context) {
 				pause(ctx, 5*time.Second)
 			}
 		}
-		if errors.Is(stop, ErrOtherConversation) || errors.Is(s.check(polled), ErrOtherConversation) {
+		if errors.Is(stop, ErrOtherConversation) || errors.Is(s.check(polled, pollConv), ErrOtherConversation) {
 			// Act for the new conversation before polling again.
 			if h := s.currentHost(); h != nil {
 				s.syncSession(ctx, h)
@@ -578,8 +584,9 @@ const unsureRetry = 500 * time.Millisecond
 // check says whether the bridge still serves conversation session, the one
 // messages were taken for: nil if it does, ErrOtherConversation if it changed
 // (/clear), or errUnsure if the host can't tell right now.
-func (s *Server) check(session string) error {
-	if s.c.Session() != session {
+func (s *Server) check(session string, conv uint64) error {
+	// The number too: the stand-in id can come back as a new conversation.
+	if id, n := s.acting(); id != session || n != conv {
 		return ErrOtherConversation
 	}
 	h := s.currentHost()
@@ -613,7 +620,7 @@ func pause(ctx context.Context, d time.Duration) {
 }
 
 // show puts a message taken for conversation session in front of the model.
-func (s *Server) show(ctx context.Context, session string, m bus.Message) error {
+func (s *Server) show(ctx context.Context, session string, conv uint64, m bus.Message) error {
 	if h := s.currentHost(); h != nil && h.Tier() == bus.TierPush {
 		return h.Push(ctx, session, m)
 	}
@@ -629,7 +636,7 @@ func (s *Server) show(ctx context.Context, session string, m bus.Message) error 
 	// meanwhile, so the conversation is checked holding the output lock.
 	s.outMu.Lock()
 	defer s.outMu.Unlock()
-	if err := s.check(session); err != nil {
+	if err := s.check(session, conv); err != nil {
 		return err
 	}
 	_, err = s.out.Write(append(b, '\n'))

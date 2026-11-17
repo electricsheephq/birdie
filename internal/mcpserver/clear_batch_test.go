@@ -155,13 +155,17 @@ func TestChannelShowOnlyReachesTheConversationItWasTakenFor(t *testing.T) {
 	var out bytes.Buffer
 	srv.out = &out
 	m := bus.Message{ID: "msg_1", ThreadID: "t", From: "peer", Content: "for the old one"}
-	if err := srv.show(context.Background(), "old", m); !errors.Is(err, ErrOtherConversation) {
+	if err := srv.show(context.Background(), "old", srv.convNow(), m); !errors.Is(err, ErrOtherConversation) {
 		t.Fatalf("show for the old conversation: %v", err)
+	}
+	// The same id, but an earlier conversation: the stand-in came back.
+	if err := srv.show(context.Background(), "new", srv.convNow()+1, m); !errors.Is(err, ErrOtherConversation) {
+		t.Fatalf("show for an earlier conversation with the same id: %v", err)
 	}
 	if out.Len() != 0 {
 		t.Fatalf("written: %s", out.String())
 	}
-	if err := srv.show(context.Background(), "new", m); err != nil {
+	if err := srv.show(context.Background(), "new", srv.convNow(), m); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Contains(out.Bytes(), []byte("notifications/claude/channel")) {

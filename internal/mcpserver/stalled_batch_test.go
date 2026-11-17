@@ -326,3 +326,108 @@ func TestAnAnswerIsRecordedForTheConversationThatAsked(t *testing.T) {
 		t.Fatalf("confirmed %v before answering", got)
 	}
 }
+
+// flapHost is a push host whose conversation id changes and that records
+// what it is pushed.
+type flapHost struct {
+	convHost
+	pushed chan string
+}
+
+func (h *flapHost) Tier() string { return bus.TierPush }
+func (h *flapHost) Push(_ context.Context, _ string, m bus.Message) error {
+	h.pushed <- m.ID
+	return nil
+}
+
+// When the stand-in id comes back while the pump waits on a claim, it is a
+// new conversation even though the id is the same: the batch goes back to
+// the queue, and what is shown next counts for the new conversation (#26).
+func TestThePumpFollowsTheStandInComingBackAsANewConversation(t *testing.T) {
+	h := &flapHost{pushed: make(chan string, 4)}
+	h.set(procID())
+	var srv atomic.Pointer[Server]
+	var polls atomic.Int32
+	var mu sync.Mutex
+	nacked := []string{}
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		switch {
+		case r.URL.Path == "/v1/inbox":
+			switch polls.Add(1) {
+			case 1:
+				s := srv.Load()
+				h.set("s1") // the real id arrives while the pump waits
+				s.syncSession(context.Background(), h)
+				h.set(procID()) // and goes: a new conversation
+				s.syncSession(context.Background(), h)
+				fallthrough
+			case 2:
+				io.WriteString(w, `{"messages":[{"id":"m1","thread_id":"t1","from":"bot","content":"hi"}]}`)
+			default:
+				select {
+				case <-r.Context().Done():
+				case <-time.After(50 * time.Millisecond):
+				}
+				io.WriteString(w, `{"messages":[]}`)
+			}
+		case strings.HasSuffix(r.URL.Path, "/nack"):
+			mu.Lock()
+			nacked = append(nacked, strings.Split(r.URL.Path, "/")[3])
+			mu.Unlock()
+			io.WriteString(w, `{}`)
+		default:
+			io.WriteString(w, `{}`)
+		}
+	}))
+	defer api.Close()
+	c := client.New(api.URL, "test-token")
+	c.SetSession(procID())
+	s := New(c, "claude", "test", false, log.New(io.Discard, "", 0))
+	s.host = h
+	srv.Store(s)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.pump(ctx) }()
+	defer func() { cancel(); <-done }()
+	select {
+	case id := <-h.pushed:
+		if id != "m1" {
+			t.Fatalf("pushed %s", id)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("m1 not pushed")
+	}
+	if n := polls.Load(); n < 2 {
+		t.Fatalf("m1 pushed from claim %d; want the second, after the first went back", n)
+	}
+	mu.Lock()
+	gaveBack := slices.Contains(nacked, "m1")
+	mu.Unlock()
+	if !gaveBack {
+		t.Fatal("the first claim of m1 wasn't given back")
+	}
+	if conv := s.convNow(); conv != 1 || !s.shownIn("m1", conv) {
+		t.Fatalf("m1 not recorded as shown in the new conversation (%d)", conv)
+	}
+}
+
+// A real id that follows the stand-in coming back is a new conversation too:
+// the stand-in may have served another one. What was shown under it is shown
+// again, not confirmed unseen (#26).
+func TestARealIDAfterTheStandInCameBackIsANewConversation(t *testing.T) {
+	h := newConvHost("a")
+	s, acked := claims(t, h, []string{"m1", "m1"}, "m1", nil)
+	h.set(procID()) // the registry entry goes: the stand-in comes back
+	if out := ask(s); !strings.Contains(out, `m1`) {
+		t.Fatalf("first answer: %s; want m1", out)
+	}
+	h.set("b") // a real id again, maybe another conversation's
+	answer, taken := fetch(t, s, `{"name":"check_inbox","arguments":{}}`)
+	if !strings.Contains(answer, `m1`) || len(taken) != 1 || taken[0].ID != "m1" {
+		t.Fatalf("check_inbox answer: %s, taken %+v; want m1, to confirm once answered", answer, taken)
+	}
+	if got := acked(); len(got) != 0 {
+		t.Fatalf("confirmed %v before answering", got)
+	}
+}
