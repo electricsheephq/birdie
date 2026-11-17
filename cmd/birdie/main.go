@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net"
@@ -18,13 +19,11 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"text/tabwriter"
 	"time"
 
 	"birdie/internal/adapter"
 	"birdie/internal/bus"
 	"birdie/internal/client"
-	"birdie/internal/httpapi"
 	"birdie/internal/mcpserver"
 	"birdie/internal/store"
 )
@@ -36,6 +35,8 @@ const usage = `birdie — two-way messaging between agents
 Usage:
   birdie serve [--addr 127.0.0.1:7777] [--db PATH] [--public-url URL] [--loop-limit 12]
   birdie onboard [--db PATH] [--url URL]
+  birdie status [--db PATH] [--url URL]
+  birdie ui [--no-open] [--db PATH] [--url URL]
   birdie doctor [--db PATH] [--url URL]
   birdie setup claude|codex|grok|hermes|--all [--as NAME] [--remove] [--dry-run] [--wake]
   birdie setup grok-bot [--webhook URL --auth-file PATH] [--remove] [--dry-run]
@@ -47,11 +48,12 @@ Usage:
   birdie agent list
   birdie agent rm NAME
   birdie agent prompt grok-bot [--save] [--url URL]
-  birdie session list
+  birdie session list [--all]
   birdie session default AGENT [NAME]
   birdie send --as NAME --to AGENT[/SESSION] [--thread ID] [--context TEXT] [--wanted TEXT] MESSAGE
   birdie reply --as NAME MSG_ID MESSAGE
   birdie inbox --as NAME [--wait 30s] [--thread ID]
+  birdie thread THREAD_ID|MSG_ID [--full]
   birdie version
 
 Each agent's token is stored in %s/<name> (mode 0600).
@@ -78,6 +80,12 @@ func main() {
 		err = runMCP(ctx, args)
 	case "onboard":
 		err = onboard(ctx, args)
+	case "status":
+		err = statusCmd(ctx, args)
+	case "ui":
+		err = uiCmd(ctx, args)
+	case "thread":
+		err = threadCmd(ctx, args)
 	case "doctor":
 		err = doctor(ctx, args)
 	case "setup":
@@ -198,7 +206,7 @@ func serve(ctx context.Context, args []string) error {
 
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           httpapi.New(b, logger),
+		Handler:           routes(b, st, logger, *addr),
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      bus.MaxWait + 30*time.Second,
 		IdleTimeout:       2 * time.Minute,
@@ -280,10 +288,14 @@ func session(ctx context.Context, args []string) error {
 		if err := st.SetAgentConfig(ctx, agent, "default_session", name); err != nil {
 			return fmt.Errorf("set default for %q: %w", agent, err)
 		}
+		label := agent
+		if a, err := st.GetAgent(ctx, agent); err == nil {
+			label = a.DisplayName()
+		}
 		if name == "" {
-			fmt.Printf("%s: new conversations go to the most recently active session\n", agent)
+			fmt.Printf("%s: new conversations go to the most recently active session\n", label)
 		} else {
-			fmt.Printf("%s: new conversations go to the session named %s when it's running\n", agent, name)
+			fmt.Printf("%s: new conversations go to the session named %s when it's running\n", label, name)
 		}
 		return nil
 	}, args)
@@ -331,11 +343,21 @@ func reply(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("replied to %s with %s (thread %s)\n", m.To, m.ID, m.ThreadID)
+	fmt.Printf("replied to %s with %s (thread %s)\n", agentLabels(ctx, c).agent(m.To), m.ID, m.ThreadID)
 	if m.Note != "" {
 		fmt.Println(m.Note)
 	}
 	return nil
+}
+
+// agentLabels names the agents the bus knows, by their labels. Agents it
+// can't list are named by what their names stand for.
+func agentLabels(ctx context.Context, c *client.Client) sessionLabels {
+	agents, err := c.Agents(ctx)
+	if err != nil {
+		agents = nil
+	}
+	return labelSessions(agents)
 }
 
 func inbox(ctx context.Context, args []string) error {
@@ -350,8 +372,12 @@ func inbox(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	labels := sessionLabels{}
+	if len(msgs) > 0 {
+		labels = agentLabels(ctx, c)
+	}
 	for _, m := range msgs {
-		fmt.Printf("── %s  from %s  thread %s  %s\n%s\n", m.ID, m.From, m.ThreadID, m.CreatedAt.Local().Format(time.DateTime), m.Content)
+		fmt.Printf("── %s  from %s  thread %s  %s\n%s\n", m.ID, labels.of(m.From, m.FromSession), m.ThreadID, m.CreatedAt.Local().Format(time.DateTime), m.Content)
 	}
 	if len(msgs) == 0 {
 		fmt.Println("(no new messages)")
@@ -361,7 +387,7 @@ func inbox(ctx context.Context, args []string) error {
 
 func agentCmd(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: birdie agent add|list|rm|prompt")
+		return errors.New("usage: birdie agent add|list|label|describe|rm|prompt")
 	}
 	fs := flag.NewFlagSet("agent "+args[0], flag.ContinueOnError)
 	db := fs.String("db", defaultDB(), "SQLite database path")
@@ -369,6 +395,7 @@ func agentCmd(ctx context.Context, args []string) error {
 	authFile := fs.String("auth-file", "", "file holding the webhook's secret")
 	authHeader := fs.String("auth-header", "", "header for the secret (default Authorization: Bearer)")
 	description := fs.String("description", "", "what this agent is for, shown to other agents")
+	label := fs.String("label", "", `its name for people, such as "Claude Code" (default: NAME)`)
 	acpCmd := fs.String("acp", "", `run this ACP agent command for each message (e.g. "grok agent stdio")`)
 	cwd := fs.String("cwd", "", "working directory for the ACP agent (default: home directory)")
 	permission := fs.String("permission", "reject", "ACP tool calls that ask for approval: reject or allow")
@@ -388,22 +415,30 @@ func agentCmd(ctx context.Context, args []string) error {
 
 	switch args[0] {
 	case "list":
-		agents, err := st.ListAgents(ctx)
+		agents, err := bus.New(st, slog.New(slog.NewTextHandler(io.Discard, nil))).Agents(ctx)
 		if err != nil {
 			return err
 		}
-		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "NAME\tDELIVERY\tCREATED\tDESCRIPTION")
-		for _, a := range agents {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", a.Name, a.Delivery, a.CreatedAt.Local().Format(time.DateTime), a.Description)
+		deliveries, err := st.Deliveries(ctx, time.Now().Add(-problemWindow))
+		if err != nil {
+			return err
 		}
-		return tw.Flush()
+		return printAgents(os.Stdout, agents, deliveries, true, time.Now())
 	case "describe":
 		if len(pos) < 2 {
 			return errors.New("usage: birdie agent describe NAME TEXT")
 		}
 		if err := st.SetAgentConfig(ctx, pos[0], "description", strings.Join(pos[1:], " ")); err != nil {
 			return fmt.Errorf("describe %q: %w", pos[0], err)
+		}
+		fmt.Printf("updated %s\n", pos[0])
+		return nil
+	case "label":
+		if len(pos) < 2 {
+			return errors.New("usage: birdie agent label NAME LABEL")
+		}
+		if err := st.SetAgentConfig(ctx, pos[0], "label", strings.Join(pos[1:], " ")); err != nil {
+			return fmt.Errorf("label %q: %w", pos[0], err)
 		}
 		fmt.Printf("updated %s\n", pos[0])
 		return nil
@@ -497,11 +532,14 @@ func agentCmd(ctx context.Context, args []string) error {
 				a.Config["auth_header"] = *authHeader
 			}
 		}
+		if a.Config == nil {
+			a.Config = map[string]string{}
+		}
 		if *description != "" {
-			if a.Config == nil {
-				a.Config = map[string]string{}
-			}
 			a.Config["description"] = *description
+		}
+		if l := strings.TrimSpace(*label); l != "" {
+			a.Config["label"] = l
 		}
 		if err := createAgent(ctx, st, a); err != nil {
 			return err

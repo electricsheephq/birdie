@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
@@ -25,6 +27,9 @@ const (
 	// reported. Sessions report every SessionBeat.
 	SessionTTL  = 90 * time.Second
 	SessionBeat = 30 * time.Second
+	// SessionRetention is how long a session is remembered after it stops.
+	SessionRetention = 24 * time.Hour
+	maxBranchBytes   = 255
 
 	// DefaultLoopLimit messages from one agent to another within LoopWindow
 	// probably means they are stuck answering each other.
@@ -44,6 +49,7 @@ type Bus struct {
 	mu      sync.Mutex
 	waiters map[string]map[chan struct{}]struct{}
 	kick    chan struct{}
+	watch   watchers
 }
 
 func New(s Store, log *slog.Logger, ds ...Deliverer) *Bus {
@@ -86,6 +92,16 @@ func (b *Bus) Authenticate(ctx context.Context, token string) (Agent, error) {
 
 // Agents lists every agent with its running sessions.
 func (b *Bus) Agents(ctx context.Context) ([]Agent, error) {
+	return b.listAgents(ctx, b.Sessions)
+}
+
+// AgentsWithRecentSessions lists every agent with its sessions from the last
+// day, as RecentSessions returns them.
+func (b *Bus) AgentsWithRecentSessions(ctx context.Context) ([]Agent, error) {
+	return b.listAgents(ctx, b.RecentSessions)
+}
+
+func (b *Bus) listAgents(ctx context.Context, sessions func(context.Context, Agent) ([]Session, error)) ([]Agent, error) {
 	agents, err := b.store.ListAgents(ctx)
 	if err != nil {
 		return nil, err
@@ -94,7 +110,7 @@ func (b *Bus) Agents(ctx context.Context) ([]Agent, error) {
 		if agents[i].Delivery != DeliveryPull {
 			continue
 		}
-		if agents[i].Sessions, err = b.Sessions(ctx, agents[i]); err != nil {
+		if agents[i].Sessions, err = sessions(ctx, agents[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -111,6 +127,29 @@ func (b *Bus) Sessions(ctx context.Context, a Agent) ([]Session, error) {
 		d.Default = true
 	}
 	return live, nil
+}
+
+// RecentSessions returns the agent's sessions from the last day: the running
+// ones as Sessions returns them, then the ones that stopped, latest first.
+func (b *Bus) RecentSessions(ctx context.Context, a Agent) ([]Session, error) {
+	now := time.Now()
+	all, err := b.store.RecentSessions(ctx, a.Name, now.Add(-SessionRetention))
+	if err != nil {
+		return nil, err
+	}
+	var live, stopped []Session
+	for _, s := range all {
+		if s.Live(now) {
+			live = append(live, s)
+		} else {
+			stopped = append(stopped, s)
+		}
+	}
+	if d := defaultSession(live, a.Config["default_session"]); d != nil {
+		d.Default = true
+	}
+	slices.SortStableFunc(stopped, func(x, y Session) int { return y.StoppedAt().Compare(x.StoppedAt()) })
+	return append(live, stopped...), nil
 }
 
 // defaultSession picks the session that takes new conversations: the one with
@@ -156,8 +195,18 @@ func (b *Bus) ReportSession(ctx context.Context, agent, id string, in SessionInp
 	default:
 		return fmt.Errorf("%w: bad tier %q", ErrInvalid, in.Tier)
 	}
+	// What a session says about itself only informs people, so anything this
+	// version can't use is dropped rather than refused.
+	switch in.State {
+	case StateBusy, StateIdle, StateWaiting:
+	default:
+		in.State = ""
+	}
+	if len(in.Branch) > maxBranchBytes || strings.ContainsFunc(in.Branch, unicode.IsControl) {
+		in.Branch = ""
+	}
 	now := time.Now().UTC()
-	s := Session{ID: id, Agent: agent, Name: in.Name, Cwd: in.Cwd, Tier: in.Tier, ActiveAt: in.ActiveAt, LastSeen: now}
+	s := Session{ID: id, Agent: agent, Name: in.Name, Cwd: in.Cwd, Branch: in.Branch, Tier: in.Tier, State: in.State, ActiveAt: in.ActiveAt, LastSeen: now}
 	if s.ActiveAt.IsZero() || s.ActiveAt.After(now) {
 		s.ActiveAt = now
 	}
@@ -165,15 +214,18 @@ func (b *Bus) ReportSession(ctx context.Context, agent, id string, in SessionInp
 		return err
 	}
 	b.notify(agent)
+	b.emit(Event{Kind: "session", Type: "reported", Agent: agent, Session: id, Name: s.Name, State: s.State})
 	return nil
 }
 
-// EndSession forgets a session, so waiting messages move on without delay.
+// EndSession records that a session closed, so its waiting messages move on
+// without delay.
 func (b *Bus) EndSession(ctx context.Context, agent, id string) error {
-	if err := b.store.DeleteSession(ctx, agent, id); err != nil {
+	if err := b.store.EndSession(ctx, agent, id, time.Now().UTC()); err != nil {
 		return err
 	}
 	b.notify(agent)
+	b.emit(Event{Kind: "session", Type: "ended", Agent: agent, Session: id})
 	return nil
 }
 
@@ -278,9 +330,12 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	if err := b.store.InsertMessage(ctx, m); err != nil {
 		return Message{}, err
 	}
+	b.emitMessage(StatusQueued, m, "", "")
 	if parent.ID != "" {
 		if err := b.store.MarkReplied(ctx, parent.ID, from); err != nil {
 			b.log.Error("mark replied", "id", parent.ID, "err", err)
+		} else if parent.To == from && parent.Status != StatusFailed {
+			b.emitMessage(StatusReplied, parent, "", "")
 		}
 	}
 	m.Note = b.deliveryNote(ctx, to, m)
@@ -317,6 +372,11 @@ func (b *Bus) ReceiveFor(ctx context.Context, in ReceiveInput) ([]Message, error
 		}
 		if err != nil || len(msgs) > 0 {
 			b.unsubscribe(in.Agent, ch)
+			if err == nil {
+				for _, m := range msgs {
+					b.emitMessage(m.Status, m, in.Session, "")
+				}
+			}
 			return msgs, err
 		}
 		remaining := time.Until(deadline)
@@ -377,7 +437,12 @@ func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput) (ClaimFilter, er
 
 // Ack confirms the agent got a claimed message.
 func (b *Bus) Ack(ctx context.Context, agent, id string) error {
-	_, err := b.store.Settle(ctx, id, agent, true, time.Now())
+	changed, err := b.store.Settle(ctx, id, agent, true, time.Now())
+	if changed {
+		if m, err := b.store.GetMessage(ctx, id); err == nil {
+			b.emitMessage(StatusDelivered, m, "", "")
+		}
+	}
 	return err
 }
 
@@ -424,6 +489,7 @@ func (b *Bus) Notice(ctx context.Context, m Message, kind, text string) error {
 	if err := b.store.InsertMessage(ctx, n); err != nil {
 		return err
 	}
+	b.emitMessage(StatusQueued, n, "", "")
 	b.notify(m.From)
 	select {
 	case b.kick <- struct{}{}:
@@ -480,14 +546,15 @@ func (b *Bus) findSession(ctx context.Context, to Agent, want string) (Session, 
 	return Session{}, fmt.Errorf("%w: %s has %d sessions named %q; use one of %s", ErrInvalid, to.Name, len(match), want, strings.Join(ids, ", "))
 }
 
-// deliveryNote tells the sender when the recipient will see m.
+// deliveryNote tells the sender when the recipient will see m, naming it by
+// its label.
 func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 	switch to.Delivery {
 	case DeliveryPull:
 	case "webhook":
-		return fmt.Sprintf("queued: being sent to %s's webhook; it answers in its own time", to.Name)
+		return fmt.Sprintf("queued: being sent to %s's webhook; it answers in its own time", to.DisplayName())
 	case "acp":
-		return fmt.Sprintf("queued: birdie will start %s for this and post its answer on this thread", to.Name)
+		return fmt.Sprintf("queued: birdie will start %s for this and post its answer on this thread", to.DisplayName())
 	default:
 		return "queued"
 	}
@@ -510,12 +577,12 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 			}
 		}
 		if target == nil {
-			return fmt.Sprintf("queued: %s has no open session; it gets this when it next checks or starts", to.Name)
+			return fmt.Sprintf("queued: %s has no open session; it gets this when it next checks or starts", to.DisplayName())
 		}
 	}
-	name := to.Name
+	name := to.DisplayName()
 	if target.Name != "" {
-		name += "/" + target.Name
+		name += " · " + target.Name
 	}
 	switch target.Tier {
 	case TierPush:
@@ -608,12 +675,16 @@ func (b *Bus) deliverDue(ctx context.Context) {
 		if errors.Is(err, ErrAccepted) {
 			if err := b.store.MarkClaimed(ctx, o.Message.ID); err != nil {
 				b.log.Error("mark claimed", "id", o.Message.ID, "err", err)
+			} else {
+				b.emitMessage(StatusClaimed, o.Message, "", "")
 			}
 			continue
 		}
 		if err == nil {
 			if err := b.store.MarkDelivered(ctx, o.Message.ID, time.Now()); err != nil {
 				b.log.Error("mark delivered", "id", o.Message.ID, "err", err)
+			} else {
+				b.emitMessage(StatusDelivered, o.Message, "", "")
 			}
 			continue
 		}
@@ -621,8 +692,13 @@ func (b *Bus) deliverDue(ctx context.Context) {
 		failed := attempts >= maxAttempts
 		next := time.Now().Add(min(time.Duration(1<<attempts)*time.Second, 5*time.Minute))
 		b.log.Warn("delivery failed", "id", o.Message.ID, "to", o.Agent.Name, "attempt", attempts, "gave_up", failed, "err", err)
-		if err := b.store.RecordFailure(ctx, o.Message.ID, err.Error(), next, failed); err != nil {
+		why := err.Error()
+		if err := b.store.RecordFailure(ctx, o.Message.ID, why, next, failed); err != nil {
 			b.log.Error("record failure", "id", o.Message.ID, "err", err)
+		} else if failed {
+			b.emitMessage(StatusFailed, o.Message, "", why)
+		} else {
+			b.emitMessage("retrying", o.Message, "", why)
 		}
 		if failed {
 			text := fmt.Sprintf("Your message %s to %s could not be delivered after %d attempts: %v", o.Message.ID, o.Agent.Name, attempts, err)

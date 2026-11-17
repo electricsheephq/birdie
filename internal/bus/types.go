@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -45,6 +46,12 @@ const (
 	TierPush = "push" // at once, even if idle
 	TierTurn = "turn" // at its next tool call or end of turn
 	TierPull = "pull" // only when it checks
+
+	// What a session is doing, when its agent says. Most agents don't, and
+	// their sessions have no state.
+	StateBusy    = "busy"    // working on a turn
+	StateIdle    = "idle"    // finished, until its user types again
+	StateWaiting = "waiting" // stopped mid-turn until its user answers, as at a permission prompt
 )
 
 var namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
@@ -60,13 +67,50 @@ type Agent struct {
 	Name string `json:"name"`
 	// Description tells other agents what this agent is for. It is kept in
 	// Config["description"].
-	Description string            `json:"description,omitempty"`
-	TokenHash   string            `json:"-"`
-	Delivery    string            `json:"delivery"`
-	Config      map[string]string `json:"-"`
-	CreatedAt   time.Time         `json:"created_at"`
+	Description string `json:"description,omitempty"`
+	// Label is the agent's name for people, such as "Claude Code" for claude.
+	// It is kept in Config["label"]; see LabelOf.
+	Label     string            `json:"label,omitempty"`
+	TokenHash string            `json:"-"`
+	Delivery  string            `json:"delivery"`
+	Config    map[string]string `json:"-"`
+	CreatedAt time.Time         `json:"created_at"`
 	// Sessions lists the agent's running sessions, when it has any.
 	Sessions []Session `json:"sessions,omitempty"`
+}
+
+// defaultLabels names the agents birdie adds by default, for agents added
+// before birdie saved labels.
+var defaultLabels = map[string]string{
+	"claude":          "Claude Code",
+	"codex":           "Codex",
+	"grok-tui":        "Grok CLI",
+	"grok":            "Grok CLI (headless)",
+	"hermes":          "Hermes",
+	"hermes-headless": "Hermes (headless)",
+	"grok-bot":        "Grok Bot",
+	"me":              "You",
+}
+
+// LabelOf is an agent's name for people: the label saved with it, the label
+// of its default name, or else the name itself.
+func LabelOf(name string, config map[string]string) string {
+	if l := strings.TrimSpace(config["label"]); l != "" {
+		return l
+	}
+	if l, ok := defaultLabels[name]; ok {
+		return l
+	}
+	return name
+}
+
+// DisplayName is the agent's label, worked out from its name and config when
+// it wasn't loaded from the store.
+func (a Agent) DisplayName() string {
+	if a.Label != "" {
+		return a.Label
+	}
+	return LabelOf(a.Name, a.Config)
 }
 
 // Session is one running conversation of an agent, such as one open Claude
@@ -77,19 +121,44 @@ type Session struct {
 	// Name is how other agents address it: agent/name.
 	Name string `json:"name,omitempty"`
 	Cwd  string `json:"cwd,omitempty"`
-	Tier string `json:"tier"`
+	// Branch is the git branch checked out in Cwd, or the commit when no
+	// branch is.
+	Branch string `json:"branch,omitempty"`
+	Tier   string `json:"tier"`
+	// State is StateBusy, StateIdle or StateWaiting, or empty when its agent
+	// doesn't say.
+	State string `json:"state,omitempty"`
 	// Default marks the session that takes new conversations.
 	Default bool `json:"default,omitempty"`
-	// ActiveAt is when its user or model last did something.
+	// ActiveAt is when its user or model last did something. While it is idle
+	// or waiting, that is when it stopped.
 	ActiveAt time.Time `json:"active_at"`
 	LastSeen time.Time `json:"last_seen"`
+	// EndedAt is when it said it was closing.
+	EndedAt time.Time `json:"ended_at,omitzero"`
+}
+
+// Live reports whether the session counts as running at now.
+func (s Session) Live(now time.Time) bool {
+	return s.EndedAt.IsZero() && !s.LastSeen.Before(now.Add(-SessionTTL))
+}
+
+// StoppedAt is when a session that isn't running stopped: when it closed, or
+// when it last reported.
+func (s Session) StoppedAt() time.Time {
+	if !s.EndedAt.IsZero() {
+		return s.EndedAt
+	}
+	return s.LastSeen
 }
 
 // SessionInput is what a session reports about itself.
 type SessionInput struct {
 	Name     string    `json:"name,omitempty"`
 	Cwd      string    `json:"cwd,omitempty"`
+	Branch   string    `json:"branch,omitempty"`
 	Tier     string    `json:"tier,omitempty"`
+	State    string    `json:"state,omitempty"`
 	ActiveAt time.Time `json:"active_at,omitzero"`
 }
 
@@ -190,10 +259,17 @@ type Store interface {
 	// stopped.
 	ReleaseOutbound(ctx context.Context) error
 
+	// UpsertSession records a report from a running session.
 	UpsertSession(ctx context.Context, s Session) error
-	DeleteSession(ctx context.Context, agent, id string) error
-	// LiveSessions returns the agent's sessions seen since a time.
+	// EndSession records that a session closed. Until it reports again, it no
+	// longer counts as running.
+	EndSession(ctx context.Context, agent, id string, at time.Time) error
+	// LiveSessions returns the agent's running sessions: seen since a time,
+	// and not closed.
 	LiveSessions(ctx context.Context, agent string, since time.Time) ([]Session, error)
+	// RecentSessions returns the agent's sessions seen since a time, running
+	// or not.
+	RecentSessions(ctx context.Context, agent string, since time.Time) ([]Session, error)
 
 	Close() error
 }
