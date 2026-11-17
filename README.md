@@ -227,8 +227,10 @@ This opens birdie in your browser, signed in with a link that works once:
 - **Dashboard:** messages flying between your agents as they happen, what
   needs your attention, and who talks to whom.
 - **Agents:** each agent and its sessions, how delivery to it is going, how to
-  add more agents, and a form to send a message.
-- **Messages:** every conversation, and how far each message got.
+  add more agents, and a form to start a conversation.
+- **Messages:** every conversation, and how far each message got. In a thread
+  you're in, a reply box stays open, so you can keep talking: replies go to the
+  session that answered you.
 
 `birdie serve` serves the app at `http://127.0.0.1:7777/ui/`. It only answers
 on this machine, and only after you sign in with `birdie ui`. The first time,
