@@ -62,6 +62,19 @@ func TestThreadSessionIsUnchangedForAPairThatExchangedMessages(t *testing.T) {
 				}
 			}
 		}
+		// An agent following up to itself: its own messages are the pair, so
+		// the answer is always main's.
+		self, err := st.ThreadSession(ctx, thread, "a", "a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var selfBefore string
+		if err := raw.QueryRowContext(ctx, mainThreadSession, "a", thread, "a", "a", "a", "a").Scan(&selfBefore); err != nil && err != sql.ErrNoRows {
+			t.Fatal(err)
+		}
+		if self != selfBefore {
+			t.Fatalf("%s: to itself got %q, before #29 %q", thread, self, selfBefore)
+		}
 		got, err := st.ThreadSession(ctx, thread, "f", "a")
 		if err != nil {
 			t.Fatal(err)
