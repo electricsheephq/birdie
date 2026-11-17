@@ -55,8 +55,8 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   rather than given to another. Bare `claude` mail needs a default or
   fallback, as described under Upgrading (#8).
 - The web app is built with Vite 8 (was 5.4), which clears the 18 security
-  alerts on Vite's dev server. One build-time picomatch advisory has no fix
-  yet. Building it needs Node.js 22.12 or later. The app looks and works the
+  alerts on Vite's dev server. One picomatch advisory in Vite's own build
+  and dev server, not in the app, has no fix yet. Building it needs Node.js 22.12 or later. The app looks and works the
   same, and it now targets browsers from Chrome 111, Firefox 114 and
   Safari 16.4 on (#36).
 
