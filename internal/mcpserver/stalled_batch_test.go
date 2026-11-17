@@ -107,10 +107,10 @@ type pullTierHost struct{ *pullOnlyHost }
 
 func (pullTierHost) Tier() string { return bus.TierPull }
 
-// pullAPI hands out m1, which the session was shown before (its
+// claimAPI hands out m1, which the session was shown before (its
 // confirmation was lost and its lease ran out), then m2 on the next claim.
 // It records what is confirmed.
-func pullAPI(t *testing.T) (*Server, func() []string) {
+func claimAPI(t *testing.T, h Host) (*Server, func() []string) {
 	t.Helper()
 	var claims atomic.Int32
 	var mu sync.Mutex
@@ -140,7 +140,7 @@ func pullAPI(t *testing.T) (*Server, func() []string) {
 	c := client.New(api.URL, "test-token")
 	c.SetSession("s1")
 	s := New(c, "claude", "test", false, log.New(io.Discard, "", 0))
-	s.host = pullTierHost{&pullOnlyHost{}}
+	s.host = h
 	s.markShown("m1")
 	return s, func() []string {
 		mu.Lock()
@@ -150,13 +150,19 @@ func pullAPI(t *testing.T) (*Server, func() []string) {
 }
 
 // check_inbox and wait_for_reply don't show again what was shown before.
-// They confirm it and go on waiting for something new (#26).
+// They confirm it and go on waiting for something new (#26). A push
+// session's wait_for_reply checks the thread itself too.
 func TestAPullCallConfirmsWhatItShowedBeforeAndWaitsOn(t *testing.T) {
-	for _, call := range []string{
-		`{"name":"check_inbox","arguments":{"wait_seconds":5}}`,
-		`{"name":"wait_for_reply","arguments":{"thread_id":"t1","timeout_seconds":5}}`,
+	for _, tc := range []struct {
+		call string
+		host Host
+	}{
+		{`{"name":"check_inbox","arguments":{"wait_seconds":5}}`, pullTierHost{&pullOnlyHost{}}},
+		{`{"name":"wait_for_reply","arguments":{"thread_id":"t1","timeout_seconds":5}}`, pullTierHost{&pullOnlyHost{}}},
+		{`{"name":"wait_for_reply","arguments":{"thread_id":"t1","timeout_seconds":5}}`, &pullOnlyHost{}},
 	} {
-		s, acked := pullAPI(t)
+		call := tc.call
+		s, acked := claimAPI(t, tc.host)
 		var taken []bus.Message
 		res, rerr := s.callTool(context.Background(), json.RawMessage(call), &taken)
 		if rerr != nil {

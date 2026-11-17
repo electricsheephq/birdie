@@ -853,8 +853,11 @@ func (s *Server) waitForReply(ctx context.Context, thread string, timeout time.D
 	// thread itself now and then.
 	tick := time.NewTicker(threadCheck)
 	defer tick.Stop()
+	seen := s.newBatch(ctx)
 	for {
 		msgs, err := s.c.Inbox(ctx, thread, 0)
+		// What was shown before is confirmed, and the wait goes on.
+		msgs = s.confirmSeen(seen, msgs)
 		if err == nil && len(msgs) > 0 {
 			// Taken, even if the deadline passed meanwhile: return them, or
 			// they sit leased to this session until the lease ends.

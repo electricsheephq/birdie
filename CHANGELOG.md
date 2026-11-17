@@ -73,7 +73,7 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   10 seconds (#22). Once one of a batch's confirmations can't reach the
   daemon, the bridge stops trying the rest: they go back to the queue when
   their leases end, so a stalled daemon holds a batch, and the bridge's exit,
-  for one deadline instead of one per message. A reply cut off while the
+  for one deadline instead of one per message. A reply that stalls while the
   daemon gives its reason counts as a stall, not a refusal (#26).
 - `check_inbox` and `wait_for_reply` don't show again a message the same
   bridge showed before whose confirmation was lost: they confirm it and go

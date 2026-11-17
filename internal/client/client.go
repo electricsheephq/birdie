@@ -104,8 +104,8 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 			Sessions []bus.SessionRef
 		}
 		if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&e); err != nil {
-			// A stall or a dropped connection while the reason comes in
-			// isn't a refusal, whatever the status said.
+			// A stall while the reason comes in isn't a refusal, whatever
+			// the status said.
 			var netErr net.Error
 			if ctx.Err() != nil || errors.As(err, &netErr) {
 				return fmt.Errorf("%s, and its reason didn't arrive: %w", resp.Status, err)
