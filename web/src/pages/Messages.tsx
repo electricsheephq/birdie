@@ -11,7 +11,7 @@ import { Button } from '../ds';
 import { Loading, Skeleton, Typing } from '../components/Signal';
 import { TilePair } from '../components/TilePair';
 import { ME, agentOf, agentsOf, labelOf, who } from '../lib/agents';
-import { isSystem, mentionIn, takeFocus } from '../lib/compose';
+import { isSystem, mentionIn, mentionQuery, takeFocus } from '../lib/compose';
 import { href } from '../lib/router';
 import { MAX_TRIES, chipFor, errorText, progress, threadChip, troubled } from '../lib/status';
 import { ago, ms, useNow } from '../lib/time';
@@ -350,6 +350,10 @@ function Composer({
   const [said, setSaid] = useState('');
   const mention = useRef('');
   const box = useRef<HTMLTextAreaElement>(null);
+  // Suggestions while you type @name: where the caret is, which one is active, and an @ you closed them for.
+  const [caret, setCaret] = useState(0);
+  const [active, setActive] = useState(0);
+  const [dismissed, setDismissed] = useState(-1);
 
   const known = (a: string) => members.includes(a) || outside.includes(a);
   const to = replyTo ? otherSide(replyTo, me) : known(picked) ? picked : latest || members[0] || '';
@@ -398,8 +402,10 @@ function Composer({
     // A Reply answers one agent; picking another one stops it.
     if (replyTo && otherSide(replyTo, me) !== agent) setReplyTo(null);
   };
-  const change = (v: string) => {
+  const change = (v: string, at = v.length) => {
     setText(v);
+    setCaret(at);
+    setActive(0);
     setError('');
     if (v) drafts.set(threadId, v);
     else drafts.delete(threadId);
@@ -417,9 +423,51 @@ function Composer({
     const parent = replyTo ?? (members.includes(to) ? replyTarget(messages, me, to) : undefined);
     mutation.mutate(parent ? { to, content, in_reply_to: parent.id } : { to, content, thread_id: threadId });
   };
+  const query = mentionQuery(text, caret);
+  const q = query ? query.q.toLowerCase() : '';
+  const suggestions =
+    query && query.start !== dismissed
+      ? [...members, ...outside]
+          .filter((a) => {
+            const label = labelOf(a).toLowerCase();
+            return a.toLowerCase().startsWith(q) || label.replace(/\s+/g, '').startsWith(q) || label.split(/\s+/).some((w) => w.startsWith(q));
+          })
+          .slice(0, 8)
+      : [];
+  const current = Math.min(active, suggestions.length - 1);
+  // Puts "@name " in place of what you typed, and writes to that agent.
+  const choose = (agent: string) => {
+    if (!query) return;
+    const before = text.slice(0, query.start) + '@' + agent + ' ';
+    change(before + text.slice(caret).replace(/^[\p{L}\p{N}._-]*/u, ''), before.length);
+    pick(agent);
+    requestAnimationFrame(() => {
+      box.current?.focus();
+      box.current?.setSelectionRange(before.length, before.length);
+    });
+  };
   const keyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    const composing = e.nativeEvent.isComposing || e.keyCode === 229;
+    if (suggestions.length && !composing) {
+      const n = suggestions.length;
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        setActive((current + (e.key === 'ArrowDown' ? 1 : n - 1)) % n);
+        return;
+      }
+      if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+        e.preventDefault();
+        choose(suggestions[current]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setDismissed(query ? query.start : -1);
+        return;
+      }
+    }
     // Not while an input method is composing a character (Safari reports that as keyCode 229).
-    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) submit(e);
+    if (e.key === 'Enter' && !e.shiftKey && !composing) submit(e);
     else if (e.key === 'Escape' && replyTo) {
       e.preventDefault();
       setReplyTo(null);
@@ -456,9 +504,37 @@ function Composer({
       )}
       <div className="chat-compose-to">
         <span id="compose-to-label">To</span>
-        <Select id="compose-to" labelledBy="compose-to-label" value={to} onChange={pick} options={options} />
+        <Select id="compose-to" labelledBy="compose-to-label" value={to} onChange={pick} options={options} placement="up" />
       </div>
       <div className="chat-compose-row">
+        {suggestions.length > 0 && (
+          <ul id="compose-mentions" role="listbox" aria-label="Agents to write to" className="dd-list mention-list">
+            {suggestions.map((a, i) => (
+              <li
+                key={a}
+                id={'compose-mention-' + i}
+                role="option"
+                aria-selected={i === current}
+                className={'dd-option' + (i === current ? ' is-active' : '')}
+                onPointerDown={(e) => e.preventDefault()}
+                onPointerMove={() => i !== current && setActive(i)}
+                onClick={() => choose(a)}
+              >
+                <span className="dd-choice">
+                  <span className="dd-icon">
+                    <AgentTile name={a} size={24} />
+                  </span>
+                  <span className="dd-text">
+                    <span className="dd-label">{labelOf(a)}</span>
+                    <span className="dd-hint">
+                      @{a} · {members.includes(a) ? 'In this thread' : 'Add to this thread'}
+                    </span>
+                  </span>
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
         <label htmlFor="compose-text" className="visually-hidden">
           Message to {labelOf(to)}
         </label>
@@ -468,8 +544,14 @@ function Composer({
           className="textarea chat-compose-text"
           rows={1}
           value={text}
-          onChange={(e) => change(e.target.value)}
+          onChange={(e) => change(e.target.value, e.target.selectionStart)}
+          onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
+          onBlur={() => setDismissed(query ? query.start : -1)}
+          onFocus={() => setDismissed(-1)}
           onKeyDown={keyDown}
+          aria-autocomplete="list"
+          aria-controls={suggestions.length ? 'compose-mentions' : undefined}
+          aria-activedescendant={suggestions.length ? 'compose-mention-' + current : undefined}
           placeholder={'Write to ' + labelOf(to) + '… (@name picks someone else)'}
           aria-invalid={error ? true : undefined}
           aria-describedby={(error ? 'compose-error ' : '') + 'compose-hint'}

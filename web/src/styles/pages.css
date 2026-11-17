@@ -339,3 +339,6 @@
 .chat-compose-reply-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-compose-reply-cancel { flex: none; width: 32px; height: 32px; border: 0; border-radius: var(--radius-full); background: transparent; color: var(--ink-muted); cursor: pointer; font-size: 14px; }
 .chat-compose-reply-cancel:hover { background: var(--ground); color: var(--ink); }
+/* Suggestions while typing @name open upward, above the reply box. */
+.chat-compose-row { position: relative; }
+.mention-list { top: auto; bottom: calc(100% + 6px); right: auto; width: min(360px, 100%); max-height: min(300px, 45vh); box-shadow: 0 -12px 28px rgb(0 0 0 / 0.14); animation-name: dd-up-in; }

@@ -20,6 +20,12 @@ export function isSystem(agent: string): boolean {
   return agent === 'birdie' || agent === 'agent-bus';
 }
 
+/** The "@name" being typed just before the caret, if any: where its @ is, and what follows it so far. */
+export function mentionQuery(text: string, caret: number): { start: number; q: string } | null {
+  const m = /(^|\s)@([\p{L}\p{N}._-]*)$/u.exec(text.slice(0, caret));
+  return m ? { start: m.index + m[1].length, q: m[2] } : null;
+}
+
 /**
  * The agent a message starting with "@name" is for: its name, or its label
  * without spaces, in any case. Returns '' when there is no mention, and the
