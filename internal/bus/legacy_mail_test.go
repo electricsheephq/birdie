@@ -182,3 +182,64 @@ func TestHeldBareMailRechecksItsRouteWhenSettled(t *testing.T) {
 		})
 	}
 }
+
+// A third party's follow-up in a thread a claude session took is queued for
+// no session (Send pins only follow-ups between the same two agents). Its
+// sender is told it is held, and a session that waits on the thread still
+// takes it. Before the upgrade, a bare follow-up there was queued the same
+// way (#27).
+func TestAFollowUpInAThreadASessionTookIsHeldYetStillTaken(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bot", nil)
+	addAgent(t, st, "carol", nil)
+	addAgent(t, st, "claude", nil)
+	report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
+	first, err := b.Send(ctx, "carol", bus.SendInput{To: "claude/s1", Content: "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range take(t, b, "claude", "s1") {
+		if err := b.Ack(ctx, "claude", m.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := b.Send(ctx, "carol", bus.SendInput{To: "bot", ThreadID: first.ThreadID, Content: "fyi"}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := b.Send(ctx, "bot", bus.SendInput{To: "claude", ThreadID: first.ThreadID, Content: "follow-up"})
+	if err != nil || f.ToSession != "" {
+		t.Fatalf("follow-up: to_session %q, err %v; want queued for no session", f.ToSession, err)
+	}
+	b.HoldFor, b.QuietFor = time.Hour, -1
+	run, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.RunDelivery(run)
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	deadline := time.Now().Add(3 * time.Second)
+	var notice *bus.Message
+	for notice == nil && time.Now().Before(deadline) {
+		got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bot", Thread: first.ThreadID, Wait: time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range got {
+			if got[i].From == bus.SystemSender {
+				notice = &got[i]
+			}
+		}
+	}
+	if notice == nil || notice.Meta["notice"] != "held" || notice.Meta["messages"] != f.ID || !strings.Contains(notice.Content, bus.SessionRequired) {
+		t.Fatalf("held notice: %+v", notice)
+	}
+	if m, err := st.GetMessage(ctx, f.ID); err != nil || m.Status != bus.StatusQueued {
+		t.Fatalf("follow-up status %s, err %v; want queued", m.Status, err)
+	}
+	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s1", Thread: first.ThreadID})
+	if err != nil || len(got) != 1 || got[0].ID != f.ID {
+		t.Fatalf("a session waiting on the thread: %+v, %v", got, err)
+	}
+}
