@@ -71,9 +71,10 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 - Claude Code is recognised when its path has a space, as in the macOS
   desktop app (#4).
 - Runs of dashes in session names collapse to one (#3).
-- After Hermes reloads the birdie plugin, the old copy no longer marks the
-  session pull over the new one, so pushes don't stop until the next turn
-  (#37).
+- When Hermes reloads the birdie plugin, the old copy no longer reports the
+  session. It could show the live session as pull for up to 30 seconds, so
+  senders were told it only gets messages when it checks. A conversation that
+  ended is no longer brought back the same way (#37).
 - The setup and migration tests pass on macOS, and they never touch the real
   config folder (#20).
 - A stalled daemon can't hold up a session's bridge forever: reporting or
