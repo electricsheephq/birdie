@@ -59,7 +59,7 @@ func TestAMessageShownOnceIsntShownAgain(t *testing.T) {
 	h := &recordingHost{pushed: make(chan string, 4)}
 	srv := New(c, "claude", "test", false, log.New(io.Discard, "", 0))
 	srv.host = h
-	srv.remember(again) // shown, and the confirmation lost
+	srv.remember(again, srv.c.Session()) // shown, and the confirmation lost
 	done := make(chan struct{})
 	go func() { defer close(done); srv.pump(ctx) }()
 	defer func() { cancel(); <-done }()
@@ -95,7 +95,7 @@ func TestAMessageShownOnceIsntShownAgain(t *testing.T) {
 func TestTheBridgeRemembersOnlyRecentPushes(t *testing.T) {
 	srv := New(client.New("http://unused", "t"), "claude", "test", false, log.New(io.Discard, "", 0))
 	for i := range maxPushed + 1 {
-		srv.remember(bus.Message{ID: fmt.Sprintf("msg_%d", i), ThreadID: "t"})
+		srv.remember(bus.Message{ID: fmt.Sprintf("msg_%d", i), ThreadID: "t"}, "")
 	}
 	if len(srv.pushed) != maxPushed || len(srv.pushedOrder) != maxPushed || srv.wasPushed("msg_0") || !srv.wasPushed("msg_1") {
 		t.Fatalf("%d remembered; oldest kept: %v", len(srv.pushed), srv.wasPushed("msg_0"))

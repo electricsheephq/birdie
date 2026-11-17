@@ -55,8 +55,9 @@ type Server struct {
 	// wait_for_reply that starts just after doesn't wait for what already came.
 	shown map[string][]bus.Message
 	// pushed holds the ids of the messages shown most recently, oldest
-	// first, so one that comes back is confirmed, not shown again.
-	pushed      map[string]bool
+	// first, with the conversation each was shown in, so one that comes
+	// back is confirmed, not shown again.
+	pushed      map[string]string
 	pushedOrder []string
 
 	pumpOnce sync.Once
@@ -83,7 +84,7 @@ func New(c *client.Client, name, version string, channel bool, logger *log.Logge
 	// it is always taken under a lease, session or not.
 	c.Leased = true
 	return &Server{c: c, name: name, version: version, channel: channel, log: logger,
-		waiters: map[string][]chan bus.Message{}, shown: map[string][]bus.Message{}, pushed: map[string]bool{}, beat: make(chan struct{}, 1),
+		waiters: map[string][]chan bus.Message{}, shown: map[string][]bus.Message{}, pushed: map[string]string{}, beat: make(chan struct{}, 1),
 		calls: map[string]*call{}}
 }
 
@@ -251,7 +252,7 @@ func (s *Server) handle(ctx context.Context, req request) {
 	b := s.newBatch(ctx)
 	for _, m := range taken {
 		if written {
-			s.markShown(m.ID) // if this confirmation is lost, it isn't shown again
+			s.markShown(m.ID, s.c.Session()) // if this confirmation is lost, it isn't shown again
 			b.ack(m)
 		} else {
 			b.nack(m)
@@ -513,7 +514,7 @@ func (s *Server) pump(ctx context.Context) {
 				b.nack(m)
 				continue
 			}
-			s.remember(m)
+			s.remember(m, polled)
 			b.ack(m)
 		}
 		if relearn {
@@ -657,12 +658,12 @@ func (b *batch) settle(m bus.Message, verb string, call func(context.Context, st
 }
 
 // confirmSeen confirms, and leaves out, what a tool call took that was shown
-// before: its confirmation was lost and its lease ran out, so it came back.
-// The push path does the same (#26).
+// before in this conversation: its confirmation was lost and its lease ran
+// out, so it came back. The push path does the same (#26).
 func (s *Server) confirmSeen(b *batch, msgs []bus.Message) []bus.Message {
 	out := msgs[:0:0]
 	for _, m := range msgs {
-		if s.wasPushed(m.ID) {
+		if s.shownHere(m.ID) {
 			b.ack(m)
 			continue
 		}
@@ -671,26 +672,28 @@ func (s *Server) confirmSeen(b *batch, msgs []bus.Message) []bus.Message {
 	return out
 }
 
-func (s *Server) remember(m bus.Message) {
+func (s *Server) remember(m bus.Message, session string) {
 	s.waitMu.Lock()
 	defer s.waitMu.Unlock()
 	if len(s.shown) > 64 {
 		clear(s.shown)
 	}
 	s.shown[m.ThreadID] = append(s.shown[m.ThreadID], m)
-	s.markShownLocked(m.ID)
+	s.markShownLocked(m.ID, session)
 }
 
-// markShown records that a tool call's answer showed the message with id.
-func (s *Server) markShown(id string) {
+// markShown records that a tool call's answer showed the message with id in
+// the conversation session.
+func (s *Server) markShown(id, session string) {
 	s.waitMu.Lock()
 	defer s.waitMu.Unlock()
-	s.markShownLocked(id)
+	s.markShownLocked(id, session)
 }
 
-func (s *Server) markShownLocked(id string) {
-	if !s.pushed[id] {
-		s.pushed[id] = true
+func (s *Server) markShownLocked(id, session string) {
+	_, known := s.pushed[id]
+	s.pushed[id] = session
+	if !known {
 		s.pushedOrder = append(s.pushedOrder, id)
 		if len(s.pushedOrder) > maxPushed {
 			delete(s.pushed, s.pushedOrder[0])
@@ -707,7 +710,18 @@ const maxPushed = 1024
 func (s *Server) wasPushed(id string) bool {
 	s.waitMu.Lock()
 	defer s.waitMu.Unlock()
-	return s.pushed[id]
+	_, ok := s.pushed[id]
+	return ok
+}
+
+// shownHere reports whether the message with id was shown in the
+// conversation the bridge acts for now. One shown before /clear wasn't: the
+// new conversation hasn't seen it.
+func (s *Server) shownHere(id string) bool {
+	s.waitMu.Lock()
+	defer s.waitMu.Unlock()
+	in, ok := s.pushed[id]
+	return ok && in == s.c.Session()
 }
 
 const messageTag = "birdie-message"

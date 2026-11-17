@@ -141,7 +141,7 @@ func claimAPI(t *testing.T, h Host) (*Server, func() []string) {
 	c.SetSession("s1")
 	s := New(c, "claude", "test", false, log.New(io.Discard, "", 0))
 	s.host = h
-	s.markShown("m1")
+	s.markShown("m1", "s1")
 	return s, func() []string {
 		mu.Lock()
 		defer mu.Unlock()
@@ -178,5 +178,24 @@ func TestAPullCallConfirmsWhatItShowedBeforeAndWaitsOn(t *testing.T) {
 		if got := acked(); len(got) != 1 || got[0] != "m1" {
 			t.Fatalf("%s confirmed %v; want m1", call, got)
 		}
+	}
+}
+
+// What an earlier conversation was shown, before /clear, is shown in the new
+// one: the new conversation hasn't seen it (#26).
+func TestAMessageShownBeforeClearIsShownAgainAfterIt(t *testing.T) {
+	s, acked := claimAPI(t, pullTierHost{&pullOnlyHost{}})
+	s.markShown("m1", "s0") // shown in the conversation before /clear
+	var taken []bus.Message
+	res, rerr := s.callTool(context.Background(), json.RawMessage(`{"name":"check_inbox","arguments":{}}`), &taken)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	b, _ := json.Marshal(res)
+	if !strings.Contains(string(b), `m1`) || len(taken) != 1 || taken[0].ID != "m1" {
+		t.Fatalf("check_inbox answer: %s, taken %+v; want m1, to confirm once answered", b, taken)
+	}
+	if got := acked(); len(got) != 0 {
+		t.Fatalf("confirmed %v before answering", got)
 	}
 }
