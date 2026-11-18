@@ -368,6 +368,9 @@ function Composer({
   // A session picked by hand, for an agent with more than one running.
   const [pickedSession, setPickedSession] = useState('');
   const [text, setText] = useState(() => drafts.get(threadId) ?? '');
+  // The box as it is now, for a send that finishes after you've typed more.
+  const latestText = useRef(text);
+  latestText.current = text;
   const [error, setError] = useState('');
   const [said, setSaid] = useState('');
   const mention = useRef('');
@@ -385,6 +388,9 @@ function Composer({
     if (box.current && takeFocus(threadId)) box.current.focus({ preventScroll: true });
   }, [threadId]);
 
+  // A Reply goes to the session of the message it answers, not one picked before it.
+  useEffect(() => setPickedSession(''), [replyTo?.id]);
+
   // Grow with what you write, up to a few lines; then it scrolls.
   useLayoutEffect(() => {
     const el = box.current;
@@ -396,9 +402,6 @@ function Composer({
   const mutation = useMutation({
     mutationFn: api.send,
     onSuccess: (_, input) => {
-      setText('');
-      drafts.delete(threadId);
-      mention.current = '';
       setError('');
       setReplyTo(null);
       setSaid('Sent to ' + labelOf(input.to) + '.');
@@ -407,7 +410,10 @@ function Composer({
       client.invalidateQueries({ queryKey: keys.threads });
       client.invalidateQueries({ queryKey: keys.overview });
     },
-    onError: (err) => {
+    onError: (err, input) => {
+      // The box was cleared when it was sent; put the message back, ahead of anything typed since.
+      const now = latestText.current.trim();
+      change(now ? input.content + '\n\n' + now : input.content);
       setSaid('');
       setError(err instanceof Error ? err.message : String(err));
     },
@@ -420,10 +426,12 @@ function Composer({
 
   // The sessions you can choose between, and the one it would reach on its own:
   // the one in your exchange with that agent here, else the agent's default.
-  const sessions = byName.get(to)?.delivery === 'pull' ? liveSessions(byName.get(to)!) : [];
+  // The overview loads apart from the thread, so the agent may not be known yet.
+  const toAgent = byName.get(to);
+  const sessions = toAgent?.delivery === 'pull' ? liveSessions(toAgent) : [];
   const parent = replyTo ?? (members.includes(to) ? replyTarget(messages, me, to) : undefined);
   const pinned = parent ? (agentOf(parent.from) === to ? parent.from_session : parent.to_session) : '';
-  const auto = sessions.find((s) => s.id === pinned) ?? defaultSession(byName.get(to)!)?.session ?? sessions[0];
+  const auto = sessions.find((s) => s.id === pinned) ?? (toAgent && defaultSession(toAgent)?.session) ?? sessions[0];
   const session = sessions.find((s) => s.id === pickedSession) ?? auto;
 
   const pick = (agent: string) => {
@@ -453,6 +461,10 @@ function Composer({
     if (!content || mutation.isPending) return;
     // Name the session only when you chose one other than where it would go anyway.
     const address = sessions.length > 1 && session && session.id !== auto?.id ? to + '/' + session.id : to;
+    // Empty the box now, so what you type while it's on its way is the next message.
+    setText('');
+    drafts.delete(threadId);
+    mention.current = '';
     mutation.mutate(parent ? { to: address, content, in_reply_to: parent.id } : { to: address, content, thread_id: threadId });
   };
   const query = mentionQuery(text, caret);
