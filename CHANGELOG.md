@@ -47,6 +47,10 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   (#18).
 - CI runs the tests on every pull request. Actions are pinned to commit
   SHAs, and Dependabot is set up (#19, #21).
+- The Hermes plugin offers heartbeat2 a notifier. When heartbeat2 holds a wake
+  because its app window is closed, it can tell someone through birdie
+  (`notify_via: "birdie:<agent>"`). Nothing is sent unless heartbeat2 uses
+  it. The plugin's README describes the handshake (#31).
 
 ### Changed
 
