@@ -255,3 +255,80 @@ func TestAppPagesFallBackToIndex(t *testing.T) {
 		t.Fatalf("csp = %q", csp)
 	}
 }
+
+func TestSendKeepsTheConversationInItsThread(t *testing.T) {
+	r := newRig(t)
+	r.signIn()
+	ctx := context.Background()
+	for _, s := range []struct{ id, name string }{{"s1", "api"}, {"s2", "web"}} {
+		if err := r.b.ReportSession(ctx, "bob", s.id, bus.SessionInput{Name: s.name, Tier: bus.TierPush}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type sendResult struct {
+		ID        string
+		ThreadID  string `json:"thread_id"`
+		ToSession string `json:"to_session"`
+	}
+	send := func(body string, want int) sendResult {
+		t.Helper()
+		resp := r.do("POST", "/ui/api/messages", body, nil)
+		if resp.StatusCode != want {
+			resp.Body.Close()
+			t.Fatalf("send %s: %s, want %d", body, resp.Status, want)
+		}
+		var out sendResult
+		if want == http.StatusCreated {
+			decode(t, resp, &out)
+		} else {
+			resp.Body.Close()
+		}
+		return out
+	}
+
+	first := send(`{"to":"bob/web","content":"first"}`, http.StatusCreated)
+	answer, err := r.b.Send(ctx, "bob", bus.SendInput{InReplyTo: first.ID, Content: "answer", FromSession: "s2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A follow-up to the answer stays in the thread and goes to the session that answered.
+	next := send(`{"to":"bob","content":"follow-up","in_reply_to":"`+answer.ID+`"}`, http.StatusCreated)
+	if next.ThreadID != first.ThreadID || next.ToSession != "s2" {
+		t.Fatalf("follow-up = %+v, want thread %s and session s2", next, first.ThreadID)
+	}
+	// Another one, before bob answers, follows your own message.
+	again := send(`{"to":"bob","content":"and also","in_reply_to":"`+next.ID+`"}`, http.StatusCreated)
+	if again.ThreadID != first.ThreadID || again.ToSession != "s2" {
+		t.Fatalf("second follow-up = %+v", again)
+	}
+	var th struct {
+		Messages []struct{ Content, Status string }
+	}
+	decode(t, r.do("GET", "/ui/api/threads/"+first.ThreadID, "", nil), &th)
+	if len(th.Messages) != 4 || th.Messages[0].Status != bus.StatusReplied {
+		t.Fatalf("thread = %+v", th.Messages)
+	}
+
+	// Writing to an agent that isn't in the thread brings it in.
+	for _, name := range []string{"carol", "dave"} {
+		if err := r.st.CreateAgent(ctx, bus.Agent{Name: name, TokenHash: name, Delivery: bus.DeliveryPull, CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	joined := send(`{"to":"carol","content":"join us","thread_id":"`+first.ThreadID+`"}`, http.StatusCreated)
+	if joined.ThreadID != first.ThreadID {
+		t.Fatalf("carol's message went to thread %s, want %s", joined.ThreadID, first.ThreadID)
+	}
+	if _, err := r.b.Send(ctx, "carol", bus.SendInput{ThreadID: first.ThreadID, To: webui.Me, Content: "here"}); err != nil {
+		t.Fatalf("carol can't post in the thread she joined: %v", err)
+	}
+
+	// The web app can't post into a thread it isn't in.
+	other, err := r.b.Send(ctx, "bob", bus.SendInput{To: "dave", Content: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	send(`{"to":"bob","content":"x","thread_id":"`+other.ThreadID+`"}`, http.StatusForbidden)
+	send(`{"to":"bob","content":"x","in_reply_to":"`+other.ID+`"}`, http.StatusForbidden)
+}

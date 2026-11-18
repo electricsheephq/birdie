@@ -56,10 +56,12 @@ type trackedJSON struct {
 	CreatedAt   time.Time  `json:"created_at"`
 	DeliveredAt *time.Time `json:"delivered_at"`
 	TakenBy     string     `json:"taken_by"`
-	Attempts    int        `json:"attempts"`
-	Error       string     `json:"error"`
-	ErrorAt     *time.Time `json:"error_at"`
-	Retry       *time.Time `json:"retry"`
+	// TakenSession is the id of the session that took it, for routing.
+	TakenSession string     `json:"taken_session,omitempty"`
+	Attempts     int        `json:"attempts"`
+	Error        string     `json:"error"`
+	ErrorAt      *time.Time `json:"error_at"`
+	Retry        *time.Time `json:"retry"`
 }
 
 func when(t time.Time) *time.Time {
@@ -109,7 +111,7 @@ func (l labels) track(t store.Tracked) trackedJSON {
 		FromSession: t.FromSession, ToSession: t.ToSession,
 		FromLabel: l.of(t.From, t.FromSession), ToLabel: l.of(t.To, t.ToSession),
 		Content: t.Content, Status: t.Status, CreatedAt: t.CreatedAt, DeliveredAt: when(t.Delivered),
-		TakenBy: taken, Attempts: t.Attempts, Error: t.Error, ErrorAt: when(t.ErrorAt), Retry: when(t.Retry),
+		TakenBy: taken, TakenSession: t.TakenBy, Attempts: t.Attempts, Error: t.Error, ErrorAt: when(t.ErrorAt), Retry: when(t.Retry),
 	}
 }
 
@@ -267,7 +269,14 @@ func (s *server) thread(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) send(w http.ResponseWriter, r *http.Request) {
-	var in struct{ To, Content string }
+	// thread_id and in_reply_to keep a conversation going in its thread; the
+	// bus checks that the web app is in it.
+	var in struct {
+		To        string `json:"to"`
+		Content   string `json:"content"`
+		ThreadID  string `json:"thread_id"`
+		InReplyTo string `json:"in_reply_to"`
+	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, bus.MaxContentBytes+4096)).Decode(&in); err != nil {
 		s.fail(w, http.StatusBadRequest, "the request isn't valid JSON")
 		return
@@ -277,7 +286,7 @@ func (s *server) send(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusConflict, "the "+Me+" agent doesn't exist yet; run birdie ui once to set it up")
 		return
 	}
-	m, err := s.Bus.Send(ctx, Me, bus.SendInput{To: in.To, Content: in.Content})
+	m, err := s.Bus.Send(ctx, Me, bus.SendInput{To: in.To, Content: in.Content, ThreadID: in.ThreadID, InReplyTo: in.InReplyTo})
 	if err != nil {
 		status := http.StatusInternalServerError
 		switch {

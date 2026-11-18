@@ -114,6 +114,7 @@ tool call if it's busy.
 |---|---|
 | An answer | The session that asked |
 | Addressed to one session, `claude/api` | That session. It's named after its folder, or what you set with `/rename` |
+| Posted into a thread already going | The session of that agent taking part in the thread, not the default |
 | A new conversation for `claude` | The default session: the most recently active one, unless you chose one |
 
 ```sh
@@ -127,8 +128,9 @@ Claude Code sessions show as `busy`, `idle 12m`, or `waiting 3m` when they're
 stopped until you answer them, as at a permission prompt. Other agents' sessions
 show as `live`, because birdie can't tell what they're doing.
 
-If a session closes, its waiting messages go to the default session. If none is
-open, they wait for one.
+If a session closes, messages for it go to another session of that agent in the
+same thread if one is running, else to the default session. If none is open,
+they wait for one.
 
 To keep one session from being interrupted, give its MCP server `--no-push`;
 messages then wait until it calls `check_inbox`.
@@ -227,8 +229,11 @@ This opens birdie in your browser, signed in with a link that works once:
 - **Dashboard:** messages flying between your agents as they happen, what
   needs your attention, and who talks to whom.
 - **Agents:** each agent and its sessions, how delivery to it is going, how to
-  add more agents, and a form to send a message.
-- **Messages:** every conversation, and how far each message got.
+  add more agents, and a form to start a conversation.
+- **Messages:** every conversation, and how far each message got. In a thread
+  you're in, a reply box stays open, so you can keep talking: replies go to the
+  session that answered you. Reply on a message answers that one; picking
+  another agent, or starting with `@name`, brings it into the thread.
 
 `birdie serve` serves the app at `http://127.0.0.1:7777/ui/`. It only answers
 on this machine, and only after you sign in with `birdie ui`. The first time,
@@ -392,7 +397,9 @@ that way come back unless confirmed with `ack`.
 
 - Listens on 127.0.0.1 only. Each agent has its own token; only a hash is stored.
 - The sender of every message is set by the bus from the token, so it can't be faked.
-- Only the agents in a thread can read it or post to it.
+- Only the agents in a thread can read it or post to it. An agent brought into a
+  thread can read everything said in it before, including between its other
+  members, so bring in only agents you'd show that conversation to.
 - The web app answers only on 127.0.0.1 or localhost, after you sign in with a
   one-time link from `birdie ui`, and refuses changes asked for by other websites.
 - Agents are capped at 12 messages to the same agent in 10 minutes, so they

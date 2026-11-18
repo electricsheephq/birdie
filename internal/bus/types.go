@@ -58,6 +58,13 @@ var namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
 // ValidName reports whether name is usable as an agent name. Names double as
 // token file names, so the pattern is deliberately strict.
+// JoinsThread reports whether m is posted into a thread that was already
+// going, other than as a reply, so its recipient may not have seen the
+// earlier messages. A message that starts a thread shares its id.
+func JoinsThread(m Message) bool {
+	return m.InReplyTo == "" && !IsSystemSender(m.From) && strings.TrimPrefix(m.ThreadID, "thr_") != strings.TrimPrefix(m.ID, "msg_")
+}
+
 // IsSystemSender says whether a sender name means the bus itself.
 func IsSystemSender(name string) bool { return name == SystemSender || name == LegacySystemSender }
 
@@ -235,8 +242,14 @@ type Store interface {
 	// ThreadAccess reports whether the thread has any messages and whether
 	// agent sent or received one of them.
 	ThreadAccess(ctx context.Context, threadID, agent string) (exists, member bool, err error)
-	// Thread returns the thread's messages that agent sent or received.
+	// Thread returns every message in the thread once agent is in it, and
+	// none before.
 	Thread(ctx context.Context, threadID, agent string) ([]Message, error)
+	// TakenBy is the session that took message id, or "" if none has.
+	TakenBy(ctx context.Context, id string) (string, error)
+	// ThreadSessions are the sessions of agent that took part in the thread,
+	// by sending a message there or taking one, most recent first.
+	ThreadSessions(ctx context.Context, threadID, agent string) ([]string, error)
 	// ClaimInbox takes up to f.Limit messages for f.Agent, oldest first:
 	// queued ones and claimed ones whose lease ran out.
 	ClaimInbox(ctx context.Context, f ClaimFilter, now time.Time) ([]Message, error)

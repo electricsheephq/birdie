@@ -51,7 +51,7 @@ var tools = []schema{
 	},
 	{
 		"name":        "get_thread",
-		"description": "Read the full history of a thread you are part of.",
+		"description": "Read the full history of a thread you are part of, including messages from before you joined it and between its other members.",
 		"inputSchema": obj([]string{"thread_id"}, schema{"thread_id": str("Thread to read.")}),
 	},
 	{

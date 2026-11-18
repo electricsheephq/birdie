@@ -1,9 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api/client';
-import { useBusEvent } from '../api/events';
-import { keys, useOverview, useThread, useTools } from '../api/hooks';
-import type { Agent, MessageStatus, Overview, SendResult, Tool } from '../api/types';
+import { keys, useOverview, useTools } from '../api/hooks';
+import type { Agent, Overview, Tool } from '../api/types';
 import { AgentTile } from '../components/AgentTile';
 import { LoopBird } from '../components/LoopBird';
 import { SessionStateMark } from '../components/bits';
@@ -27,6 +26,7 @@ import { href } from '../lib/router';
 import { errorText } from '../lib/status';
 import { ago, ms, span, until, useNow } from '../lib/time';
 import { Signal } from '../components/Signal';
+import { focusReplyIn } from '../lib/compose';
 import { Select } from '../components/Select';
 
 export function AgentsPage({ section, to: pickTo }: { section?: 'send' | 'add'; to?: string }) {
@@ -473,20 +473,6 @@ function resolve(o: Overview | undefined, to: string): string {
   return s;
 }
 
-type Phase = MessageStatus | 'retrying';
-const RANK: Record<Phase, number> = { queued: 0, retrying: 1, claimed: 2, delivered: 3, replied: 4, failed: 5 };
-
-interface Sent {
-  result: SendResult;
-  text: string;
-  at: number;
-  phase: Phase;
-  toLabel: string;
-  deliveredAt: number | null;
-  error: string;
-  answeredBy: string;
-}
-
 function SendForm({
   overview: o,
   to,
@@ -502,9 +488,7 @@ function SendForm({
   const targets = useMemo(() => targetsOf(o), [o]);
   const [text, setText] = useState('');
   const [invalid, setInvalid] = useState(false);
-  const [sent, setSent] = useState<Sent | null>(null);
   const [sendError, setSendError] = useState('');
-  const now = useNow();
 
   // Fall back to the first agent when nothing, or something gone, is picked.
   const value = targets.some((t) => t.value === to) ? to : to && to.includes('/') ? to : targets[0]?.value || '';
@@ -512,54 +496,20 @@ function SendForm({
 
   const mutation = useMutation({
     mutationFn: api.send,
-    onSuccess: (result, input) => {
-      setSent({
-        result,
-        text: input.content,
-        at: Date.now(),
-        phase: result.status,
-        toLabel: result.to_session ? sessionLabel(o, result.to, result.to_session) : labelOf(result.to),
-        deliveredAt: null,
-        error: '',
-        answeredBy: '',
-      });
+    onSuccess: (result) => {
       setSendError('');
       setText('');
       client.invalidateQueries({ queryKey: keys.overview });
+      client.invalidateQueries({ queryKey: keys.threads });
+      // The conversation goes on in its thread, where the answer will come.
+      const thread = result.thread_id || result.id;
+      focusReplyIn(thread);
+      window.location.hash = href.thread(thread);
     },
     onError: (err) => {
       setSendError(err instanceof Error ? err.message : String(err));
     },
   });
-
-  // Follow the message through the stream: queued, delivered, answered.
-  useBusEvent((e) => {
-    if (e.kind !== 'message' || !sent) return;
-    if (e.id === sent.result.id) {
-      const phase: Phase = e.type;
-      setSent((s) => {
-        if (!s || s.result.id !== e.id) return s;
-        const next = { ...s, toLabel: e.to_label ? who(e.to_label) : s.toLabel };
-        if (e.type === 'delivered' || e.type === 'replied') next.deliveredAt = next.deliveredAt ?? (ms(e.at) || Date.now());
-        if (e.error) next.error = e.error;
-        if (RANK[phase] >= RANK[s.phase] || (s.phase === 'retrying' && phase !== 'queued')) next.phase = phase;
-        return next;
-      });
-    } else if (e.in_reply_to === sent.result.id && e.type === 'queued') {
-      setSent((s) => (s ? { ...s, phase: 'replied', answeredBy: who(e.from_label || e.from) } : s));
-    }
-  });
-
-  // The thread is the record: it catches up if an event was missed.
-  const thread = useThread(sent?.result.id);
-  const tracked = thread.data?.messages.find((m) => m.id === sent?.result.id);
-  const reply = thread.data?.messages.find((m) => m.in_reply_to === sent?.result.id);
-  let phase: Phase = sent?.phase ?? 'queued';
-  if (tracked) {
-    const tp: Phase = tracked.status === 'queued' && tracked.error ? 'retrying' : tracked.status;
-    if (RANK[tp] > RANK[phase]) phase = tp;
-  }
-  if (reply && phase !== 'failed') phase = 'replied';
 
   const submit = (e: { preventDefault(): void }) => {
     e.preventDefault();
@@ -573,52 +523,12 @@ function SendForm({
     mutation.mutate({ to: value, content: text.trim() });
   };
 
-  let title = '';
-  let detail = '';
-  let problem = false;
-  if (sent) {
-    const where = tracked?.taken_by ? who(tracked.taken_by) : sent.toLabel;
-    const deliveredAt = ms(tracked?.delivered_at) ?? sent.deliveredAt;
-    const createdAt = ms(tracked?.created_at) ?? sent.at;
-    const error = tracked?.error || sent.error;
-    switch (phase) {
-      case 'queued':
-        title = 'Queued for ' + sent.toLabel;
-        detail = sent.result.note;
-        break;
-      case 'retrying':
-        problem = true;
-        title = 'Still queued for ' + sent.toLabel;
-        detail =
-          (tracked?.attempts ? 'Try ' + tracked.attempts + ' failed' : 'A try failed') + (error ? ': ' + errorText(error) : '') + '.' +
-          (tracked?.retry && until(tracked.retry, now) !== 'now' ? ' Next try ' + until(tracked.retry, now) + '.' : ' birdie tries again.');
-        break;
-      case 'claimed':
-        title = 'Taken by ' + where + ', not confirmed yet';
-        detail = 'Waiting for ' + where + ' to confirm it got the message.';
-        break;
-      case 'delivered':
-        title = 'Delivered to ' + where + (deliveredAt ? ' after ' + span(deliveredAt - createdAt) : '');
-        detail = 'Waiting for an answer. It will appear in Messages.';
-        break;
-      case 'replied':
-        title = 'Answered by ' + who(reply?.from_label || sent.answeredBy || where);
-        detail = 'The answer is in the thread.';
-        break;
-      case 'failed':
-        problem = true;
-        title = 'Not delivered';
-        detail = 'birdie gave up' + (error ? ': ' + errorText(error) : '') + '.';
-        break;
-    }
-  }
-
   return (
     <section id="send" aria-labelledby="send-title" className="send">
       <div className="send-head">
         <h2 id="send-title" className="title">Send a message</h2>
         <p>
-          You send as yourself. Answers come back to Messages.
+          You send as yourself. The thread opens in Messages, where you can keep talking.
         </p>
       </div>
       <form onSubmit={submit} noValidate className="send-form">
@@ -682,24 +592,7 @@ function SendForm({
             </div>
           </div>
         )}
-        {sent && !sendError && (
-          <div className={'sent' + (problem ? ' is-problem' : '')}>
-            <Letter tone="request" size={28} />
-            <div className="sent-body">
-              <span className="sent-title">{title}</span>
-              <span className="sent-text">“{sent.text.length > 160 ? sent.text.slice(0, 159) + '…' : sent.text}”</span>
-              {detail && <span className="sent-detail">{detail}</span>}
-              <a href={href.thread(sent.result.thread_id || sent.result.id)}>Open thread</a>
-            </div>
-          </div>
-        )}
       </div>
     </section>
   );
-}
-
-function sessionLabel(o: Overview | undefined, agent: string, session: string): string {
-  const a = findAgent(o, agent);
-  const s = a?.sessions.find((x) => x.id === session || x.name === session);
-  return who(s ? sessionAddress(s) : agent + '/' + session.slice(0, 8));
 }

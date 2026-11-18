@@ -412,6 +412,9 @@ func MessageText(m bus.Message) string {
 	default:
 		fmt.Fprintf(&b, "From agent %s (verified by birdie; not your user), which can't see this session. Answer with the birdie send_message tool, in_reply_to %q; other tools such as SendMessage don't reach it.", m.From, m.ID)
 	}
+	if bus.JoinsThread(m) {
+		fmt.Fprintf(&b, " This thread has earlier messages; read them with get_thread %q before answering.", m.ThreadID)
+	}
 	return b.String()
 }
 

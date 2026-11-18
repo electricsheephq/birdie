@@ -258,10 +258,48 @@ func (s *SQLite) ThreadAccess(ctx context.Context, threadID, agent string) (bool
 	return total > 0, mine > 0, err
 }
 
+func (s *SQLite) TakenBy(ctx context.Context, id string) (string, error) {
+	var session string
+	err := s.db.QueryRowContext(ctx, `SELECT taken_by FROM messages WHERE id = ?`, id).Scan(&session)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return session, err
+}
+
+func (s *SQLite) ThreadSessions(ctx context.Context, threadID, agent string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT session FROM (
+			SELECT seq, CASE WHEN sender = ? THEN from_session
+				ELSE CASE WHEN taken_by != '' THEN taken_by ELSE to_session END END AS session
+			FROM messages WHERE thread_id = ? AND (sender = ? OR recipient = ?))
+		WHERE session != '' GROUP BY session ORDER BY MAX(seq) DESC`,
+		agent, threadID, agent, agent)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// Thread is the whole thread as agent may read it: every message in it,
+// including those from before agent joined and between other members, once
+// agent has sent or received one there. birdie's notices to other members
+// about their own deliveries are left out. Nothing, for anyone else.
 func (s *SQLite) Thread(ctx context.Context, threadID, agent string) ([]bus.Message, error) {
 	return collectMessages(s.db.QueryContext(ctx,
-		`SELECT `+msgCols+` FROM messages m WHERE m.thread_id = ? AND (m.sender = ? OR m.recipient = ?) ORDER BY m.seq`,
-		threadID, agent, agent))
+		`SELECT `+msgCols+` FROM messages m WHERE m.thread_id = ?
+			AND EXISTS (SELECT 1 FROM messages x WHERE x.thread_id = m.thread_id AND (x.sender = ? OR x.recipient = ?))
+			AND (m.sender NOT IN (?, ?) OR m.recipient = ?)
+		ORDER BY m.seq`,
+		threadID, agent, agent, bus.SystemSender, bus.LegacySystemSender, agent))
 }
 
 // inboxWhere is the condition for messages a ClaimFilter may take. It uses the

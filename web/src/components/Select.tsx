@@ -7,6 +7,8 @@ export interface SelectOption {
   hint?: string;
   /** Drawn before the label, such as an agent's tile. Decorative. */
   icon?: ReactNode;
+  /** Shown faded, for a choice that's available but not right now, such as an agent with nothing running. */
+  dim?: boolean;
 }
 
 interface Props {
@@ -20,6 +22,8 @@ interface Props {
   placeholder?: string;
   disabled?: boolean;
   describedBy?: string;
+  /** Which way the list opens; "up" for a control at the bottom of a panel. */
+  placement?: 'down' | 'up';
 }
 
 /**
@@ -28,7 +32,7 @@ interface Props {
  * keys move through the options, Enter or Space picks, Escape closes, and
  * typing jumps to an option starting with those letters.
  */
-export function Select({ id, labelledBy, value, options, onChange, placeholder = 'Pick one', disabled, describedBy }: Props) {
+export function Select({ id, labelledBy, value, options, onChange, placeholder = 'Pick one', disabled, describedBy, placement = 'down' }: Props) {
   const auto = useId();
   const base = id || 'select' + auto.replace(/:/g, '');
   const listId = base + '-list';
@@ -118,7 +122,7 @@ export function Select({ id, labelledBy, value, options, onChange, placeholder =
   };
 
   return (
-    <div ref={root} className={'dd' + (open ? ' is-open' : '')}>
+    <div ref={root} className={'dd' + (placement === 'up' ? ' dd-up' : '') + (open ? ' is-open' : '')}>
       <div
         id={base}
         role="combobox"
@@ -147,7 +151,7 @@ export function Select({ id, labelledBy, value, options, onChange, placeholder =
             data-index={i}
             role="option"
             aria-selected={i === current}
-            className={'dd-option' + (i === active ? ' is-active' : '')}
+            className={'dd-option' + (i === active ? ' is-active' : '') + (o.dim ? ' is-dim' : '')}
             onPointerMove={() => i !== active && setActive(i)}
             onPointerDown={(e) => e.preventDefault()}
             onClick={() => pick(i)}
@@ -165,7 +169,7 @@ export function Select({ id, labelledBy, value, options, onChange, placeholder =
 
 function Choice({ option }: { option: SelectOption }) {
   return (
-    <span className="dd-choice">
+    <span className={'dd-choice' + (option.dim ? ' is-dim' : '')}>
       {option.icon && <span className="dd-icon">{option.icon}</span>}
       <span className="dd-text">
         <span className="dd-label">{option.label}</span>
