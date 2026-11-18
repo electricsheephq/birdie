@@ -76,3 +76,20 @@ SECURITY.md describes what birdie trusts and what it stores.
   and why, and how it was tested.
 - The installed Hermes plugin and daemon are updated by whoever runs the
   machine, not by the pull request's author.
+
+## Release closeout
+
+This fork ships from main: a fix reaches users when whoever runs the machine
+installs a main commit (the daemon, the Hermes plugin, or both). Here a
+confirmed install of a main commit counts as a release, and so does a tag.
+After each one:
+
+1. Close every issue it fully served, with a comment naming the commit or tag.
+   Never close an umbrella or parent issue whose own acceptance isn't met.
+2. Tick the boxes it completed on the roadmap issue (#40), on tracking issues,
+   and on closed issues whose checklists shipped. Close a milestone once all
+   its issues are closed.
+3. Update every README, CHANGELOG or roadmap line that names the latest
+   release or what ships next.
+4. Send whoever runs the machine one closeout line: issues closed, boxes
+   ticked, docs updated (or "none").
