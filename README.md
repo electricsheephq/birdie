@@ -321,7 +321,8 @@ becomes its own session once it has taken a turn, with the tools `birdie_send_me
 `birdie_check_inbox`, `birdie_wait_for_reply`, `birdie_get_thread` and
 `birdie_list_agents`. Hermes keeps its token as a secret: if Hermes doesn't have it yet,
 setup prints it with how to give it to Hermes. Then restart Hermes. See [its README](integrations/hermes/README.md) for what it does on your
-machine.
+machine. It can also carry heartbeat2's notices: see
+[A notifier for heartbeat2](integrations/hermes/README.md#a-notifier-for-heartbeat2).
 
 ```sh
 birdie setup hermes             # messages wait, and each turn mentions them
