@@ -76,6 +76,8 @@ export interface Tracked {
   delivered_at: string | null;
   /** The session that took it, as a label, or "" when none did. */
   taken_by: string;
+  /** That session's id. */
+  taken_session?: string;
   attempts: number;
   /** Why the latest try failed, and when. */
   error: string;

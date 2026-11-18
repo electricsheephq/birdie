@@ -56,10 +56,12 @@ type trackedJSON struct {
 	CreatedAt   time.Time  `json:"created_at"`
 	DeliveredAt *time.Time `json:"delivered_at"`
 	TakenBy     string     `json:"taken_by"`
-	Attempts    int        `json:"attempts"`
-	Error       string     `json:"error"`
-	ErrorAt     *time.Time `json:"error_at"`
-	Retry       *time.Time `json:"retry"`
+	// TakenSession is the id of the session that took it, for routing.
+	TakenSession string     `json:"taken_session,omitempty"`
+	Attempts     int        `json:"attempts"`
+	Error        string     `json:"error"`
+	ErrorAt      *time.Time `json:"error_at"`
+	Retry        *time.Time `json:"retry"`
 }
 
 func when(t time.Time) *time.Time {
@@ -109,7 +111,7 @@ func (l labels) track(t store.Tracked) trackedJSON {
 		FromSession: t.FromSession, ToSession: t.ToSession,
 		FromLabel: l.of(t.From, t.FromSession), ToLabel: l.of(t.To, t.ToSession),
 		Content: t.Content, Status: t.Status, CreatedAt: t.CreatedAt, DeliveredAt: when(t.Delivered),
-		TakenBy: taken, Attempts: t.Attempts, Error: t.Error, ErrorAt: when(t.ErrorAt), Retry: when(t.Retry),
+		TakenBy: taken, TakenSession: t.TakenBy, Attempts: t.Attempts, Error: t.Error, ErrorAt: when(t.ErrorAt), Retry: when(t.Retry),
 	}
 }
 

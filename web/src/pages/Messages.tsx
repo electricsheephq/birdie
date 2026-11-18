@@ -299,6 +299,30 @@ function otherSide(m: Tracked, me: string): string {
   return m.from === me ? agentOf(m.to) : agentOf(m.from);
 }
 
+/** The session of `agent` in m, if m names one: the one that sent it, or the one that took or was meant to take it. */
+function sessionIn(m: Tracked, agent: string): string {
+  if (agentOf(m.from) === agent) return m.from_session || '';
+  if (m.to === agent) return m.taken_session || m.to_session || '';
+  return '';
+}
+
+/**
+ * The session of `agent` a message in this thread goes to, as birdie routes it:
+ * `want` (the session of the message being answered) while it runs, else the
+ * latest of the agent's sessions in the thread that runs, else `want`, else the latest.
+ */
+function threadSession(messages: Tracked[], agent: string, running: string[], want = ''): string {
+  if (want && running.includes(want)) return want;
+  let latest = '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const s = sessionIn(messages[i], agent);
+    if (!s) continue;
+    if (running.includes(s)) return s;
+    latest ||= s;
+  }
+  return want || latest;
+}
+
 /** The message a reply to `agent` answers: the latest between you and it, so it reaches the same session. */
 function replyTarget(messages: Tracked[], me: string, agent: string): Tracked | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -430,7 +454,7 @@ function Composer({
   const toAgent = byName.get(to);
   const sessions = toAgent?.delivery === 'pull' ? liveSessions(toAgent) : [];
   const parent = replyTo ?? (members.includes(to) ? replyTarget(messages, me, to) : undefined);
-  const pinned = parent ? (agentOf(parent.from) === to ? parent.from_session : parent.to_session) : '';
+  const pinned = threadSession(messages, to, sessions.map((s) => s.id), parent ? sessionIn(parent, to) : '');
   const auto = sessions.find((s) => s.id === pinned) ?? (toAgent && defaultSession(toAgent)?.session) ?? sessions[0];
   const session = sessions.find((s) => s.id === pickedSession) ?? auto;
 
