@@ -163,6 +163,109 @@ func TestNewMembersReadTheWholeThread(t *testing.T) {
 	}
 }
 
+func TestThreadMessagesGoToTheSessionInTheConversation(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	for _, n := range []string{"alice", "claude"} {
+		addAgent(t, st, n, nil)
+	}
+	report := func(id, name string) {
+		t.Helper()
+		if err := b.ReportSession(ctx, "claude", id, bus.SessionInput{Name: name, Tier: bus.TierPush, ActiveAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report("s-work", "work")
+	report("s-home", "home") // active last, so it's the default
+
+	// Claude's work window starts a conversation with alice.
+	ask, err := b.Send(ctx, "claude", bus.SendInput{To: "alice", Content: "review this?", FromSession: "s-work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// alice posts into the thread without replying to a message: it goes to
+	// the work window, not to the default home window.
+	m, err := b.Send(ctx, "alice", bus.SendInput{To: "claude", ThreadID: ask.ThreadID, Content: "one question first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.ToSession != "s-work" {
+		t.Fatalf("thread message went to %q, want s-work", m.ToSession)
+	}
+	if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s-home"}); err != nil || len(got) != 0 {
+		t.Fatalf("the default home window took %d messages, err %v; want none", len(got), err)
+	}
+	if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s-work"}); err != nil || len(got) != 1 {
+		t.Fatalf("the work window took %d messages, err %v; want 1", len(got), err)
+	}
+
+	// A new conversation still goes to the default session.
+	fresh, err := b.Send(ctx, "alice", bus.SendInput{To: "claude", Content: "something new"})
+	if err != nil || fresh.ToSession != "" {
+		t.Fatalf("new conversation pinned to %q, err %v; want the default", fresh.ToSession, err)
+	}
+	// The session that took a message counts too.
+	if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s-home"}); err != nil || len(got) != 1 {
+		t.Fatalf("home took %d, err %v; want 1", len(got), err)
+	}
+	next, err := b.Send(ctx, "alice", bus.SendInput{To: "claude", ThreadID: fresh.ThreadID, Content: "and another thing"})
+	if err != nil || next.ToSession != "s-home" {
+		t.Fatalf("follow-up pinned to %q, err %v; want s-home, which took the first", next.ToSession, err)
+	}
+
+	// Once the work window closes, its thread falls back to the default.
+	if err := b.EndSession(ctx, "claude", "s-work"); err != nil {
+		t.Fatal(err)
+	}
+	late, err := b.Send(ctx, "alice", bus.SendInput{To: "claude", ThreadID: ask.ThreadID, Content: "still there?"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "s-home"})
+	if err != nil || len(got) != 2 || got[0].ID != next.ID || got[1].ID != late.ID {
+		t.Fatalf("after work closed, home took %v, err %v; want %s and %s", got, err, next.ID, late.ID)
+	}
+}
+
+func TestThreadMessagesPreferARunningSessionFromTheThread(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	for _, n := range []string{"codex", "claude"} {
+		addAgent(t, st, n, nil)
+	}
+	for _, id := range []string{"s-a", "s-b", "s-default"} {
+		if err := b.ReportSession(ctx, "claude", id, bus.SessionInput{Name: id, Tier: bus.TierPush, ActiveAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two Claude windows take part in a thread with codex: a, then b.
+	first, err := b.Send(ctx, "claude", bus.SendInput{To: "codex", Content: "from a", FromSession: "s-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromB, err := b.Send(ctx, "claude", bus.SendInput{To: "codex", ThreadID: first.ThreadID, Content: "from b", FromSession: "s-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := b.Send(ctx, "codex", bus.SendInput{To: "claude", ThreadID: first.ThreadID, Content: "to whoever's here"})
+	if err != nil || m.ToSession != "s-b" {
+		t.Fatalf("went to %q, err %v; want s-b, the latest in the thread", m.ToSession, err)
+	}
+	// b closes: the thread's earlier window a still runs, so it gets the next one, not the default.
+	if err := b.EndSession(ctx, "claude", "s-b"); err != nil {
+		t.Fatal(err)
+	}
+	m, err = b.Send(ctx, "codex", bus.SendInput{To: "claude", ThreadID: first.ThreadID, Content: "b has gone"})
+	if err != nil || m.ToSession != "s-a" {
+		t.Fatalf("went to %q, err %v; want s-a", m.ToSession, err)
+	}
+	// So does an answer to b's message.
+	m, err = b.Send(ctx, "codex", bus.SendInput{InReplyTo: fromB.ID, Content: "answering b"})
+	if err != nil || m.ToSession != "s-a" {
+		t.Fatalf("answer went to %q, err %v; want s-a", m.ToSession, err)
+	}
+}
+
 func TestWebhookDelivery(t *testing.T) {
 	type hit struct {
 		auth string

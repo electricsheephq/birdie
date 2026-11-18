@@ -258,6 +258,28 @@ func (s *SQLite) ThreadAccess(ctx context.Context, threadID, agent string) (bool
 	return total > 0, mine > 0, err
 }
 
+func (s *SQLite) ThreadSessions(ctx context.Context, threadID, agent string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT session FROM (
+			SELECT seq, CASE WHEN sender = ? THEN from_session
+				ELSE CASE WHEN taken_by != '' THEN taken_by ELSE to_session END END AS session
+			FROM messages WHERE thread_id = ? AND (sender = ? OR recipient = ?))
+		WHERE session != '' GROUP BY session ORDER BY MAX(seq) DESC`,
+		agent, threadID, agent, agent)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // Thread is the whole thread as agent may read it: every message in it,
 // including those from before agent joined and between other members, once
 // agent has sent or received one there. birdie's notices to other members

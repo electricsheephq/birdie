@@ -114,6 +114,7 @@ tool call if it's busy.
 |---|---|
 | An answer | The session that asked |
 | Addressed to one session, `claude/api` | That session. It's named after its folder, or what you set with `/rename` |
+| Posted into a thread already going | The session of that agent taking part in the thread, not the default |
 | A new conversation for `claude` | The default session: the most recently active one, unless you chose one |
 
 ```sh
@@ -127,8 +128,9 @@ Claude Code sessions show as `busy`, `idle 12m`, or `waiting 3m` when they're
 stopped until you answer them, as at a permission prompt. Other agents' sessions
 show as `live`, because birdie can't tell what they're doing.
 
-If a session closes, its waiting messages go to the default session. If none is
-open, they wait for one.
+If a session closes, messages for it go to another session of that agent in the
+same thread if one is running, else to the default session. If none is open,
+they wait for one.
 
 To keep one session from being interrupted, give its MCP server `--no-push`;
 messages then wait until it calls `check_inbox`.

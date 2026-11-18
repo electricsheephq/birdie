@@ -301,6 +301,16 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	if err := b.admit(ctx, from, to.Name); err != nil {
 		return Message{}, err
 	}
+	// In a thread already going, it goes to a session of that agent taking
+	// part in it, rather than whichever is the agent's default now: the most
+	// recent one still running, else the most recent one, whose mail falls to
+	// the default while it's gone.
+	// An answer whose session has closed does the same.
+	if addr.Session == "" && thread != "" {
+		if pinned, err = b.threadSession(ctx, thread, to.Name, pinned); err != nil {
+			return Message{}, err
+		}
+	}
 	toSession := pinned
 	if addr.Session != "" {
 		s, err := b.findSession(ctx, to, addr.Session)
@@ -517,6 +527,41 @@ func (b *Bus) admit(ctx context.Context, from, to string) error {
 			ErrLoop, from, to, n, LoopWindow)
 	}
 	return nil
+}
+
+// threadSession is the session of agent a message posted into thread goes
+// to. want, the session an answer is for, wins while it runs; otherwise the
+// most recent session of agent in the thread that runs, else want, else the
+// most recent one in the thread.
+func (b *Bus) threadSession(ctx context.Context, thread, agent, want string) (string, error) {
+	live, err := b.store.LiveSessions(ctx, agent, time.Now().Add(-SessionTTL))
+	if err != nil {
+		return "", err
+	}
+	running := func(id string) bool {
+		for _, s := range live {
+			if s.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+	if want != "" && running(want) {
+		return want, nil
+	}
+	ids, err := b.store.ThreadSessions(ctx, thread, agent)
+	if err != nil {
+		return "", err
+	}
+	for _, id := range ids {
+		if running(id) {
+			return id, nil
+		}
+	}
+	if want != "" || len(ids) == 0 {
+		return want, nil
+	}
+	return ids[0], nil
 }
 
 func (b *Bus) findSession(ctx context.Context, to Agent, want string) (Session, error) {
