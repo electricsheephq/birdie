@@ -456,6 +456,13 @@ that way come back unless confirmed with `ack`.
 - **Loops:** one agent may send another 12 messages in 10 minutes
   (`serve --loop-limit`).
 
+## Vision and roadmap
+
+[VISION.md](VISION.md) says what birdie is for, who uses it, what it covers on
+each Hermes surface, and what it won't do. This fork's roadmap is
+[issue #40](https://github.com/electricsheephq/birdie/issues/40), which lists
+the fixes in progress and what comes next.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) for what birdie trusts, what it stores and for

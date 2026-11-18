@@ -76,6 +76,10 @@ SECURITY.md describes what birdie trusts and what it stores.
   and why, and how it was tested.
 - The installed Hermes plugin and daemon are updated by whoever runs the
   machine, not by the pull request's author.
+- main requires a pull request and two checks from `.github/workflows/test.yml`:
+  `go` (`make test`) and `web` (`make web`). If you rename either job, tell
+  whoever runs the machine before the pull request merges, because the
+  ruleset names them.
 
 ## Release closeout
 
