@@ -483,8 +483,9 @@ function Composer({
     e?.preventDefault();
     const content = text.trim();
     if (!content || mutation.isPending) return;
-    // Name the session only when you chose one other than where it would go anyway.
-    const address = sessions.length > 1 && session && session.id !== auto?.id ? to + '/' + session.id : to;
+    // Name the session when you picked it, or it differs from where it would go anyway.
+    const chosen = sessions.some((s) => s.id === pickedSession);
+    const address = sessions.length > 1 && session && (chosen || session.id !== auto?.id) ? to + '/' + session.id : to;
     // Empty the box now, so what you type while it's on its way is the next message.
     setText('');
     drafts.delete(threadId);

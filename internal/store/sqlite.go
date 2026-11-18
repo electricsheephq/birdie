@@ -258,6 +258,15 @@ func (s *SQLite) ThreadAccess(ctx context.Context, threadID, agent string) (bool
 	return total > 0, mine > 0, err
 }
 
+func (s *SQLite) TakenBy(ctx context.Context, id string) (string, error) {
+	var session string
+	err := s.db.QueryRowContext(ctx, `SELECT taken_by FROM messages WHERE id = ?`, id).Scan(&session)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return session, err
+}
+
 func (s *SQLite) ThreadSessions(ctx context.Context, threadID, agent string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT session FROM (
 			SELECT seq, CASE WHEN sender = ? THEN from_session

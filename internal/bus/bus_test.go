@@ -266,6 +266,35 @@ func TestThreadMessagesPreferARunningSessionFromTheThread(t *testing.T) {
 	}
 }
 
+// Writing again on your own message reaches the session that took it, even
+// when another session of that agent spoke in the thread since.
+func TestReplyToYourOwnMessageReachesTheSessionThatTookIt(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	for _, n := range []string{"me", "claude"} {
+		addAgent(t, st, n, nil)
+	}
+	for _, id := range []string{"beta", "alpha"} { // alpha, active last, is the default
+		if err := b.ReportSession(ctx, "claude", id, bus.SessionInput{Name: id, Tier: bus.TierPush, ActiveAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ask, err := b.Send(ctx, "me", bus.SendInput{To: "claude", Content: "unpinned"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "claude", Session: "alpha"}); err != nil || len(got) != 1 {
+		t.Fatalf("alpha took %d, err %v; want 1", len(got), err)
+	}
+	if _, err := b.Send(ctx, "claude", bus.SendInput{To: "me", ThreadID: ask.ThreadID, Content: "beta chimes in", FromSession: "beta"}); err != nil {
+		t.Fatal(err)
+	}
+	m, err := b.Send(ctx, "me", bus.SendInput{To: "claude", InReplyTo: ask.ID, Content: "following up"})
+	if err != nil || m.ToSession != "alpha" {
+		t.Fatalf("follow-up went to %q, err %v; want alpha, which took the message it follows", m.ToSession, err)
+	}
+}
+
 func TestWebhookDelivery(t *testing.T) {
 	type hit struct {
 		auth string

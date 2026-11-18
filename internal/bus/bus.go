@@ -264,11 +264,18 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 				in.To = parent.To
 			}
 		}
-		// An answer goes back to the session that asked.
+		// An answer goes back to the session that asked. Writing again to
+		// whoever a message went to reaches the session it was addressed to,
+		// or, sent to the default, the session that took it.
 		if in.To == parent.From {
 			pinned = parent.FromSession
 		} else if in.To == parent.To {
 			pinned = parent.ToSession
+			if pinned == "" {
+				if pinned, err = b.store.TakenBy(ctx, parent.ID); err != nil {
+					return Message{}, err
+				}
+			}
 		}
 	} else if thread != "" {
 		exists, member, err := b.store.ThreadAccess(ctx, thread, from)

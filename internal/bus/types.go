@@ -245,6 +245,8 @@ type Store interface {
 	// Thread returns every message in the thread once agent is in it, and
 	// none before.
 	Thread(ctx context.Context, threadID, agent string) ([]Message, error)
+	// TakenBy is the session that took message id, or "" if none has.
+	TakenBy(ctx context.Context, id string) (string, error)
 	// ThreadSessions are the sessions of agent that took part in the thread,
 	// by sending a message there or taking one, most recent first.
 	ThreadSessions(ctx context.Context, threadID, agent string) ([]string, error)
