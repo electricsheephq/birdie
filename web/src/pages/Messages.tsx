@@ -10,6 +10,7 @@ import { Select } from '../components/Select';
 import { Button } from '../ds';
 import { Loading, Skeleton, Typing } from '../components/Signal';
 import { TilePair } from '../components/TilePair';
+import { TileStack } from '../components/TileStack';
 import { ME, agentOf, agentsOf, defaultSession, homePath, labelOf, liveSessions, who } from '../lib/agents';
 import { isSystem, mentionIn, mentionQuery, takeFocus } from '../lib/compose';
 import { href } from '../lib/router';
@@ -100,7 +101,7 @@ function ThreadItem({ t, on, now }: { t: ThreadSummary; on: boolean; now: number
   const agents = agentsIn(t.participants.length ? t.participants : [t.last_from]);
   return (
     <a href={href.thread(t.id)} className="thread-item" aria-current={on ? 'true' : undefined}>
-      <TilePair a={agents[0]} b={agents[1]} size={30} />
+      <TilePair a={agents[0]} b={agents[1]} more={agents.length - 2} size={30} />
       <span className="thread-item-body">
         <span className="thread-item-top">
           <span className="thread-item-between">{agents.map(labelOf).join(' ⇄ ')}</span>
@@ -203,7 +204,7 @@ function ThreadDetail({ id, target, query, now }: { id?: string; target?: string
   return (
     <section aria-labelledby="thread-title" className="panel thread chat">
       <div className="chat-head">
-        {agents.length > 0 && <TilePair a={agents[0]} b={agents[1]} size={38} />}
+        {agents.length > 0 && <TileStack names={agents} size={38} max={4} className="chat-head-stack" />}
         <div className="chat-head-text">
           <h2 id="thread-title" className="panel-title">{agents.map(labelOf).join(' ⇄ ') || data.id}</h2>
           <span className="chat-sub">

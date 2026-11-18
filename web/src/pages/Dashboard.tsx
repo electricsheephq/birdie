@@ -1,12 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useOverview, useRecentMessages } from '../api/hooks';
 import type { Agent, Overview, Session, Tracked } from '../api/types';
-import { AgentTile } from '../components/AgentTile';
 import { CourierFlight, type Run } from '../components/CourierFlight';
 import { useBusEvent } from '../api/events';
 import { courier } from '../lib/courier';
 import { SessionStateMark, StatusChip } from '../components/bits';
-import { agentOf, agentsOf, identity, labelOf, liveSessions, sessionAddress, sessionWho, who } from '../lib/agents';
+import { agentOf, agentsOf, identity, liveSessions, sessionAddress, sessionWho, who } from '../lib/agents';
 import { href } from '../lib/router';
 import { MAX_TRIES, errorText, messageChip } from '../lib/status';
 import { ago, agoWords, until, useNow } from '../lib/time';
@@ -14,6 +13,7 @@ import { Scene } from '../scene/Scene';
 import { Loading, Skeleton } from '../components/Signal';
 import { Scroller } from '../components/Scroller';
 import { TilePair } from '../components/TilePair';
+import { TileStack } from '../components/TileStack';
 
 export function DashboardPage() {
   const overview = useOverview();
@@ -148,17 +148,7 @@ function Stats({ overview, now }: { overview: Overview; now: number }) {
 
 /** Overlapping icons of the first few agents, and how many more there are. */
 function Stack({ names }: { names: string[] }) {
-  const MAX = 3;
-  const shown = names.slice(0, MAX);
-  const more = names.length - shown.length;
-  return (
-    <span className="tile-stack" title={names.map(labelOf).join(', ')}>
-      {shown.map((n) => (
-        <AgentTile key={n} name={n} size={30} ring />
-      ))}
-      {more > 0 && <span className="tile-stack-more">+{more}</span>}
-    </span>
-  );
+  return <TileStack names={names} size={30} max={3} />;
 }
 
 /** How long a new message waits for its letter before it shows anyway. */
