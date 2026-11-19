@@ -371,6 +371,17 @@ class PluginTest(PluginCase):
         time.sleep(1.5)
         self.assertEqual(ctx.injected, [], "put in again after the reload")
 
+    def test_a_pasted_tag_doesnt_confirm_a_push_another_conversation_waits_for(self):
+        self.write_config(True)
+        ctx, _ = self.load()
+        self.turn(ctx, user_message="hello")
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "for s1 only"})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        tag = ctx.injected[0][1].splitlines()[0]
+        self.turn(ctx, session="s2", user_message="what is this? " + tag)
+        time.sleep(1)
+        self.assertEqual(status(sent["id"]), "claimed", "a pasted tag confirmed a push no turn showed")
+
     def test_a_turn_confirms_what_it_shows_within_hermess_time(self):
         self.write_config(True)
         ctx, network = self.load()

@@ -211,14 +211,20 @@ def turn_text(user_message):
     return ""
 
 
-# The opening tag frame() and push_frame() write. Content can't contain one (frame
-# cleans it), so a message that only mentions another one's id doesn't match.
-SHOWN = re.compile(r'<' + TAG + r' from="(?:[^"\\]|\\.)*" message_id="([^"\\]+)"')
+# The whole opening tag frame() and push_frame() write. Content can't contain one
+# (frame cleans it), so a message that only mentions another one's id doesn't match.
+SHOWN = re.compile(r'<' + TAG + r' from="(?:[^"\\]|\\.)*" message_id="([^"\\]+)" thread_id="((?:[^"\\]|\\.)*)">')
 
 
-def shown_ids(user_message):
-    """The ids of the birdie messages a turn's user message shows."""
-    return set(SHOWN.findall(turn_text(user_message)))
+def shown_ids(text):
+    """The birdie messages a turn's text shows: message id -> thread id."""
+    shown = {}
+    for ident, thread in SHOWN.findall(text):
+        try:
+            shown[ident] = json.loads('"' + thread + '"')
+        except ValueError:
+            shown[ident] = thread
+    return shown
 
 
 class Conversation:
@@ -645,29 +651,50 @@ class Network:
         turn, or wrap them, so it reads the ids of the frames in the turn's text. One
         given back before its turn came late is remembered as delivered, and is
         confirmed when delivery takes it again, not put in a second time."""
-        ids = shown_ids(user_message)
+        text = turn_text(user_message)
+        ids = shown_ids(text)
         if not ids:
             return
         with conversation.lock:
-            # Every shown frame this conversation hasn't confirmed: its own pushes,
-            # ones given back before their turn came late, and ones another copy of
-            # the plugin put in before a restart or reload, whose turn Hermes kept.
-            # The bus only confirms a message that is still claimed, so one given
-            # back is confirmed when delivery takes it again.
+            # This conversation's own pushes, and ones given back before their turn
+            # came late. The bus only confirms a message that is still claimed, so one
+            # given back is confirmed when delivery takes it again.
             new = [ident for ident in ids if ident not in conversation.delivered]
-            shown = [conversation.pending.pop(ident)[0] for ident in new if ident in conversation.pending]
-            for message in shown:
-                conversation.shown.setdefault(message.get("thread_id", ""), []).append(message)
-            # An expired mark is kept through a new push, which Hermes may refuse,
-            # and cleared once a turn shows the message.
-            for ident in new:
+            ours = [ident for ident in new if ident in conversation.pending or ident in conversation.expired]
+            for ident in ours:
+                entry = conversation.pending.pop(ident, None)
+                if entry is not None:
+                    conversation.shown.setdefault(entry[0].get("thread_id", ""), []).append(entry[0])
+                # An expired mark is kept through a new push, which Hermes may refuse,
+                # and cleared once a turn shows the message.
                 conversation.expired.pop(ident, None)
                 conversation.remember(ident)
-        for ident in new:
+        # One this copy never put in: another copy put it in before a restart or
+        # reload, and Hermes kept its turn. It counts only if the bus has it for this
+        # conversation and the turn shows all of it, so a pasted tag confirms nothing.
+        others = [ident for ident in new if ident not in ours
+                  and self.shows_in_full(conversation, text, ident, ids[ident])]
+        if others:
+            with conversation.lock:
+                for ident in others:
+                    conversation.remember(ident)
+        for ident in ours + others:
             try:
                 self.bus.ack(ident, timeout=CONFIRM_SECONDS)
             except BusError as err:
                 log.debug("birdie: confirm: %s", err)  # it comes back and is confirmed then
+
+    def shows_in_full(self, conversation, text, ident, thread):
+        """Whether a turn's text holds the whole frame of a message for this
+        conversation that another copy of the plugin put in."""
+        try:
+            reply = self.bus.call("GET", "/v1/threads/" + urllib.parse.quote(thread, safe=""), timeout=CONFIRM_SECONDS)
+        except Exception:  # noqa: BLE001 - unconfirmed is safe: it comes back and is shown
+            return False
+        for message in reply.get("messages") or []:
+            if message.get("id") == ident:
+                return message.get("to_session", "") in ("", conversation.id) and push_frame(message) in text
+        return False
 
     def expire_pending(self, conversation):
         """Gives back pushes that no turn showed in time. Hermes accepted them, then
