@@ -548,7 +548,14 @@ class Network:
                     log.debug("birdie: couldn't report a session: %s", err)
 
     def deliver_loop(self, conversation):
-        while conversation.wake and not conversation.closed.is_set() and not self.closed.is_set():
+        while True:
+            # Decided under the lock, and the poller cleared with it, so a turn that
+            # turns waking back on either keeps this loop going or starts a new one.
+            with conversation.lock:
+                if not conversation.wake or conversation.closed.is_set() or self.closed.is_set():
+                    if conversation.poller is threading.current_thread():
+                        conversation.poller = None
+                    return
             try:
                 messages = self.bus.inbox(conversation.id, wait=POLL_SECONDS, push=True)
             except BusError as err:
@@ -583,7 +590,6 @@ class Network:
                 reserved = not seen and not put_in and waiter is None and self.sees_turn_text
                 if reserved:
                     conversation.pending[message["id"]] = (message, time.monotonic() + PENDING_SECONDS)
-                    conversation.expired.pop(message["id"], None)
             if seen:
                 self.bus.ack(message["id"])
                 return
@@ -644,6 +650,8 @@ class Network:
             for message in shown:
                 conversation.remember(message["id"])
                 conversation.shown.setdefault(message.get("thread_id", ""), []).append(message)
+            # Its expired mark is kept through a new push, which Hermes may refuse,
+            # and cleared once a turn shows it.
             for ident in ids:
                 if conversation.expired.pop(ident, None) is not None:
                     conversation.remember(ident)

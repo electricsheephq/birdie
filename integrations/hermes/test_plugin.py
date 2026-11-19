@@ -337,6 +337,26 @@ class PluginTest(PluginCase):
         self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 6), "not confirmed when taken again")
         self.assertEqual(len(ctx.injected), 1, "put in a second time after its turn showed it")
 
+    def test_a_late_turn_after_a_refused_retry_isnt_put_in_again(self):
+        self.write_config(True)
+        ctx, _ = self.load()
+        self.turn(ctx, user_message="hello")
+        with mock.patch.object(plugin, "PENDING_SECONDS", 1):
+            sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "retried"})
+            self.assertTrue(wait_until(lambda: ctx.injected))
+            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued", 6))
+        first = ctx.injected[0][1]
+        # A turn that doesn't show it turns waking back on, and Hermes refuses the retry.
+        ctx.accept = False
+        self.turn(ctx, user_message="something else")
+        self.assertTrue(wait_until(lambda: len(ctx.injected) == 2))
+        self.assertTrue(wait_until(lambda: self.sessions()[0]["tier"] == "pull"))
+        # Then the turn the first push was put in for comes late.
+        ctx.accept = True
+        self.turn(ctx, user_message=first)
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 6), "not confirmed when taken again")
+        self.assertEqual(len(ctx.injected), 2, "put in again after its turn showed it")
+
     def test_a_reply_handed_to_a_wait_that_is_ending_is_still_shown(self):
         # The wait's last look comes just before the reply is handed to it, so
         # the wait never returns it. It must come back and be shown, not be lost.
