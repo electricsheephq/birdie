@@ -199,11 +199,23 @@ def now():
 
 
 def turn_text(user_message):
-    """A turn's user message as text. A list of content parts works too: only the
-    message ids are looked for in it."""
-    if user_message is None:
-        return ""
-    return user_message if isinstance(user_message, str) else str(user_message)
+    """A turn's user message as text: a string, or the text of a list of content parts."""
+    if isinstance(user_message, str):
+        return user_message
+    if isinstance(user_message, (list, tuple)):
+        return "\n".join(part if isinstance(part, str) else str(part.get("text") or "")
+                         for part in user_message if isinstance(part, (str, dict)))
+    return ""
+
+
+# The opening tag frame() and push_frame() write. Content can't contain one (frame
+# cleans it), so a message that only mentions another one's id doesn't match.
+SHOWN = re.compile(r'<' + TAG + r' from="(?:[^"\\]|\\.)*" message_id="([^"\\]+)"')
+
+
+def shown_ids(user_message):
+    """The ids of the birdie messages a turn's user message shows."""
+    return set(SHOWN.findall(turn_text(user_message)))
 
 
 class Conversation:
@@ -230,6 +242,9 @@ class Conversation:
         # Pushed and accepted by Hermes, but no turn has shown them yet:
         # message id -> (message, time.monotonic() deadline). Still claimed.
         self.pending = {}
+        # Given back because no turn showed them in time. A turn can still show
+        # one late; it then counts as delivered when delivery takes it again.
+        self.expired = collections.OrderedDict()
 
     def was_delivered(self, message_id):
         with self.lock:
@@ -562,6 +577,13 @@ class Network:
                 waiter = None if seen or put_in else conversation.waiting.get(thread)
                 if waiter is not None:
                     waiter.put(message)
+                # Reserved before Hermes is asked, so a turn that shows it, or a wait
+                # for its thread, finds it even when it comes before inject_message
+                # returns.
+                reserved = not seen and not put_in and waiter is None and self.sees_turn_text
+                if reserved:
+                    conversation.pending[message["id"]] = (message, time.monotonic() + PENDING_SECONDS)
+                    conversation.expired.pop(message["id"], None)
             if seen:
                 self.bus.ack(message["id"])
                 return
@@ -572,7 +594,8 @@ class Network:
             if conversation.pull_only:
                 # Taken just before it was made pull-only: back to the queue for
                 # birdie_check_inbox. Asking again ends any loop on a stale flag.
-                self.bus.nack(message["id"])
+                if self.unreserve(conversation, message, reserved):
+                    self.bus.nack(message["id"])
                 try:
                     self.report(conversation)
                 except BusError:
@@ -584,9 +607,7 @@ class Network:
                     accepted = bool(self.ctx.inject_message(push_frame(message), session_key=conversation.route or None))
                 except Exception:
                     log.warning("birdie: Hermes refused a message", exc_info=True)
-            if accepted and self.sees_turn_text:
-                with conversation.lock:
-                    conversation.pending[message["id"]] = (message, time.monotonic() + PENDING_SECONDS)
+            if accepted and reserved:
                 return
             if accepted:
                 with conversation.lock:
@@ -594,24 +615,38 @@ class Network:
                 conversation.mark_delivered(message["id"])
                 self.bus.ack(message["id"])
                 return
-            self.bus.nack(message["id"])
+            if self.unreserve(conversation, message, reserved):
+                self.bus.nack(message["id"])
             conversation.wake = False
             self.report(conversation)
         except BusError as err:
             log.debug("birdie: delivery: %s", err)  # its lease ends and it comes back
 
+    @staticmethod
+    def unreserve(conversation, message, reserved):
+        """Takes back a reservation for a message Hermes wasn't given or refused.
+        False if a turn or a wait has shown it meanwhile, so it isn't given back."""
+        if not reserved:
+            return True
+        with conversation.lock:
+            return conversation.pending.pop(message["id"], None) is not None
+
     def confirm_shown(self, conversation, user_message):
         """Confirms the pushed messages a turn shows. Hermes may fold several into one
-        turn, or wrap them, so it looks for each message's id in the turn's text."""
-        text = turn_text(user_message)
-        if not text:
+        turn, or wrap them, so it reads the ids of the frames in the turn's text. One
+        given back before its turn came late is remembered as delivered, and is
+        confirmed when delivery takes it again, not put in a second time."""
+        ids = shown_ids(user_message)
+        if not ids:
             return
         with conversation.lock:
-            shown = [message for ident, (message, _) in conversation.pending.items() if ident in text]
+            shown = [conversation.pending.pop(ident)[0] for ident in ids if ident in conversation.pending]
             for message in shown:
-                del conversation.pending[message["id"]]
                 conversation.remember(message["id"])
                 conversation.shown.setdefault(message.get("thread_id", ""), []).append(message)
+            for ident in ids:
+                if conversation.expired.pop(ident, None) is not None:
+                    conversation.remember(ident)
         for message in shown:
             try:
                 self.bus.ack(message["id"])
@@ -628,11 +663,15 @@ class Network:
             late = [message for message, deadline in conversation.pending.values() if deadline <= cutoff]
             for message in late:
                 del conversation.pending[message["id"]]
+                conversation.expired[message["id"]] = True
+            while len(conversation.expired) > MAX_DELIVERED:
+                conversation.expired.popitem(last=False)
+            if late:
+                conversation.wake = False
         if not late:
             return
         log.warning("birdie: Hermes accepted %d pushed message(s) that no turn showed in %d s; "
                     "they're back in the inbox", len(late), PENDING_SECONDS)
-        conversation.wake = False
         for message in late:
             try:
                 self.bus.nack(message["id"])
