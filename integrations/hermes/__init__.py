@@ -682,7 +682,10 @@ class Network:
             try:
                 self.bus.ack(ident, timeout=CONFIRM_SECONDS)
             except BusError as err:
-                log.debug("birdie: confirm: %s", err)  # it comes back and is confirmed then
+                # The rest are remembered too: each comes back and is confirmed then.
+                # Stopping here keeps a hung bus from holding the turn for each one.
+                log.debug("birdie: confirm: %s", err)
+                break
 
     def shows_in_full(self, conversation, text, ident, thread):
         """Whether a turn's text holds the whole frame of a message for this
