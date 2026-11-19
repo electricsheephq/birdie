@@ -29,6 +29,12 @@ behind a turn already running. It never changes a turn in progress.
 `birdie session pull-only hermes/NAME on` stops one conversation from being woken,
 with no restart. It then reads its messages with `birdie_check_inbox`.
 
+A pushed message counts as delivered once a turn shows it, not when Hermes says yes
+to it: Hermes can accept a push and still drop its turn. One that no turn shows
+within 10 minutes goes back to the inbox, and the conversation is reported as pull,
+so senders are told it only gets messages when it checks. Its next turn turns waking
+back on, and the waiting messages are pushed again.
+
 Hermes keeps the agent's token itself, as its `BIRDIE_HERMES_TOKEN` secret. Setup
 doesn't read or write Hermes's `.env`, so if Hermes doesn't have the token yet, setup
 prints it with what to do:

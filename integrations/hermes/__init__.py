@@ -199,12 +199,11 @@ def now():
 
 
 def turn_text(user_message):
-    """A turn's user message as text: a string, or a list of content parts."""
-    if isinstance(user_message, str):
-        return user_message
-    if isinstance(user_message, (list, tuple)):
-        return "\n".join(part.get("text") or "" if isinstance(part, dict) else str(part) for part in user_message)
-    return "" if user_message is None else str(user_message)
+    """A turn's user message as text. A list of content parts works too: only the
+    message ids are looked for in it."""
+    if user_message is None:
+        return ""
+    return user_message if isinstance(user_message, str) else str(user_message)
 
 
 class Conversation:
