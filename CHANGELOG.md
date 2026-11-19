@@ -80,14 +80,14 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   senders were told it only gets messages when it checks. A conversation that
   ended is no longer brought back the same way (#37).
 - A message pushed into a Hermes conversation counts as delivered only once a
-  turn shows it. Hermes says yes when it schedules the turn, and can still drop
-  the turn after that, for example on a shared group chat whose session was
-  just reset. Such a message was marked delivered and never shown. Now, if no
-  turn shows it within 10 minutes, it goes back to the inbox, and the
-  conversation is reported as pull until its next turn, so its sender is told
-  it only gets it when it checks. This needs a Hermes that passes the turn's
-  user message to plugins; with an older one, a message counts as delivered
-  when Hermes says yes, as before.
+  turn shows it. Hermes says yes when it schedules the turn, and can still
+  drop the turn after that, for example on a shared group chat whose session
+  was just reset. Such a message was marked delivered and never shown. Now, if
+  no turn shows it within 10 minutes, it goes back to the inbox, and the
+  conversation is reported as pull until its next turn, so new senders are
+  told it only gets messages when it checks. This needs a Hermes that passes
+  the turn's user message to plugins; with an older one, a message counts as
+  delivered when Hermes says yes, as before.
 - The setup and migration tests pass on macOS, and they never touch the real
   config folder (#20).
 - A stalled daemon can't hold up a session's bridge forever: reporting or
