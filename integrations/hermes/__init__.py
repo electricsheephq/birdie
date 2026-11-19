@@ -45,6 +45,9 @@ MAX_PUSH_BYTES = 100 << 10  # a longer message is pushed as a pointer to birdie_
 # How long a pushed message may wait for the turn that shows it. Hermes can accept a
 # push and drop it later, and its turn can also wait behind a long one.
 PENDING_SECONDS = 600
+# A turn's hook confirms what it shows within Hermes's time for pre_llm_call. A
+# confirmation that times out is safe: the message comes back and is confirmed then.
+CONFIRM_SECONDS = 2
 
 # Runs with no person in the conversation, or that birdie itself starts over ACP
 # for one message. They can send and wait for their own answers, but aren't
@@ -127,8 +130,8 @@ class Bus:
         path = "/v1/inbox?" + urllib.parse.urlencode(query)
         return self.call("GET", path, timeout=wait + 30).get("messages") or []
 
-    def ack(self, message_id):
-        self.call("POST", f"/v1/messages/{urllib.parse.quote(message_id, safe='')}/ack")
+    def ack(self, message_id, timeout=10):
+        self.call("POST", f"/v1/messages/{urllib.parse.quote(message_id, safe='')}/ack", timeout=timeout)
 
     def nack(self, message_id):
         self.call("POST", f"/v1/messages/{urllib.parse.quote(message_id, safe='')}/nack")
@@ -646,18 +649,23 @@ class Network:
         if not ids:
             return
         with conversation.lock:
-            shown = [conversation.pending.pop(ident)[0] for ident in ids if ident in conversation.pending]
+            # Every shown frame this conversation hasn't confirmed: its own pushes,
+            # ones given back before their turn came late, and ones another copy of
+            # the plugin put in before a restart or reload, whose turn Hermes kept.
+            # The bus only confirms a message that is still claimed, so one given
+            # back is confirmed when delivery takes it again.
+            new = [ident for ident in ids if ident not in conversation.delivered]
+            shown = [conversation.pending.pop(ident)[0] for ident in new if ident in conversation.pending]
             for message in shown:
-                conversation.remember(message["id"])
                 conversation.shown.setdefault(message.get("thread_id", ""), []).append(message)
-            # Its expired mark is kept through a new push, which Hermes may refuse,
-            # and cleared once a turn shows it.
-            for ident in ids:
-                if conversation.expired.pop(ident, None) is not None:
-                    conversation.remember(ident)
-        for message in shown:
+            # An expired mark is kept through a new push, which Hermes may refuse,
+            # and cleared once a turn shows the message.
+            for ident in new:
+                conversation.expired.pop(ident, None)
+                conversation.remember(ident)
+        for ident in new:
             try:
-                self.bus.ack(message["id"])
+                self.bus.ack(ident, timeout=CONFIRM_SECONDS)
             except BusError as err:
                 log.debug("birdie: confirm: %s", err)  # it comes back and is confirmed then
 
