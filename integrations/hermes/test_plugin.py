@@ -51,6 +51,12 @@ def pull_only(on):
         db.execute("UPDATE sessions SET pull_only = ? WHERE agent = 'hermes'", (int(on),))
 
 
+def status(message_id):
+    with sqlite3.connect(DB, timeout=10) as db:
+        row = db.execute("SELECT status FROM messages WHERE id = ?", (message_id,)).fetchone()
+    return row[0] if row else None
+
+
 def peer_inbox(wait=0):
     messages = peer("GET", f"/v1/inbox?wait={wait}").get("messages") or []
     for message in messages:
@@ -230,6 +236,67 @@ class PluginTest(PluginCase):
         # Its confirmation was lost and its lease ran out, so it comes again.
         network.deliver(network.conversation("s1"), {"id": sent["id"], "thread_id": sent["thread_id"], "from": "peer", "content": "once"})
         self.assertEqual(len(ctx.injected), 1, "a message put in once must not be put in again")
+
+    # Hermes says yes to a push when it schedules the turn, and its gateway can still
+    # drop the turn after that. A host that shows the plugin its turns lets a push be
+    # confirmed when its turn shows it.
+    def test_a_push_is_confirmed_only_when_a_turn_shows_it(self):
+        self.write_config(True)
+        ctx, _ = self.load()
+        self.turn(ctx, user_message="hello")
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "wake up"})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        time.sleep(1.5)
+        self.assertEqual(status(sent["id"]), "claimed", "confirmed before any turn showed it")
+        self.turn(ctx, user_message="[from the gateway] " + ctx.injected[0][1])
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered"))
+        self.assertEqual(len(ctx.injected), 1, "a message put in once must not be put in again")
+
+    def test_a_turn_with_content_parts_confirms_its_push(self):
+        self.write_config(True)
+        ctx, _ = self.load()
+        self.turn(ctx, user_message="hello")
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "parts"})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        self.turn(ctx, user_message=[{"type": "text", "text": ctx.injected[0][1]}])
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered"))
+
+    def test_a_push_no_turn_shows_goes_back_to_the_inbox(self):
+        self.write_config(True)
+        ctx, _ = self.load()
+        self.turn(ctx, user_message="hello")
+        with mock.patch.object(plugin, "PENDING_SECONDS", 1):
+            sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "dropped by the gateway"})
+            self.assertTrue(wait_until(lambda: ctx.injected))
+            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued", 6), "a push the gateway dropped was lost")
+        self.assertTrue(wait_until(lambda: self.sessions()[0]["tier"] == "pull"), "senders aren't told it must check")
+        self.assertEqual(len(ctx.injected), 1, "put in again with no turn in between")
+        self.assertIn("dropped by the gateway", self.call(ctx, "birdie_check_inbox"))
+        self.assertEqual(status(sent["id"]), "delivered")
+
+    def test_a_push_waiting_for_its_turn_is_neither_put_in_again_nor_confirmed(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        self.turn(ctx, user_message="hello")
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "once"})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        # Its lease ran out before its turn came, and delivery took it again.
+        network.deliver(network.conversation("s1"), {"id": sent["id"], "thread_id": sent["thread_id"], "from": "peer", "content": "once"})
+        self.assertEqual(len(ctx.injected), 1, "a message put in once must not be put in again")
+        self.assertEqual(status(sent["id"]), "claimed", "confirmed before any turn showed it")
+
+    def test_wait_for_reply_returns_a_reply_already_put_in(self):
+        self.write_config(True)
+        ctx, _ = self.load()
+        self.turn(ctx, user_message="hello")
+        sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}))
+        reply = peer("POST", "/v1/messages", {"in_reply_to": peer_inbox(5)[0]["id"], "content": "the answer"})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        started = time.monotonic()
+        result = self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 5})
+        self.assertIn("the answer", result)
+        self.assertLess(time.monotonic() - started, 2, "waited for a reply that was already put in")
+        self.assertEqual(status(reply["id"]), "delivered")
 
     def test_a_reply_handed_to_a_wait_that_is_ending_is_still_shown(self):
         # The wait's last look comes just before the reply is handed to it, so

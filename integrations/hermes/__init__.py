@@ -42,6 +42,9 @@ CLARIFY = "(question / not a steer)"  # starts a reply that asks before acting
 STATUS_SECONDS = 2  # how long wait_for_reply's extra read of the thread's status may take
 AWAITING = "Thread status: awaiting_clarification (its latest reply asks the agent that started it questions before acting)."
 MAX_PUSH_BYTES = 100 << 10  # a longer message is pushed as a pointer to birdie_get_thread
+# How long a pushed message may wait for the turn that shows it. Hermes can accept a
+# push and drop it later, and its turn can also wait behind a long one.
+PENDING_SECONDS = 600
 
 # Runs with no person in the conversation, or that birdie itself starts over ACP
 # for one message. They can send and wait for their own answers, but aren't
@@ -195,6 +198,15 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def turn_text(user_message):
+    """A turn's user message as text: a string, or a list of content parts."""
+    if isinstance(user_message, str):
+        return user_message
+    if isinstance(user_message, (list, tuple)):
+        return "\n".join(part.get("text") or "" if isinstance(part, dict) else str(part) for part in user_message)
+    return "" if user_message is None else str(user_message)
+
+
 class Conversation:
     def __init__(self, ident, name, cwd, is_session):
         self.id = ident
@@ -216,6 +228,9 @@ class Conversation:
         # comes back (its confirmation was lost and its lease ran out) is
         # confirmed, not put in again.
         self.delivered = collections.OrderedDict()
+        # Pushed and accepted by Hermes, but no turn has shown them yet:
+        # message id -> (message, time.monotonic() deadline). Still claimed.
+        self.pending = {}
 
     def was_delivered(self, message_id):
         with self.lock:
@@ -223,9 +238,13 @@ class Conversation:
 
     def mark_delivered(self, message_id):
         with self.lock:
-            self.delivered[message_id] = True
-            while len(self.delivered) > MAX_DELIVERED:
-                self.delivered.popitem(last=False)
+            self.remember(message_id)
+
+    def remember(self, message_id):
+        """mark_delivered, for a caller that holds the lock."""
+        self.delivered[message_id] = True
+        while len(self.delivered) > MAX_DELIVERED:
+            self.delivered.popitem(last=False)
 
 
 def notifier(bus):
@@ -265,6 +284,10 @@ class Network:
         self.stopped = set()  # routes whose turn the user stopped
         self.notifier_stamp = None  # set while heartbeat2 is offered a notifier
         self.notifier_lock = threading.RLock()  # an offer never follows its own withdraw
+        # Hermes passes pre_llm_call the turn's user message, so a push can be
+        # confirmed when its turn shows it. Without that, it's confirmed when
+        # Hermes accepts it, as before.
+        self.sees_turn_text = False
 
     # What Hermes offers varies by version. These use its public API where it has
     # one, and otherwise read the turn's session variables.
@@ -382,9 +405,12 @@ class Network:
                 log.debug("birdie: no system prompt section", exc_info=True)
 
     # Hooks. A broken bus must never break a Hermes turn.
-    def before_turn(self, session_id="", platform="", parent_session_id="", is_first_turn=False, **_):
+    def before_turn(self, session_id="", platform="", parent_session_id="", is_first_turn=False, **kwargs):
         try:
             conversation = self.conversation(session_id, platform or "", parent_session_id)
+            if "user_message" in kwargs:
+                self.sees_turn_text = True
+                self.confirm_shown(conversation, kwargs["user_message"])
             lines = []
             if is_first_turn and not self.intro_in_prompt:
                 lines.append(self.intro())
@@ -501,6 +527,7 @@ class Network:
             with self.lock:
                 conversations = [c for c in self.conversations.values() if c.is_session]
             for conversation in conversations:
+                self.expire_pending(conversation)
                 try:
                     self.report(conversation)
                 except BusError as err:
@@ -516,22 +543,32 @@ class Network:
                 continue
             for message in messages:
                 self.deliver(conversation, message)
+            self.expire_pending(conversation)
 
     def deliver(self, conversation, message):
-        """Confirms a message only once Hermes accepts it. A refused one goes back to
+        """Puts a message into the conversation. Hermes accepting it only means the
+        turn is scheduled: the gateway can still drop it after that. So where Hermes
+        shows the plugin its turns, the message is confirmed when a turn shows it
+        (confirm_shown), and until then it stays claimed. A refused one goes back to
         the queue for birdie_check_inbox, and the next turn tries waking again."""
         thread = message.get("thread_id", "")
         try:
-            if conversation.was_delivered(message["id"]):
-                self.bus.ack(message["id"])
-                return
             with conversation.lock:
+                # One look under the lock, so a turn confirming it at the same
+                # moment can't make it look new.
+                seen = message["id"] in conversation.delivered
+                put_in = message["id"] in conversation.pending
                 # Under the lock, so a wait that is ending can't miss it: the wait
                 # confirms it once it returns it, or gives it back.
-                waiter = conversation.waiting.get(thread)
+                waiter = None if seen or put_in else conversation.waiting.get(thread)
                 if waiter is not None:
                     waiter.put(message)
-            if waiter is not None:
+            if seen:
+                self.bus.ack(message["id"])
+                return
+            if put_in or waiter is not None:
+                # Put in already and waiting for its turn: taking it again only
+                # renewed its lease. Neither put it in again nor confirm it.
                 return
             if conversation.pull_only:
                 # Taken just before it was made pull-only: back to the queue for
@@ -548,6 +585,10 @@ class Network:
                     accepted = bool(self.ctx.inject_message(push_frame(message), session_key=conversation.route or None))
                 except Exception:
                     log.warning("birdie: Hermes refused a message", exc_info=True)
+            if accepted and self.sees_turn_text:
+                with conversation.lock:
+                    conversation.pending[message["id"]] = (message, time.monotonic() + PENDING_SECONDS)
+                return
             if accepted:
                 with conversation.lock:
                     conversation.shown.setdefault(thread, []).append(message)
@@ -559,6 +600,49 @@ class Network:
             self.report(conversation)
         except BusError as err:
             log.debug("birdie: delivery: %s", err)  # its lease ends and it comes back
+
+    def confirm_shown(self, conversation, user_message):
+        """Confirms the pushed messages a turn shows. Hermes may fold several into one
+        turn, or wrap them, so it looks for each message's id in the turn's text."""
+        text = turn_text(user_message)
+        if not text:
+            return
+        with conversation.lock:
+            shown = [message for ident, (message, _) in conversation.pending.items() if ident in text]
+            for message in shown:
+                del conversation.pending[message["id"]]
+                conversation.remember(message["id"])
+                conversation.shown.setdefault(message.get("thread_id", ""), []).append(message)
+        for message in shown:
+            try:
+                self.bus.ack(message["id"])
+            except BusError as err:
+                log.debug("birdie: confirm: %s", err)  # it comes back and is confirmed then
+
+    def expire_pending(self, conversation):
+        """Gives back pushes that no turn showed in time. Hermes accepted them, then
+        dropped them or hasn't got to them yet. They wait for birdie_check_inbox, and
+        the conversation reports as pull, so their senders are told it only sees
+        them when it checks. Its next turn turns waking on again."""
+        cutoff = time.monotonic()
+        with conversation.lock:
+            late = [message for message, deadline in conversation.pending.values() if deadline <= cutoff]
+            for message in late:
+                del conversation.pending[message["id"]]
+        if not late:
+            return
+        log.warning("birdie: Hermes accepted %d pushed message(s) that no turn showed in %d s; "
+                    "they're back in the inbox", len(late), PENDING_SECONDS)
+        conversation.wake = False
+        for message in late:
+            try:
+                self.bus.nack(message["id"])
+            except BusError as err:
+                log.debug("birdie: give back: %s", err)  # its lease ends and it comes back
+        try:
+            self.report(conversation)
+        except BusError as err:
+            log.debug("birdie: couldn't report a session: %s", err)
 
     # Tools.
     def take(self, conversation, wait=0, thread=None):
@@ -583,9 +667,20 @@ class Network:
         then nothing is handed over, and the caller fetches instead."""
         with conversation.lock:
             shown = conversation.shown.pop(thread, [])
-            if shown:
-                return shown, True
-            waiter = conversation.waiting[thread] = queue.Queue()
+            # Put in, and its turn hasn't come yet: the wait shows it now, so it's confirmed here.
+            pushed = [message for message, _ in conversation.pending.values() if message.get("thread_id", "") == thread]
+            for message in pushed:
+                del conversation.pending[message["id"]]
+                conversation.remember(message["id"])
+            if not shown and not pushed:
+                waiter = conversation.waiting[thread] = queue.Queue()
+        if shown or pushed:
+            for message in pushed:
+                try:
+                    self.bus.ack(message["id"])
+                except BusError as err:
+                    log.debug("birdie: confirm: %s", err)  # it comes back and is confirmed then
+            return shown + pushed, True
         try:
             try:
                 # Only now that delivery would hand the reply here: it may have been
