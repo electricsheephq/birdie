@@ -88,6 +88,11 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   told it only gets messages when it checks. This needs a Hermes that passes
   the turn's user message to plugins; with an older one, a message counts as
   delivered when Hermes says yes, as before.
+- A push that was still waiting for its turn when Hermes restarted or reloaded
+  the plugin is confirmed when that turn shows it in full, instead of being
+  put in a second time. A turn's hook also gives up on a confirmation after 2
+  seconds, and stops at the first one that fails, so a bus that hangs holds
+  the turn up much less; the message comes back and is confirmed then (#48).
 - The setup and migration tests pass on macOS, and they never touch the real
   config folder (#20).
 - A stalled daemon can't hold up a session's bridge forever: reporting or

@@ -357,6 +357,43 @@ class PluginTest(PluginCase):
         self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 6), "not confirmed when taken again")
         self.assertEqual(len(ctx.injected), 2, "put in again after its turn showed it")
 
+    def test_a_push_put_in_before_a_reload_is_confirmed_when_its_turn_shows_it(self):
+        # Hermes keeps the turn it accepted, and runs it after the plugin reloads.
+        self.write_config(True)
+        old_ctx, old = self.load()
+        self.turn(old_ctx, user_message="hello")
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "before the reload"})
+        self.assertTrue(wait_until(lambda: old_ctx.injected))
+        old.close()
+        ctx, _ = self.load()
+        self.turn(ctx, user_message=old_ctx.injected[0][1])
+        # Delivered now, so when the old claim runs out it isn't taken and put in again.
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 4), "the new copy didn't confirm it")
+
+    def test_a_pasted_tag_doesnt_confirm_a_push_another_conversation_waits_for(self):
+        self.write_config(True)
+        ctx, _ = self.load()
+        self.turn(ctx, user_message="hello")
+        sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "for s1 only"})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        tag = ctx.injected[0][1].splitlines()[0]
+        self.turn(ctx, session="s2", user_message="what is this? " + tag)
+        time.sleep(1)
+        self.assertEqual(status(sent["id"]), "claimed", "a pasted tag confirmed a push no turn showed")
+
+    def test_a_turn_confirms_what_it_shows_within_hermess_time(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        self.turn(ctx, user_message="hello")
+        peer("POST", "/v1/messages", {"to": "hermes", "content": "quick"})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        timeouts = []
+        ack = network.bus.ack
+        with mock.patch.object(network.bus, "ack", side_effect=lambda ident, timeout=10: (timeouts.append(timeout), ack(ident, timeout))[1]):
+            self.turn(ctx, user_message=ctx.injected[0][1])
+        self.assertEqual(timeouts, [plugin.CONFIRM_SECONDS])
+        self.assertLessEqual(plugin.CONFIRM_SECONDS, 5)
+
     def test_a_reply_handed_to_a_wait_that_is_ending_is_still_shown(self):
         # The wait's last look comes just before the reply is handed to it, so
         # the wait never returns it. It must come back and be shown, not be lost.
