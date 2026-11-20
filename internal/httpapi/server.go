@@ -92,7 +92,7 @@ func (s *server) inbox(w http.ResponseWriter, r *http.Request, a bus.Agent) {
 		wait = time.Duration(secs * float64(time.Second))
 	}
 	in := bus.ReceiveInput{Agent: a.Name, Thread: r.URL.Query().Get("thread_id"), Session: r.URL.Query().Get("session"), Wait: wait,
-		Push: r.URL.Query().Get("push") == "1"}
+		Push: r.URL.Query().Get("push") == "1", At: r.URL.Query().Get("at")}
 	if v := r.URL.Query().Get("lease"); v != "" {
 		secs, err := strconv.ParseFloat(v, 64)
 		if err != nil || secs < 0 {
@@ -106,7 +106,22 @@ func (s *server) inbox(w http.ResponseWriter, r *http.Request, a bus.Agent) {
 		s.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"messages": msgs})
+	err = r.Context().Err()
+	if err == nil {
+		err = writeJSON(w, http.StatusOK, map[string]any{"messages": msgs})
+	}
+	if err != nil && in.Lease > 0 && len(msgs) > 0 {
+		// The caller couldn't read the claim. Return it even if the request
+		// was cancelled, including any reservation it made for a digest.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+		defer cancel()
+		for _, m := range msgs {
+			if err := s.b.Nack(ctx, a.Name, m.ID, m.LeaseUntil); err != nil {
+				s.log.Error("return unwritten inbox claim", "id", m.ID, "err", err)
+				break
+			}
+		}
+	}
 }
 
 func (s *server) unread(w http.ResponseWriter, r *http.Request, a bus.Agent) {
@@ -119,15 +134,24 @@ func (s *server) unread(w http.ResponseWriter, r *http.Request, a bus.Agent) {
 }
 
 func (s *server) ack(w http.ResponseWriter, r *http.Request, a bus.Agent) {
-	if err := s.b.Ack(r.Context(), a.Name, r.PathValue("id")); err != nil {
-		s.fail(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	s.settle(w, r, a, s.b.Ack)
 }
 
 func (s *server) nack(w http.ResponseWriter, r *http.Request, a bus.Agent) {
-	if err := s.b.Nack(r.Context(), a.Name, r.PathValue("id")); err != nil {
+	s.settle(w, r, a, s.b.Nack)
+}
+
+func (s *server) settle(w http.ResponseWriter, r *http.Request, a bus.Agent, call func(context.Context, string, string, ...int64) error) {
+	var lease int64
+	if v := r.URL.Query().Get("lease_until"); v != "" {
+		var err error
+		lease, err = strconv.ParseInt(v, 10, 64)
+		if err != nil || lease <= 0 {
+			s.fail(w, errors.Join(bus.ErrInvalid, errors.New("lease_until must be a positive timestamp")))
+			return
+		}
+	}
+	if err := call(r.Context(), a.Name, r.PathValue("id"), lease); err != nil {
 		s.fail(w, err)
 		return
 	}
@@ -204,8 +228,8 @@ func (s *server) fail(w http.ResponseWriter, err error) {
 	writeJSON(w, status, body)
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func writeJSON(w http.ResponseWriter, status int, v any) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	return json.NewEncoder(w).Encode(v)
 }

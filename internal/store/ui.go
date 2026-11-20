@@ -45,17 +45,18 @@ func (s *SQLite) RecentThreads(ctx context.Context, limit int) ([]ThreadSummary,
 	out := []ThreadSummary{}
 	for rows.Next() {
 		var ts ThreadSummary
-		var problem int
+		var problem, priority int
 		var senders, recipients string
 		var meta string
 		var created, delivered, errorAt, next int64
 		m := &ts.Last.Message
 		if err := rows.Scan(&ts.ID, &ts.Count, &problem, &senders, &recipients,
-			&m.ID, &m.ThreadID, &m.InReplyTo, &m.From, &m.To, &m.FromSession, &m.ToSession, &m.Content, &meta, &m.Status, &m.Attempts, &created,
+			&m.ID, &m.ThreadID, &m.InReplyTo, &m.From, &m.To, &m.FromSession, &m.ToSession, &m.Content, &meta, &m.Status, &m.Attempts, &created, &priority,
 			&delivered, &ts.Last.TakenBy, &ts.Last.Error, &errorAt, &next); err != nil {
 			return nil, err
 		}
 		m.CreatedAt = time.UnixMilli(created).UTC()
+		m.Priority = priorityName(priority)
 		ts.Last.Delivered, ts.Last.ErrorAt = unixMilli(delivered), unixMilli(errorAt)
 		if m.Status == bus.StatusQueued && ts.Last.Error != "" {
 			ts.Last.Retry = unixMilli(next)

@@ -182,12 +182,15 @@ type Message struct {
 	To        string `json:"to"`
 	// FromSession and ToSession pin the message to sessions of those agents.
 	// An empty ToSession means whichever session takes new conversations.
-	FromSession string            `json:"from_session,omitempty"`
-	ToSession   string            `json:"to_session,omitempty"`
-	Content     string            `json:"content"`
-	Meta        map[string]string `json:"meta,omitempty"`
-	Status      string            `json:"status"`
-	CreatedAt   time.Time         `json:"created_at"`
+	FromSession string `json:"from_session,omitempty"`
+	ToSession   string `json:"to_session,omitempty"`
+	Content     string `json:"content"`
+	Priority    string `json:"priority,omitempty"`
+	// ContentBytes replaces Content in a positioned claim for an oversized P3.
+	ContentBytes int               `json:"content_bytes,omitempty"`
+	Meta         map[string]string `json:"meta,omitempty"`
+	Status       string            `json:"status"`
+	CreatedAt    time.Time         `json:"created_at"`
 	// Note says when the recipient will see the message. Only set on the
 	// result of a send.
 	Note string `json:"note,omitempty"`
@@ -200,10 +203,18 @@ type Message struct {
 	// address one of them instead.
 	OtherSessions []SessionRef `json:"other_sessions,omitempty"`
 
-	Attempts int `json:"-"`
+	Attempts   int   `json:"-"`
+	LeaseUntil int64 `json:"lease_until,omitempty"`
 }
 
+const (
+	Midturn        = "midturn"
+	Boundary       = "boundary"
+	MaxDigestBytes = 64 << 10
+)
+
 type SendInput struct {
+	Priority  string            `json:"priority,omitempty"`
 	To        string            `json:"to"`
 	Content   string            `json:"content"`
 	ThreadID  string            `json:"thread_id,omitempty"`
@@ -227,11 +238,14 @@ type ReceiveInput struct {
 	// Push marks a claim by a delivery that puts messages into the session's
 	// conversation on its own. A pull-only session gets nothing from one.
 	Push bool
+	// At is the recipient turn position, or empty for legacy delivery.
+	At string
 }
 
 // ClaimFilter is ReceiveInput as the store needs it.
 type ClaimFilter struct {
 	Agent, Thread, Session string
+	At                     string
 	// Unpinned also takes messages not pinned to any session.
 	Unpinned bool
 	// Orphans, with Unpinned, also takes messages pinned to a session that is
@@ -289,8 +303,8 @@ type Store interface {
 	// MarkClaimed records that a Deliverer is working on the message.
 	MarkClaimed(ctx context.Context, id string) error
 	// Settle moves a claimed message addressed to agent to delivered (ok) or
-	// back to queued. It reports whether anything changed.
-	Settle(ctx context.Context, id, agent string, ok bool, at time.Time) (bool, error)
+	// back to queued. A nonzero leaseUntil identifies the claim to settle.
+	Settle(ctx context.Context, id, agent string, ok bool, at time.Time, leaseUntil int64) (bool, error)
 	// MarkReplied records that agent answered the message and reports whether
 	// the row changed. For claimed or queued messages, a nonempty session
 	// must match the claim or address, respectively. Sessionless replies can
