@@ -535,10 +535,15 @@ func (s *SQLite) CountInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 	return n, err
 }
 
-func (s *SQLite) CountSent(ctx context.Context, from, to string, since time.Time) (int, error) {
+func (s *SQLite) CountSent(ctx context.Context, from, to, fromSession, toSession string, since time.Time) (int, error) {
+	q := `SELECT COUNT(*) FROM messages WHERE sender = ? AND recipient = ? AND created_at >= ?`
+	args := []any{from, to, since.UnixMilli()}
+	if fromSession != "" && toSession != "" {
+		q += ` AND from_session = ? AND to_session = ?`
+		args = append(args, fromSession, toSession)
+	}
 	var n int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM messages WHERE sender = ? AND recipient = ? AND created_at >= ?`, from, to, since.UnixMilli()).Scan(&n)
+	err := s.db.QueryRowContext(ctx, q, args...).Scan(&n)
 	return n, err
 }
 
@@ -601,10 +606,19 @@ func (s *SQLite) Settle(ctx context.Context, id, agent string, ok bool, at time.
 	return n > 0, err
 }
 
-func (s *SQLite) MarkReplied(ctx context.Context, id, agent string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE messages SET status = 'replied', lease_until = 0,
-		delivered_at = COALESCE(delivered_at, ?) WHERE id = ? AND recipient = ? AND status != 'failed'`, time.Now().UnixMilli(), id, agent)
-	return err
+func (s *SQLite) MarkReplied(ctx context.Context, id, agent, session string, sameAgent bool) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE messages SET status = 'replied', lease_until = 0,
+		delivered_at = COALESCE(delivered_at, ?1)
+		WHERE id = ?2 AND recipient = ?3 AND status != 'failed'
+		  AND (status != 'replied' OR lease_until != 0 OR delivered_at IS NULL)
+		  AND (NOT ?4 OR status IN ('delivered', 'replied') OR (?5 != '' AND (
+		       (status = 'claimed' AND taken_by = ?5) OR (status = 'queued' AND to_session = ?5))))`,
+		time.Now().UnixMilli(), id, agent, sameAgent, session)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 func (s *SQLite) ReleaseOutbound(ctx context.Context) error {

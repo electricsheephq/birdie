@@ -593,9 +593,6 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	} else if err != nil {
 		return Message{}, err
 	}
-	if err := b.admit(ctx, from, to.Name); err != nil {
-		return Message{}, err
-	}
 	toSession := pinned
 	var others []SessionRef // running sessions with the name that were passed over
 	name := addr.Session
@@ -630,6 +627,9 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		}
 		toSession, others, name = s.ID, more, s.Name
 	}
+	if err := b.admit(ctx, from, to.Name, in.FromSession, toSession); err != nil {
+		return Message{}, err
+	}
 
 	id := randHex(12)
 	if thread == "" {
@@ -657,9 +657,9 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	}
 	b.emitMessage(StatusQueued, m, "", "")
 	if parent.ID != "" {
-		if err := b.store.MarkReplied(ctx, parent.ID, from); err != nil {
+		if changed, err := b.store.MarkReplied(ctx, parent.ID, from, in.FromSession, parent.From == parent.To); err != nil {
 			b.log.Error("mark replied", "id", parent.ID, "err", err)
-		} else if parent.To == from && parent.Status != StatusFailed {
+		} else if changed {
 			b.emitMessage(StatusReplied, parent, "", "")
 		}
 	}
@@ -889,7 +889,7 @@ func (b *Bus) Notice(ctx context.Context, m Message, kind, text string) error {
 
 // admit decides whether from may message to right now. Rules about who may
 // reach whom belong here, including any later ones for other machines.
-func (b *Bus) admit(ctx context.Context, from, to string) error {
+func (b *Bus) admit(ctx context.Context, from, to, fromSession, toSession string) error {
 	limit := b.LoopLimit
 	if limit == 0 {
 		limit = DefaultLoopLimit
@@ -897,11 +897,15 @@ func (b *Bus) admit(ctx context.Context, from, to string) error {
 	if limit < 0 {
 		return nil
 	}
-	n, err := b.store.CountSent(ctx, from, to, time.Now().Add(-LoopWindow))
+	n, err := b.store.CountSent(ctx, from, to, fromSession, toSession, time.Now().Add(-LoopWindow))
 	if err != nil {
 		return err
 	}
 	if n >= limit {
+		if fromSession != "" && toSession != "" {
+			from = (Address{Agent: from, Session: fromSession}).String()
+			to = (Address{Agent: to, Session: toSession}).String()
+		}
 		return fmt.Errorf("%w: %s has sent %s %d messages in the last %v, which looks like a loop; check with your user before continuing",
 			ErrLoop, from, to, n, LoopWindow)
 	}
