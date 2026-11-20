@@ -47,3 +47,24 @@ func TestAClaimStaysWithinItsByteBudget(t *testing.T) {
 		}
 	}
 }
+
+func TestAFutureMessageNeverAsksAClaimToWaitMoreThanTenSeconds(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "bus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().Truncate(time.Millisecond)
+	m := bus.Message{
+		ID: "future", ThreadID: "thr", From: "a", To: "b", Content: "stop",
+		Status: bus.StatusQueued, Priority: "p0", CreatedAt: now.Add(time.Minute),
+	}
+	if err := st.InsertMessage(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	got, delay, err := st.ClaimInbox(ctx, bus.ClaimFilter{Agent: "b", At: bus.Midturn, Limit: 50}, now)
+	if err != nil || len(got) != 0 || delay != bus.CoalesceMax {
+		t.Fatalf("claim took %d rows and asked to wait %v, %v, want only a %v wait", len(got), delay, err, bus.CoalesceMax)
+	}
+}

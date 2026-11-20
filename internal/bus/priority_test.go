@@ -138,15 +138,49 @@ func TestAP0HasDoubleTheLoopLimitAndCountsTowardBothLimits(t *testing.T) {
 	}
 }
 
-func TestAP0AndAP3SentASecondApartGoInOneIdleClaim(t *testing.T) {
+func TestAnOldHeldP3RidesWithFreshMailAfterItSettles(t *testing.T) {
 	p := newPriorityInbox(t)
+	held := p.send(t, "alice", "p3", "earlier update")
+	*p.now = p.now.Add(time.Minute)
+	p.claim(t, bus.Boundary)
 	p0 := p.send(t, "alice", "p0", "stop")
+	p.claim(t, bus.Boundary)
 	*p.now = p.now.Add(time.Second)
 	p3 := p.send(t, "carol", "p3", "details")
 	*p.now = p.now.Add(2 * time.Second)
 	p.claim(t, bus.Boundary)
 	*p.now = p.now.Add(time.Second)
-	p.claim(t, bus.Boundary, p0.ID, p3.ID)
+	p.claim(t, bus.Boundary, p0.ID, held.ID, p3.ID)
+}
+
+func TestAP0CarriesAtMostThreeHundredRowsAndLeavesTheRestQueued(t *testing.T) {
+	p := newPriorityInbox(t)
+	var held []string
+	for range 400 {
+		held = append(held, p.send(t, "alice", "p3", "update").ID)
+	}
+	*p.now = p.now.Add(time.Minute)
+	p0 := p.send(t, "carol", "p0", "stop")
+	*p.now = p.now.Add(bus.Coalesce)
+	got, err := p.ReceiveFor(context.Background(), bus.ReceiveInput{
+		Agent: "bob", Session: "desk", Push: true, At: bus.Midturn, Lease: 2 * time.Minute,
+	})
+	if err != nil || len(got) != 300 {
+		t.Fatalf("p0 carry claimed %d rows, %v, want 300", len(got), err)
+	}
+	if got[0].ID != p0.ID {
+		t.Fatalf("first row = %s, want p0 %s", got[0].ID, p0.ID)
+	}
+	for i, m := range got[1:] {
+		if m.ID != held[i] {
+			t.Fatalf("row %d = %s, want %s", i+1, m.ID, held[i])
+		}
+	}
+	p.ack(t, got)
+	p.claim(t, bus.Midturn)
+	next := p.send(t, "carol", "p0", "stop again")
+	*p.now = p.now.Add(bus.Coalesce)
+	p.claim(t, bus.Midturn, append([]string{next.ID}, held[299:]...)...)
 }
 
 func TestALoneP0WakesAWaitingClaimAfterThreeSeconds(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -98,7 +99,12 @@ const (
 	trackCols = `COALESCE(m.delivered_at, 0), m.taken_by, m.last_error, m.error_at, m.next_attempt_at`
 )
 
-type SQLite struct{ db *sql.DB }
+type SQLite struct {
+	db *sql.DB
+	// A canceled claim can lose its DB connection while checking its window.
+	settleMu sync.Mutex
+	settling map[settleKey]settleWindow
+}
 
 var _ bus.Store = (*SQLite)(nil)
 
@@ -455,18 +461,52 @@ func positionGate(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where stri
 	return " AND m.priority != 3", false, nil
 }
 
-// settleDelay checks both ages after applying the position gate. A fresh
-// message that would stay held cannot delay a claim. Using the same
-// transaction keeps new arrivals from slipping into a settled batch.
-func settleDelay(ctx context.Context, tx *sql.Tx, where string, args []any, now time.Time) (time.Duration, error) {
+type settleKey struct{ agent, session, predicate string }
+
+type settleWindow struct{ deadline, newest time.Time }
+
+// settleDelay uses only fresh mail that passed the position gate. Holding the
+// claim transaction keeps new arrivals from slipping into a settled batch.
+func (s *SQLite) settleDelay(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where string, args []any, now time.Time) (time.Duration, error) {
+	cutoff := now.Add(-bus.CoalesceMax)
 	var oldest, newest sql.NullInt64
-	err := tx.QueryRowContext(ctx, `SELECT MIN(m.created_at), MAX(m.created_at) FROM messages m WHERE`+where, args...).Scan(&oldest, &newest)
-	if err != nil || !oldest.Valid {
+	err := tx.QueryRowContext(ctx, `SELECT MIN(m.created_at), MAX(m.created_at) FROM messages m WHERE`+where+
+		` AND m.created_at > ?`, append(args, cutoff.UnixMilli())...).Scan(&oldest, &newest)
+	if err != nil {
 		return 0, err
 	}
-	quiet := time.UnixMilli(newest.Int64).Add(bus.Coalesce)
-	latest := time.UnixMilli(oldest.Int64).Add(bus.CoalesceMax)
-	return max(0, min(quiet.Sub(now), latest.Sub(now))), nil
+	s.settleMu.Lock()
+	defer s.settleMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	for key, window := range s.settling {
+		if window.deadline.Before(cutoff) {
+			delete(s.settling, key)
+		}
+	}
+	key := settleKey{f.Agent, f.Session, where}
+	if !oldest.Valid {
+		delete(s.settling, key)
+		return 0, nil
+	}
+	oldestAt, newestAt := time.UnixMilli(oldest.Int64), time.UnixMilli(newest.Int64)
+	maxWait := min(bus.CoalesceMax, oldestAt.Add(bus.CoalesceMax).Sub(now))
+	// Keep the cap for an overlapping batch when its earliest rows age out
+	// of the query. Without this, a steady stream can keep moving the cap.
+	if window, ok := s.settling[key]; ok && !oldestAt.After(window.newest) {
+		maxWait = min(maxWait, window.deadline.Sub(now))
+	}
+	delay := min(newestAt.Add(bus.Coalesce).Sub(now), maxWait)
+	if delay <= 0 {
+		delete(s.settling, key)
+		return 0, nil
+	}
+	if s.settling == nil {
+		s.settling = make(map[settleKey]settleWindow)
+	}
+	s.settling[key] = settleWindow{deadline: now.Add(maxWait), newest: newestAt}
+	return delay, nil
 }
 
 func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Time) ([]bus.Message, time.Duration, error) {
@@ -487,16 +527,15 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 		}
 		where += gate
 		if f.Thread == "" {
-			delay, err := settleDelay(ctx, tx, where, args, now)
+			delay, err := s.settleDelay(ctx, tx, f, where, args, now)
 			if err != nil || delay > 0 {
 				return nil, delay, err
 			}
 		}
 		if carry {
-			// A push frame can fit more than the normal row limit. Each
-			// member takes at least its opening and closing tags, so the
-			// bridge cannot fit a prefix longer than this.
-			limit = bus.MaxPushFrameBytes / len("<birdie-message></birdie-message>")
+			// A carry can exceed the normal batch size, but even tiny
+			// messages must leave the rest queued after 300 rows.
+			limit = 300
 		}
 		order = "CASE m.priority WHEN 0 THEN 0 WHEN 3 THEN 2 ELSE 1 END, m.seq"
 		cols = strings.Replace(msgCols, "m.content", digestContent, 1)
