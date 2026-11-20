@@ -92,17 +92,15 @@ func TestAP0PassesFiftyHeldMessagesAtEitherPosition(t *testing.T) {
 				held = append(held, p.send(t, "alice", "p3", "update").ID)
 			}
 			urgent := p.send(t, "carol", "p0", "stop")
-			want := []string{urgent.ID}
-			if at == "boundary" {
-				want = append(want, held[:49]...)
-			}
+			*p.now = p.now.Add(3 * time.Second)
+			want := append([]string{urgent.ID}, held...)
 			p.ack(t, p.claim(t, at, want...))
 			p.claim(t, at)
 		})
 	}
 }
 
-func TestAP0PassesTheLoopGuardAndCountsTowardIt(t *testing.T) {
+func TestAP0HasDoubleTheLoopLimitAndCountsTowardBothLimits(t *testing.T) {
 	p := newPriorityInbox(t)
 	p.LoopLimit = 0
 	p.report(t, time.Time{})
@@ -130,6 +128,75 @@ func TestAP0PassesTheLoopGuardAndCountsTowardIt(t *testing.T) {
 	if err := send("p3"); !errors.Is(err, bus.ErrLoop) || !strings.Contains(err.Error(), "13 messages") {
 		t.Fatalf("p3 after p0: %v, want ErrLoop counting all 13 sends", err)
 	}
+	for i := 13; i < 2*bus.DefaultLoopLimit; i++ {
+		if err := send("p0"); err != nil {
+			t.Fatalf("send %d with p0: %v", i+1, err)
+		}
+	}
+	if err := send("p0"); !errors.Is(err, bus.ErrLoop) || !strings.Contains(err.Error(), "p0 limit") {
+		t.Fatalf("25th send with p0: %v, want ErrLoop naming the p0 limit", err)
+	}
+}
+
+func TestAP0AndAP3SentASecondApartGoInOneIdleClaim(t *testing.T) {
+	p := newPriorityInbox(t)
+	p0 := p.send(t, "alice", "p0", "stop")
+	*p.now = p.now.Add(time.Second)
+	p3 := p.send(t, "carol", "p3", "details")
+	*p.now = p.now.Add(2 * time.Second)
+	p.claim(t, bus.Boundary)
+	*p.now = p.now.Add(time.Second)
+	p.claim(t, bus.Boundary, p0.ID, p3.ID)
+}
+
+func TestALoneP0WakesAWaitingClaimAfterThreeSeconds(t *testing.T) {
+	p := newPriorityInbox(t)
+	p.Now = nil
+	m := p.send(t, "alice", "p0", "stop")
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	got, err := p.ReceiveFor(ctx, bus.ReceiveInput{
+		Agent: "bob", Session: "desk", Push: true, At: bus.Midturn, Wait: 5 * time.Second,
+	})
+	age := time.Since(m.CreatedAt)
+	if err != nil || len(got) != 1 || got[0].ID != m.ID || age < 3*time.Second-time.Millisecond || age > 4*time.Second {
+		t.Fatalf("lone p0 claimed after %v: %v, %v, want its message at about 3s", age, got, err)
+	}
+}
+
+func TestASteadyStreamSettlesWithinTenSeconds(t *testing.T) {
+	p := newPriorityInbox(t)
+	var ids []string
+	for second := range 15 {
+		ids = append(ids, p.send(t, "alice", "p0", "stop").ID)
+		switch {
+		case second == 10:
+			p.ack(t, p.claim(t, bus.Midturn, ids...))
+			ids = nil
+		default:
+			p.claim(t, bus.Midturn)
+		}
+		*p.now = p.now.Add(time.Second)
+	}
+	*p.now = p.now.Add(2 * time.Second)
+	p.claim(t, bus.Midturn, ids...)
+}
+
+func TestAMidturnP0CarriesHeldMailAndRestartsTheDigestClock(t *testing.T) {
+	p := newPriorityInbox(t)
+	p3 := p.send(t, "alice", "p3", strings.Repeat("a", 40<<10))
+	overflow := p.send(t, "alice", "p3", strings.Repeat("b", 40<<10))
+	p1 := p.send(t, "carol", "p1", "answer")
+	*p.now = p.now.Add(19 * time.Minute)
+	p.claim(t, bus.Midturn)
+	p0 := p.send(t, "dora", "p0", "stop")
+	*p.now = p.now.Add(3 * time.Second)
+	p.ack(t, p.claim(t, bus.Midturn, p0.ID, p1.ID, p3.ID))
+
+	*p.now = p.now.Add(20*time.Minute - time.Millisecond)
+	p.claim(t, bus.Boundary)
+	*p.now = p.now.Add(time.Millisecond)
+	p.claim(t, bus.Boundary, overflow.ID)
 }
 
 func TestAP1SentMidturnWaitsForTheBoundaryAndRidesWithP3(t *testing.T) {
@@ -142,6 +209,7 @@ func TestAP1SentMidturnWaitsForTheBoundaryAndRidesWithP3(t *testing.T) {
 		t.Fatalf("notes = %q, %q", answer.Note, fyi.Note)
 	}
 	p.claim(t, "midturn")
+	*p.now = p.now.Add(3 * time.Second)
 	p.claim(t, "boundary", answer.ID, fyi.ID)
 }
 
@@ -170,6 +238,8 @@ func TestTheCacheRuleReleasesFreshP3AfterFiftyMinutesIdle(t *testing.T) {
 	}
 	p.claim(t, "boundary")
 	*p.now = p.now.Add(time.Millisecond)
+	p.claim(t, "boundary")
+	*p.now = p.now.Add(3*time.Second - time.Millisecond)
 	p.claim(t, "boundary", m.ID)
 }
 
@@ -214,6 +284,8 @@ func TestLegacyClaimsAndUnrankedMailKeepTheirDelivery(t *testing.T) {
 	if unranked.Priority != "" || ranked.Priority != "p3" {
 		t.Fatalf("effective priorities = %q, %q", unranked.Priority, ranked.Priority)
 	}
+	p.claim(t, "midturn")
+	*p.now = p.now.Add(3 * time.Second)
 	p.ack(t, p.claim(t, "midturn", unranked.ID))
 	p.claim(t, "", ranked.ID)
 	_, err := p.Send(context.Background(), "alice", bus.SendInput{To: "bob/desk", Content: "invalid", Priority: "p2"})
@@ -281,13 +353,14 @@ func TestReturningARetriedDigestDoesNotEraseItsEarlierReservation(t *testing.T) 
 
 	*p.now = p.now.Add(2 * time.Minute)
 	urgent := p.send(t, "dora", "p0", "stop")
+	*p.now = p.now.Add(3 * time.Second)
 	p.claim(t, "boundary", urgent.ID, first.ID)
 	p.ack(t, []bus.Message{urgent})
 	if err := p.Nack(context.Background(), "bob", first.ID); err != nil {
 		t.Fatal(err)
 	}
 	p.claim(t, "boundary")
-	*p.now = p.now.Add(bus.DigestEvery - 2*time.Minute)
+	*p.now = p.now.Add(bus.DigestEvery - 2*time.Minute - 3*time.Second)
 	p.ack(t, p.claim(t, "boundary", first.ID))
 	*p.now = p.now.Add(bus.DigestEvery)
 	p.claim(t, "boundary", second.ID)

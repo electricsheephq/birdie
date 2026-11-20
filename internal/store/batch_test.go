@@ -31,7 +31,7 @@ func TestAClaimStaysWithinItsByteBudget(t *testing.T) {
 	}
 	claim := func() []string {
 		t.Helper()
-		got, err := st.ClaimInbox(ctx, bus.ClaimFilter{Agent: "b", Unpinned: true, Limit: 50}, now)
+		got, _, err := st.ClaimInbox(ctx, bus.ClaimFilter{Agent: "b", Unpinned: true, Limit: 50}, now)
 		if err != nil {
 			t.Fatal(err)
 		}

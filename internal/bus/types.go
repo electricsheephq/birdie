@@ -208,9 +208,10 @@ type Message struct {
 }
 
 const (
-	Midturn        = "midturn"
-	Boundary       = "boundary"
-	MaxDigestBytes = 64 << 10
+	Midturn           = "midturn"
+	Boundary          = "boundary"
+	MaxDigestBytes    = 64 << 10
+	MaxPushFrameBytes = 256 << 10
 )
 
 type SendInput struct {
@@ -287,9 +288,10 @@ type Store interface {
 	// with there, with anyone, or "" if it did that without a session or
 	// took no part.
 	ThreadSession(ctx context.Context, threadID, from, agent string) (string, error)
-	// ClaimInbox takes up to f.Limit messages for f.Agent, oldest first:
-	// queued ones and claimed ones whose lease ran out.
-	ClaimInbox(ctx context.Context, f ClaimFilter, now time.Time) ([]Message, error)
+	// ClaimInbox takes queued messages and claims whose lease ran out. A
+	// positioned P0 batch can exceed f.Limit to fill a push frame. A positive
+	// duration means eligible messages are settling and nothing was claimed.
+	ClaimInbox(ctx context.Context, f ClaimFilter, now time.Time) ([]Message, time.Duration, error)
 	// CountInbox counts what ClaimInbox would take.
 	CountInbox(ctx context.Context, f ClaimFilter, now time.Time) (int, error)
 	// CountSent counts messages between the two agents since a time. The

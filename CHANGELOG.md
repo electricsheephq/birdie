@@ -35,13 +35,16 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 
 ### Added
 
-- `send_message` accepts `p0`, `p1`, or `p3`. Claude Code offers P0
-  immediately, shows P1 at turn boundaries, and batches P3 into digests.
+- `send_message` accepts `p0`, `p1`, or `p3`. Claude Code shows P1 at
+  turn boundaries and batches P3 into digests. Push claims batch due mail
+  after 3 seconds of quiet or 10 seconds from the oldest due message.
+  A P0 can carry held P1 and P3 at either turn position, and any P3 it
+  carries resets the digest clock.
   Unranked messages keep their existing delivery. Claude Code's `check_inbox`
   can read held messages while pushes are on. Claude Code push frames carry up
-  to 256 KiB of rendered text and return overflow to the queue. P0 bypasses
-  the loop guard and still counts toward it. Oversized P3 messages show a
-  pointer preview in the activity feed.
+  to 256 KiB of rendered text and return overflow to the queue. P0 has
+  double the usual loop limit, and all priorities count toward it.
+  Oversized P3 messages show a pointer preview in the activity feed.
 
 - Clarify-back. A session that isn't sure what a new request wants replies
   `(question / not a steer)` with up to 3 numbered questions. The sender then

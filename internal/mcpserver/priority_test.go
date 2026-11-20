@@ -238,6 +238,7 @@ func TestAClaudeFrameReturnsTheOverflowInClaimOrder(t *testing.T) {
 	unranked := f.send(t, "bob", "", body)
 	p0 := f.send(t, "carol", "p0", body)
 
+	f.now.Add((3 * time.Second).Milliseconds())
 	poll.resume <- nil
 	if frame := f.frame(t, p0, p1); len(frame) > 256<<10 {
 		t.Fatalf("first frame is %d bytes", len(frame))
@@ -255,20 +256,15 @@ func TestAClaudeFrameReturnsTheOverflowInClaimOrder(t *testing.T) {
 	f.statusIs(t, p3, bus.StatusDelivered)
 }
 
-func TestABusyClaudeShowsOnlyP0UntilItsTurnEnds(t *testing.T) {
+func TestABusyClaudeCarriesHeldMailWithP0(t *testing.T) {
 	f := newClaudeInbox(t, "busy")
 	poll := f.poll(t, "midturn")
 	p1 := f.send(t, "alice", "p1", "answer")
 	p3 := f.send(t, "bob", "p3", "progress")
 	p0 := f.send(t, "carol", "p0", "stop")
-	f.status("idle")
+	f.now.Add((3 * time.Second).Milliseconds())
 	poll.resume <- nil
-	f.frame(t, p0)
-	poll = f.poll(t, "boundary")
-	f.statusIs(t, p1, bus.StatusQueued)
-	f.statusIs(t, p3, bus.StatusQueued)
-	poll.resume <- nil
-	f.frame(t, p1, p3)
+	f.frame(t, p0, p1, p3)
 }
 
 func TestAnIdleClaudePollTakesNewP1AndThenP3ComingDue(t *testing.T) {
@@ -276,6 +272,7 @@ func TestAnIdleClaudePollTakesNewP1AndThenP3ComingDue(t *testing.T) {
 	poll := f.poll(t, "boundary")
 	poll.resume <- nil
 	p1 := f.send(t, "alice", "p1", "answer")
+	f.now.Add((3 * time.Second).Milliseconds())
 	f.frame(t, p1)
 
 	poll = f.poll(t, "boundary")
@@ -296,22 +293,33 @@ func TestAClaudeTurnStartingAfterTheClaimGivesBackHeldMembers(t *testing.T) {
 	poll := f.poll(t, "boundary")
 	p1 := f.send(t, "alice", "p1", "answer")
 	p3 := f.send(t, "bob", "p3", "progress")
-	p0 := f.send(t, "carol", "p0", "stop")
 	unranked := f.send(t, "alice", "", "unranked")
+	f.now.Add((3 * time.Second).Milliseconds())
 	poll.resume <- func() { f.status("waiting") }
-	f.frame(t, p0, unranked)
+	f.frame(t, unranked)
 	poll = f.poll(t, "midturn")
 	f.statusIs(t, p1, bus.StatusQueued)
 	f.statusIs(t, p3, bus.StatusQueued)
 	f.status("idle")
-	// Wake this midturn poll with a new P0. The next poll can release
-	// the returned P1 and P3 at the boundary.
+	// A later P0 can carry the returned members.
 	next := f.send(t, "carol", "p0", "stop again")
+	f.now.Add((3 * time.Second).Milliseconds())
 	poll.resume <- nil
-	f.frame(t, next)
-	poll = f.poll(t, "boundary")
-	poll.resume <- nil
-	f.frame(t, p1, p3)
+	f.frame(t, next, p1, p3)
+}
+
+func TestAClaudeP0CarriesHeldMailEvenIfATurnStartsAfterTheClaim(t *testing.T) {
+	f := newClaudeInbox(t, "idle")
+	poll := f.poll(t, "boundary")
+	p1 := f.send(t, "alice", "p1", "answer")
+	p3 := f.send(t, "bob", "p3", "progress")
+	p0 := f.send(t, "carol", "p0", "stop")
+	f.now.Add((3 * time.Second).Milliseconds())
+	poll.resume <- func() { f.status("waiting") }
+	f.frame(t, p0, p1, p3)
+	f.poll(t, "midturn")
+	f.statusIs(t, p1, bus.StatusDelivered)
+	f.statusIs(t, p3, bus.StatusDelivered)
 }
 
 func TestCheckInboxTakesHeldMailEvenWhileClaudePushes(t *testing.T) {

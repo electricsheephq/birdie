@@ -73,12 +73,15 @@ func (w failedInboxWriter) Write([]byte) (int, error) {
 func TestAnUnwrittenInboxResponseGivesItsClaimBack(t *testing.T) {
 	api, b := priorityAPI(t)
 	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	b.Now = func() time.Time { return now }
 	m, err := b.Send(ctx, "alice", bus.SendInput{To: "bob/desk", Content: "answer", Priority: "p1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodGet, "/v1/inbox?session=desk&push=1&at=boundary&lease=120", nil)
 	req.Header.Set("Authorization", "Bearer bob-tok")
+	now = now.Add(3 * time.Second)
 	api.ServeHTTP(failedInboxWriter{ResponseRecorder: httptest.NewRecorder()}, req)
 	msgs, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bob", Session: "desk", Push: true, At: "boundary"})
 	if err != nil || len(msgs) != 1 || msgs[0].ID != m.ID {

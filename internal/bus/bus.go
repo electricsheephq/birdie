@@ -61,6 +61,8 @@ const (
 	DigestEvery = 20 * time.Minute
 	Valve       = 40 * time.Minute
 	CacheIdle   = 50 * time.Minute
+	Coalesce    = 3 * time.Second
+	CoalesceMax = 10 * time.Second
 )
 
 type Bus struct {
@@ -756,12 +758,13 @@ func (b *Bus) ReceiveFor(ctx context.Context, in ReceiveInput) ([]Message, error
 			held, err = b.store.SessionPullOnly(ctx, in.Agent, in.Session)
 		}
 		var msgs []Message
+		var settleIn time.Duration
 		if err == nil && !held {
 			now := b.now()
 			var f ClaimFilter
 			f, err = b.claimFilter(ctx, in, now)
 			if err == nil {
-				msgs, err = b.store.ClaimInbox(ctx, f, now)
+				msgs, settleIn, err = b.store.ClaimInbox(ctx, f, now)
 			}
 		}
 		if err != nil || len(msgs) > 0 {
@@ -780,6 +783,9 @@ func (b *Bus) ReceiveFor(ctx context.Context, in ReceiveInput) ([]Message, error
 		}
 		if held {
 			remaining = min(remaining, PullOnlyCheck)
+		}
+		if settleIn > 0 {
+			remaining = min(remaining, settleIn)
 		}
 		timer := time.NewTimer(remaining)
 		select {
@@ -972,20 +978,28 @@ func (b *Bus) admit(ctx context.Context, from, to, fromSession, toSession, prior
 	if limit == 0 {
 		limit = DefaultLoopLimit
 	}
-	if limit < 0 || priority == "p0" {
+	if limit < 0 {
 		return nil
 	}
 	n, err := b.store.CountSent(ctx, from, to, fromSession, toSession, b.now().Add(-LoopWindow))
 	if err != nil {
 		return err
 	}
-	if n >= limit {
+	reached := n >= limit
+	reason := "which looks like a loop"
+	if priority == "p0" {
+		// The same window counts all priorities. Divide the count so doubling
+		// a very large configured limit cannot overflow.
+		reached = n/2 >= limit
+		reason = "which reaches the p0 limit and looks like a loop"
+	}
+	if reached {
 		if fromSession != "" && toSession != "" {
 			from = (Address{Agent: from, Session: fromSession}).String()
 			to = (Address{Agent: to, Session: toSession}).String()
 		}
-		return fmt.Errorf("%w: %s has sent %s %d messages in the last %v, which looks like a loop; check with your user before continuing",
-			ErrLoop, from, to, n, LoopWindow)
+		return fmt.Errorf("%w: %s has sent %s %d messages in the last %v, %s; check with your user before continuing",
+			ErrLoop, from, to, n, LoopWindow, reason)
 	}
 	return nil
 }
@@ -1062,7 +1076,7 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 		if at != "" {
 			switch {
 			case m.Priority == "p0":
-				return "p0: offered to the session at once; its host may hold peer messages for its user first"
+				return "p0: offered after a short batching window; its host may hold peer messages for its user first"
 			case m.Priority == "p1" && at == Midturn:
 				return "held: sees this when its turn ends"
 			case m.Priority == "p3":

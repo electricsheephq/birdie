@@ -287,10 +287,7 @@ func (h *claudeHost) Push(ctx context.Context, session string, m bus.Message) er
 	return err
 }
 
-const (
-	maxClaudeFrameBytes  = 256 << 10
-	claudeFrameSeparator = "\n\n"
-)
+const claudeFrameSeparator = "\n\n"
 
 func (h *claudeHost) pushClaim(ctx context.Context, session, at string, msgs []bus.Message) (shown, returned []bus.Message, err error) {
 	text := make([]string, len(msgs))
@@ -322,11 +319,14 @@ func (h *claudeHost) pushClaim(ctx context.Context, session, at string, msgs []b
 		return nil, nil, errUnsure
 	}
 	shown = msgs
-	if at == bus.Boundary && (e.Status == "busy" || e.Status == "waiting") {
+	// Positioned claims put P0 first. A P0 batch is allowed at either
+	// position, even if the recipient started a turn after the claim.
+	p0 := len(msgs) > 0 && msgs[0].Priority == "p0"
+	if at == bus.Boundary && !p0 && (e.Status == "busy" || e.Status == "waiting") {
 		shown = nil
 		kept := text[:0]
 		for i, m := range msgs {
-			if m.Priority == "" || m.Priority == "p0" {
+			if m.Priority == "" {
 				shown = append(shown, m)
 				kept = append(kept, text[i])
 			} else {
@@ -343,7 +343,7 @@ func (h *claudeHost) pushClaim(ctx context.Context, session, at string, msgs []b
 	size := len(text[0])
 	for i := 1; i < len(text); i++ {
 		size += len(claudeFrameSeparator) + len(text[i])
-		if size > maxClaudeFrameBytes {
+		if size > bus.MaxPushFrameBytes {
 			returned = append(returned, shown[i:]...)
 			shown, text = shown[:i], text[:i]
 			break

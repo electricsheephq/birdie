@@ -402,21 +402,27 @@ func inboxWhere(f bus.ClaimFilter, now time.Time) (string, []any) {
 // positionGate runs in the claim transaction so overlapping polls cannot
 // both reserve the same digest window. The age checks use the same inbox
 // predicate as the claim, including leases that have run out.
-func positionGate(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where string, args []any, now time.Time) (string, error) {
+func positionGate(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where string, args []any, now time.Time) (gate string, carry bool, err error) {
 	var oldestHeld, oldestP3 sql.NullInt64
-	var ready bool
-	err := tx.QueryRowContext(ctx, `SELECT MIN(CASE WHEN m.priority IN (1, 3) THEN m.created_at END),
+	var ready, p0 bool
+	err = tx.QueryRowContext(ctx, `SELECT MIN(CASE WHEN m.priority IN (1, 3) THEN m.created_at END),
 		MIN(CASE WHEN m.priority = 3 THEN m.created_at END),
-		COALESCE(MAX(m.priority IN (-1, 0, 1)), 0) FROM messages m WHERE`+where, args...).Scan(&oldestHeld, &oldestP3, &ready)
+		COALESCE(MAX(m.priority IN (-1, 0, 1)), 0),
+		COALESCE(MAX(m.priority = 0), 0) FROM messages m WHERE`+where, args...).Scan(&oldestHeld, &oldestP3, &ready, &p0)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
+	// P0 brings held mail at either turn position. P3 that fits counts as
+	// a digest release, including when it rides with a midturn P0.
+	if p0 && f.Thread == "" {
+		return "", true, nil
+	}
 	if f.At == bus.Boundary && (ready || !oldestP3.Valid) {
-		return "", nil
+		return "", false, nil
 	}
 	if f.At == bus.Midturn && (!oldestHeld.Valid || oldestHeld.Int64 > now.Add(-bus.Valve).UnixMilli()) {
-		return " AND m.priority IN (-1, 0)", nil
+		return " AND m.priority IN (-1, 0)", false, nil
 	}
 
 	var lastRelease, lastDigest int64
@@ -424,54 +430,81 @@ func positionGate(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where stri
 		COALESCE(MAX(CASE WHEN digest THEN released_at END), 0)
 		FROM inbox_releases WHERE recipient = ? AND session = ?`, f.Agent, f.Session).Scan(&lastRelease, &lastDigest)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if f.At == bus.Midturn {
 		if lastRelease == 0 || lastRelease <= now.Add(-bus.Valve).UnixMilli() {
-			return "", nil
+			return "", false, nil
 		}
-		return " AND m.priority IN (-1, 0)", nil
+		return " AND m.priority IN (-1, 0)", false, nil
 	}
 	cutoff := now.Add(-bus.DigestEvery).UnixMilli()
 	// Cache age can release fresh mail, but overflow still waits for the
 	// next digest window or an immediate message it can ride with.
 	if lastDigest == 0 || lastDigest <= cutoff {
 		if oldestP3.Int64 <= cutoff {
-			return "", nil
+			return "", false, nil
 		}
 		var idle bool
 		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sessions
 			WHERE agent = ? AND id = ? AND active_at <= ?)`, f.Agent, f.Session, now.Add(-bus.CacheIdle).UnixMilli()).Scan(&idle)
 		if err != nil || idle {
-			return "", err
+			return "", false, err
 		}
 	}
-	return " AND m.priority != 3", nil
+	return " AND m.priority != 3", false, nil
 }
 
-func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Time) ([]bus.Message, error) {
+// settleDelay checks both ages after applying the position gate. A fresh
+// message that would stay held cannot delay a claim. Using the same
+// transaction keeps new arrivals from slipping into a settled batch.
+func settleDelay(ctx context.Context, tx *sql.Tx, where string, args []any, now time.Time) (time.Duration, error) {
+	var oldest, newest sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT MIN(m.created_at), MAX(m.created_at) FROM messages m WHERE`+where, args...).Scan(&oldest, &newest)
+	if err != nil || !oldest.Valid {
+		return 0, err
+	}
+	quiet := time.UnixMilli(newest.Int64).Add(bus.Coalesce)
+	latest := time.UnixMilli(oldest.Int64).Add(bus.CoalesceMax)
+	return max(0, min(quiet.Sub(now), latest.Sub(now))), nil
+}
+
+func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Time) ([]bus.Message, time.Duration, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer tx.Rollback()
 
 	where, args := inboxWhere(f, now)
 	order, cols := "m.seq", msgCols
 	positioned := f.At != ""
+	limit := f.Limit
 	if positioned {
-		gate, err := positionGate(ctx, tx, f, where, args, now)
+		gate, carry, err := positionGate(ctx, tx, f, where, args, now)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		where += gate
+		if f.Thread == "" {
+			delay, err := settleDelay(ctx, tx, where, args, now)
+			if err != nil || delay > 0 {
+				return nil, delay, err
+			}
+		}
+		if carry {
+			// A push frame can fit more than the normal row limit. Each
+			// member takes at least its opening and closing tags, so the
+			// bridge cannot fit a prefix longer than this.
+			limit = bus.MaxPushFrameBytes / len("<birdie-message></birdie-message>")
+		}
 		order = "CASE m.priority WHEN 0 THEN 0 WHEN 3 THEN 2 ELSE 1 END, m.seq"
 		cols = strings.Replace(msgCols, "m.content", digestContent, 1)
 	}
 	// Sizes first, so only what fits in one batch is read.
-	rows, err := tx.QueryContext(ctx, `SELECT m.id, m.priority, `+contentSize+` FROM messages m WHERE`+where+` ORDER BY `+order+` LIMIT ?`, append(args, f.Limit)...)
+	rows, err := tx.QueryContext(ctx, `SELECT m.id, m.priority, `+contentSize+` FROM messages m WHERE`+where+` ORDER BY `+order+` LIMIT ?`, append(args, limit)...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var ids []any
 	pointers := make(map[string]int)
@@ -481,7 +514,7 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 		var priority, size int
 		if err := rows.Scan(&id, &priority, &size); err != nil {
 			rows.Close()
-			return nil, err
+			return nil, 0, err
 		}
 		if positioned && priority == 3 {
 			if size > bus.MaxDigestBytes {
@@ -501,12 +534,12 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil || len(ids) == 0 {
-		return []bus.Message{}, err
+		return []bus.Message{}, 0, err
 	}
 	msgs, err := collectMessages(tx.QueryContext(ctx,
 		`SELECT `+cols+` FROM messages m WHERE m.id IN (?`+strings.Repeat(", ?", len(ids)-1)+`) ORDER BY `+order, ids...))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	reserved := false
 	for i := range msgs {
@@ -526,26 +559,26 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 			result, err := tx.ExecContext(ctx, `INSERT INTO inbox_releases (recipient, session, digest, released_at)
 				VALUES (?, ?, ?, ?)`, f.Agent, f.Session, m.Priority == "p3", now.UnixMilli())
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			releaseID, err = result.LastInsertId()
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			reserved = true
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE messages SET status = ?, delivered_at = ?, lease_until = ?, taken_by = ?,
 			release_id = ? WHERE id = ?`, m.Status, delivered, m.LeaseUntil, f.Session, releaseID, m.ID)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 	if reserved {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM inbox_releases WHERE released_at <= ?`, now.Add(-bus.Valve).UnixMilli()); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
-	return msgs, tx.Commit()
+	return msgs, 0, tx.Commit()
 }
 
 const contentSize = `length(CAST(m.content AS BLOB))`
