@@ -38,6 +38,7 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 - `send_message` accepts `p0`, `p1`, or `p3`. Claude Code shows P1 at
   turn boundaries and batches P3 into digests. Push claims batch due mail
   after 3 seconds of quiet or 10 seconds from the oldest due message.
+  Sparse polling preserves the batch's original deadline.
   A P0 can carry held P1 and P3 at either turn position, and any P3 it
   carries resets the digest clock.
   Unranked messages keep their existing delivery. Claude Code's `check_inbox`

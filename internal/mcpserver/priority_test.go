@@ -42,6 +42,11 @@ type claudeInbox struct {
 
 func newClaudeInbox(t *testing.T, initialStatus string) *claudeInbox {
 	t.Helper()
+	return newClaudeInboxWithAck(t, initialStatus, nil)
+}
+
+func newClaudeInboxWithAck(t *testing.T, initialStatus string, beforeAck func(*http.Request)) *claudeInbox {
+	t.Helper()
 	f := &claudeInbox{sender: make(map[string]*client.Client), polls: make(chan observedClaim), frames: make(chan string, 16)}
 	f.now.Store(time.Now().UnixMilli())
 	dir := t.TempDir()
@@ -108,6 +113,9 @@ func newClaudeInbox(t *testing.T, initialStatus string) *claudeInbox {
 	}
 	handler := httpapi.New(b, quiet)
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if beforeAck != nil && strings.HasSuffix(r.URL.Path, "/ack") {
+			beforeAck(r)
+		}
 		q := r.URL.Query()
 		if r.URL.Path != "/v1/inbox" || q.Get("push") != "1" {
 			handler.ServeHTTP(w, r)
@@ -265,6 +273,37 @@ func TestABusyClaudeCarriesHeldMailWithP0(t *testing.T) {
 	f.now.Add((3 * time.Second).Milliseconds())
 	poll.resume <- nil
 	f.frame(t, p0, p1, p3)
+}
+
+func TestAClaudeFrameReachesTheSocketBeforeSlowAcksCanOutlastItsLease(t *testing.T) {
+	releaseAck := make(chan struct{}, 1)
+	defer close(releaseAck)
+	var slowPath atomic.Value
+	f := newClaudeInboxWithAck(t, "busy", func(r *http.Request) {
+		if r.URL.Path == slowPath.Load() {
+			select {
+			case <-releaseAck:
+			case <-r.Context().Done():
+			}
+		}
+	})
+	poll := f.poll(t, "midturn")
+	seen := f.send(t, "alice", "p0", "already shown")
+	p0 := f.send(t, "bob", "p0", "new stop")
+	f.srv.markShown(seen, f.srv.convNow())
+	slowPath.Store("/v1/messages/" + seen + "/ack")
+	claimTime := f.now.Add(bus.Coalesce.Milliseconds())
+	leaseEnd := claimTime + client.Lease.Milliseconds()
+	poll.resume <- func() { f.now.Store(leaseEnd - 1) }
+
+	// The old ack cannot finish until after the claim's lease would expire.
+	// The frame must reach the socket while that ack is still held.
+	f.frame(t, p0)
+	f.now.Store(leaseEnd)
+	releaseAck <- struct{}{}
+	f.poll(t, "midturn")
+	f.statusIs(t, p0, bus.StatusDelivered)
+	f.statusIs(t, seen, bus.StatusDelivered)
 }
 
 func TestAnIdleClaudePollTakesNewP1AndThenP3ComingDue(t *testing.T) {

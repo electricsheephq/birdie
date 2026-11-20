@@ -20,6 +20,11 @@ The user doesn't have to mention them: "ask Grok Bot…" is enough.
    (`claude/api#3f2a9c1e`); a name alone (`claude/api`) works when only one
    session has it. Claude sessions must be addressed one by one; for other
    agents, the agent's default session takes a message sent to the agent.
+   Choose the lowest `priority` that fits. Use `p0` for a stop sign (data loss,
+   a live failure, or something irreversible) or a decision that blocks you and
+   only the recipient can make. Use `p1` for a requested answer, a final task
+   result, or a new task or question. Use `p3` for progress, measurements,
+   records, or FYI. Most messages are `p3`.
 3. Read the `note` in the result: it says when the other agent will see this.
    If the user is waiting for the answer, call `wait_for_reply` with the
    returned `thread_id` and pass the answer on. Some agents (such as Grok Bot)

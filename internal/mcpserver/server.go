@@ -339,6 +339,7 @@ func (s *Server) instructions() string {
 
 - list_agents shows who you can reach and what each one is for. Match the user's words to an agent name ("Grok Bot" is grok-bot).
 - send_message sends. Make requests self-contained: the other agent has none of your context. To answer a message, pass its message_id as in_reply_to (to can be left out).
+- Choose the lowest priority that fits. Use p0 for a stop sign (data loss, a live failure, or something irreversible) or a decision that blocks you and only the recipient can make. Use p1 for a requested answer, a final task result, or a new task or question. Use p3 for progress, measurements, records, or FYI. Most messages are p3.
 - When the user is waiting on the answer, call wait_for_reply with the returned thread_id; otherwise carry on and check later.
 - Don't answer replies that are only acknowledgements or thanks, so two agents don't loop.
 - If a new request leaves you unsure what is wanted, ask before acting: reply in its thread starting "(question / not a steer)" with up to 3 numbered questions. The sender sees the thread as awaiting_clarification. When you're sure, just do it.
@@ -514,7 +515,7 @@ func (s *Server) pump(ctx context.Context) {
 		var stop error
 		failed, relearn := false, false
 		b := s.newBatch(ctx)
-		var ready []bus.Message
+		var ready, alreadyShown []bus.Message
 		for _, m := range msgs {
 			// The conversation can change between members or while a
 			// waiter is being handed its reply.
@@ -526,9 +527,12 @@ func (s *Server) pump(ctx context.Context) {
 				continue
 			}
 			if s.wasPushed(m.ID) {
-				// Shown already, but its confirmation was lost and its lease
-				// ran out: confirm it, and don't show it again.
-				b.ack(m)
+				if claude != nil {
+					// A slow ack must not spend the ready frame's lease.
+					alreadyShown = append(alreadyShown, m)
+				} else {
+					b.ack(m)
+				}
 				continue
 			}
 			if s.route(m) {
@@ -563,8 +567,8 @@ func (s *Server) pump(ctx context.Context) {
 			s.remember(m, pollConv)
 			b.ack(m)
 		}
+		var shown, returned []bus.Message
 		if len(ready) > 0 {
-			var shown, returned []bus.Message
 			if stop == nil {
 				stop = s.check(polled, pollConv)
 			}
@@ -586,12 +590,15 @@ func (s *Server) pump(ctx context.Context) {
 			for _, m := range shown {
 				s.remember(m, pollConv)
 			}
-			for _, m := range shown {
-				b.ack(m)
-			}
-			for _, m := range returned {
-				b.nack(m)
-			}
+		}
+		for _, m := range shown {
+			b.ack(m)
+		}
+		for _, m := range alreadyShown {
+			b.ack(m)
+		}
+		for _, m := range returned {
+			b.nack(m)
 		}
 		if relearn {
 			// The bus handed these out, so it may say pull-only is off now:
