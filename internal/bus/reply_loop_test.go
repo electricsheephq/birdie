@@ -12,21 +12,26 @@ import (
 
 func TestAnUnaddressedReplyLeavesTheParentDeliverable(t *testing.T) {
 	for _, tc := range []struct {
-		name, replier, target, recipient string
+		name, sender, replier, target, recipient string
 	}{
-		{"sender follow-up", "sender", "claude/recipient", "recipient"},
-		{"third session reply", "third", "claude/recipient", "recipient"},
-		{"sessionless reply to unpinned mail", "", "claude", ""},
+		{"sender follow-up", "claude", "sender", "claude/recipient", "recipient"},
+		{"third session reply", "claude", "third", "claude/recipient", "recipient"},
+		{"sessionless reply to unpinned mail", "claude", "", "claude", ""},
+		{"another session of a different recipient agent", "codex", "third", "claude/recipient", "recipient"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			b, st := newBus(t)
 			addAgent(t, st, "claude", nil)
 			picksSession(t, st, "claude")
-			for _, session := range []string{"sender", "recipient", "third"} {
+			if tc.sender != "claude" {
+				addAgent(t, st, tc.sender, nil)
+			}
+			report(t, b, tc.sender, "sender", "sender", bus.TierPush, time.Now())
+			for _, session := range []string{"recipient", "third"} {
 				report(t, b, "claude", session, session, bus.TierPush, time.Now())
 			}
-			parent, err := b.Send(ctx, "claude", bus.SendInput{To: tc.target, FromSession: "sender", Content: "question"})
+			parent, err := b.Send(ctx, tc.sender, bus.SendInput{To: tc.target, FromSession: "sender", Content: "question"})
 			if err != nil || parent.ToSession != tc.recipient {
 				t.Fatalf("parent = %+v, %v", parent, err)
 			}
@@ -95,7 +100,9 @@ func TestARecipientReplyMarksTheParentAndOnlyEmitsOnce(t *testing.T) {
 		{"claimed by the replying session", "claude", "claude", "claude", "recipient", bus.StatusClaimed},
 		{"delivered", "claude", "claude", "claude/recipient", "recipient", bus.StatusDelivered},
 		{"queued for the replying session", "claude", "claude", "claude/recipient", "recipient", bus.StatusQueued},
-		{"queued between different agents", "alice", "bob", "bob", "", bus.StatusQueued},
+		{"queued for the replying session of a different agent", "codex", "claude", "claude/recipient", "recipient", bus.StatusQueued},
+		{"queued for a session of a different agent replying without a session", "codex", "claude", "claude/recipient", "", bus.StatusQueued},
+		{"expired for a session of the same agent", "claude", "claude", "claude/recipient", "recipient", bus.StatusExpired},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -105,8 +112,8 @@ func TestARecipientReplyMarksTheParentAndOnlyEmitsOnce(t *testing.T) {
 				addAgent(t, st, tc.recipient, nil)
 			} else {
 				picksSession(t, st, tc.recipient)
-				report(t, b, tc.recipient, tc.session, tc.session, bus.TierPush, time.Now())
 			}
+			report(t, b, tc.recipient, "recipient", "recipient", bus.TierPush, time.Now())
 			parent, err := b.Send(ctx, tc.sender, bus.SendInput{To: tc.to, Content: "question"})
 			if err != nil {
 				t.Fatal(err)
@@ -119,6 +126,20 @@ func TestARecipientReplyMarksTheParentAndOnlyEmitsOnce(t *testing.T) {
 				if got, err := b.ReceiveFor(ctx, inbox); err != nil || len(got) != 1 || got[0].ID != parent.ID || got[0].Status != tc.status {
 					t.Fatalf("recipient got %+v, %v, want %s parent %s", got, err, tc.status, parent.ID)
 				}
+			}
+			if tc.status == bus.StatusExpired {
+				if err := b.EndSession(ctx, tc.recipient, tc.session); err != nil {
+					t.Fatal(err)
+				}
+				now := time.Now()
+				q := bus.HoldQuery{Expire: true, Before: now.Add(time.Hour), Now: now, Limit: 1}
+				if held, _, err := st.SettleHeld(ctx, q, func([]bus.HeldMessage) []bus.Message { return nil }); err != nil || len(held) != 1 || held[0].ID != parent.ID {
+					t.Fatalf("expire parent: %+v, %v", held, err)
+				}
+				if got, err := st.GetMessage(ctx, parent.ID); err != nil || got.Status != bus.StatusExpired {
+					t.Fatalf("parent status before replying = %q, %v, want expired", got.Status, err)
+				}
+				report(t, b, tc.recipient, tc.session, tc.session, bus.TierPush, now)
 			}
 
 			events, stop := b.Watch()
@@ -170,6 +191,26 @@ func TestEachSessionPairHasItsOwnLoopLimit(t *testing.T) {
 			}
 		}
 	}
+	t.Run("a sessionless sender has its own limit", func(t *testing.T) {
+		for i := range bus.DefaultLoopLimit {
+			if _, err := send("", "claude/orchestrator"); err != nil {
+				t.Fatalf("sessionless send %d: %v", i+1, err)
+			}
+		}
+		for _, to := range []string{"claude/orchestrator", "claude"} {
+			if _, err := send("", to); !errors.Is(err, bus.ErrLoop) || !strings.Contains(err.Error(), "claude has sent claude") {
+				t.Errorf("sessionless send 13 to %q: %v, want ErrLoop naming the agent pair", to, err)
+			}
+		}
+		if _, err := send("", "claude/another"); err != nil {
+			t.Fatalf("sessionless send to a different recipient session: %v", err)
+		}
+	})
+	t.Run("an unpinned send counts only the sending session", func(t *testing.T) {
+		if _, err := send(lanes[1], "claude"); err != nil {
+			t.Fatalf("unpinned send from %q: %v", lanes[1], err)
+		}
+	})
 	for i := 8; i < bus.DefaultLoopLimit; i++ {
 		if _, err := send(lanes[0], "claude/orchestrator-id"); err != nil {
 			t.Fatalf("%s send %d: %v", lanes[0], i+1, err)
@@ -181,12 +222,7 @@ func TestEachSessionPairHasItsOwnLoopLimit(t *testing.T) {
 	if _, err := send(lanes[0], "claude/another"); err != nil {
 		t.Fatalf("same sender to a different session: %v", err)
 	}
-	for _, pair := range []struct{ from, to string }{
-		{"", "claude/orchestrator"},
-		{lanes[0], "claude"},
-	} {
-		if _, err := send(pair.from, pair.to); !errors.Is(err, bus.ErrLoop) || !strings.Contains(err.Error(), "claude has sent claude") {
-			t.Errorf("send from %q to %q: %v, want ErrLoop naming the agent pair", pair.from, pair.to, err)
-		}
+	if _, err := send(lanes[0], "claude"); !errors.Is(err, bus.ErrLoop) || !strings.Contains(err.Error(), "claude has sent claude") {
+		t.Errorf("unpinned send from %q: %v, want ErrLoop naming the agent pair", lanes[0], err)
 	}
 }

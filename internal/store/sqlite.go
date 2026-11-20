@@ -536,11 +536,11 @@ func (s *SQLite) CountInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 }
 
 func (s *SQLite) CountSent(ctx context.Context, from, to, fromSession, toSession string, since time.Time) (int, error) {
-	q := `SELECT COUNT(*) FROM messages WHERE sender = ? AND recipient = ? AND created_at >= ?`
-	args := []any{from, to, since.UnixMilli()}
-	if fromSession != "" && toSession != "" {
-		q += ` AND from_session = ? AND to_session = ?`
-		args = append(args, fromSession, toSession)
+	q := `SELECT COUNT(*) FROM messages WHERE sender = ? AND recipient = ? AND from_session = ? AND created_at >= ?`
+	args := []any{from, to, fromSession, since.UnixMilli()}
+	if toSession != "" {
+		q += ` AND to_session = ?`
+		args = append(args, toSession)
 	}
 	var n int
 	err := s.db.QueryRowContext(ctx, q, args...).Scan(&n)
@@ -611,8 +611,11 @@ func (s *SQLite) MarkReplied(ctx context.Context, id, agent, session string, sam
 		delivered_at = COALESCE(delivered_at, ?1)
 		WHERE id = ?2 AND recipient = ?3 AND status != 'failed'
 		  AND (status != 'replied' OR lease_until != 0 OR delivered_at IS NULL)
-		  AND (NOT ?4 OR status IN ('delivered', 'replied') OR (?5 != '' AND (
-		       (status = 'claimed' AND taken_by = ?5) OR (status = 'queued' AND to_session = ?5))))`,
+		  AND (status IN ('delivered', 'replied', 'expired')
+		       OR (?5 = '' AND NOT ?4)
+		       OR (?5 != '' AND (
+		           (status = 'claimed' AND taken_by = ?5)
+		           OR (status = 'queued' AND to_session = ?5))))`,
 		time.Now().UnixMilli(), id, agent, sameAgent, session)
 	if err != nil {
 		return false, err

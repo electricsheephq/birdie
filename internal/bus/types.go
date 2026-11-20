@@ -278,8 +278,9 @@ type Store interface {
 	ClaimInbox(ctx context.Context, f ClaimFilter, now time.Time) ([]Message, error)
 	// CountInbox counts what ClaimInbox would take.
 	CountInbox(ctx context.Context, f ClaimFilter, now time.Time) (int, error)
-	// CountSent counts messages between the two sessions since a time, or
-	// between the two agents if either session is unknown.
+	// CountSent counts messages between the two agents since a time. The
+	// sender session must match, including an empty session. The recipient
+	// session must match when one is given.
 	CountSent(ctx context.Context, from, to, fromSession, toSession string, since time.Time) (int, error)
 
 	DueOutbound(ctx context.Context, now time.Time, limit int) ([]Outbound, error)
@@ -291,8 +292,9 @@ type Store interface {
 	// back to queued. It reports whether anything changed.
 	Settle(ctx context.Context, id, agent string, ok bool, at time.Time) (bool, error)
 	// MarkReplied records that agent answered the message and reports whether
-	// the row changed. Within one agent, only the session that claimed or was
-	// addressed by the message may mark it before delivery.
+	// the row changed. For claimed or queued messages, a nonempty session
+	// must match the claim or address, respectively. Sessionless replies can
+	// mark these messages only between different agents.
 	MarkReplied(ctx context.Context, id, agent, session string, sameAgent bool) (bool, error)
 	// ReleaseOutbound requeues work Deliverers had in progress when the bus
 	// stopped.
