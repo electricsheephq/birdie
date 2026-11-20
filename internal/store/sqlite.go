@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -45,6 +46,14 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_inbox ON messages(recipient, status, seq);
 CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread_id, seq);
+CREATE TABLE IF NOT EXISTS inbox_releases (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	recipient   TEXT NOT NULL,
+	session     TEXT NOT NULL,
+	digest      BOOLEAN NOT NULL,
+	released_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS inbox_releases_session ON inbox_releases(recipient, session);
 CREATE TABLE IF NOT EXISTS state (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
@@ -78,17 +87,24 @@ var addedColumns = []struct{ table, column, def string }{
 	{"messages", "held_at", "INTEGER NOT NULL DEFAULT 0"},
 	// pull_only: the session gets messages only when it checks.
 	{"sessions", "pull_only", "INTEGER NOT NULL DEFAULT 0"},
+	{"messages", "priority", "INTEGER NOT NULL DEFAULT -1"},
+	{"messages", "release_id", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 const (
-	msgCols     = `m.id, m.thread_id, m.in_reply_to, m.sender, m.recipient, m.from_session, m.to_session, m.content, m.meta, m.status, m.attempts, m.created_at`
+	msgCols     = `m.id, m.thread_id, m.in_reply_to, m.sender, m.recipient, m.from_session, m.to_session, m.content, m.meta, m.status, m.attempts, m.created_at, m.priority`
 	agentCols   = `a.name, a.token_hash, a.delivery, a.config, a.created_at`
 	sessionCols = `agent, id, name, cwd, branch, tier, state, active_at, last_seen, ended_at, pull_only`
 	// trackCols follow msgCols for the delivery details birdie's own commands show.
 	trackCols = `COALESCE(m.delivered_at, 0), m.taken_by, m.last_error, m.error_at, m.next_attempt_at`
 )
 
-type SQLite struct{ db *sql.DB }
+type SQLite struct {
+	db *sql.DB
+	// A canceled claim can lose its DB connection while checking its window.
+	settleMu sync.Mutex
+	settling map[settleKey]settleWindow
+}
 
 var _ bus.Store = (*SQLite)(nil)
 
@@ -156,13 +172,15 @@ func scanMessage(r scanner) (bus.Message, error) {
 	var m bus.Message
 	var meta string
 	var created int64
-	if err := r.Scan(&m.ID, &m.ThreadID, &m.InReplyTo, &m.From, &m.To, &m.FromSession, &m.ToSession, &m.Content, &meta, &m.Status, &m.Attempts, &created); err != nil {
+	var priority int
+	if err := r.Scan(&m.ID, &m.ThreadID, &m.InReplyTo, &m.From, &m.To, &m.FromSession, &m.ToSession, &m.Content, &meta, &m.Status, &m.Attempts, &created, &priority); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return m, bus.ErrNotFound
 		}
 		return m, err
 	}
 	m.CreatedAt = time.UnixMilli(created).UTC()
+	m.Priority = priorityName(priority)
 	if err := json.Unmarshal([]byte(meta), &m.Meta); err != nil {
 		return m, err
 	}
@@ -170,6 +188,19 @@ func scanMessage(r scanner) (bus.Message, error) {
 		m.Meta = nil
 	}
 	return m, nil
+}
+
+func priorityName(priority int) string {
+	switch priority {
+	case 0:
+		return "p0"
+	case 1:
+		return "p1"
+	case 3:
+		return "p3"
+	default:
+		return ""
+	}
 }
 
 func collectMessages(rows *sql.Rows, err error) ([]bus.Message, error) {
@@ -258,10 +289,19 @@ func insertMessage(ctx context.Context, db execer, m bus.Message) error {
 	if m.Held != "" {
 		held = m.CreatedAt.UnixMilli()
 	}
+	priority := -1
+	switch m.Priority {
+	case "p0":
+		priority = 0
+	case "p1":
+		priority = 1
+	case "p3":
+		priority = 3
+	}
 	_, err := db.ExecContext(ctx,
-		`INSERT INTO messages (id, thread_id, in_reply_to, sender, recipient, from_session, to_session, content, meta, status, created_at, held_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.ID, m.ThreadID, m.InReplyTo, m.From, m.To, m.FromSession, m.ToSession, m.Content, string(meta), m.Status, m.CreatedAt.UnixMilli(), held)
+		`INSERT INTO messages (id, thread_id, in_reply_to, sender, recipient, from_session, to_session, content, meta, status, created_at, held_at, priority)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, m.ThreadID, m.InReplyTo, m.From, m.To, m.FromSession, m.ToSession, m.Content, string(meta), m.Status, m.CreatedAt.UnixMilli(), held, priority)
 	return err
 }
 
@@ -365,27 +405,166 @@ func inboxWhere(f bus.ClaimFilter, now time.Time) (string, []any) {
 	return q, args
 }
 
-func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Time) ([]bus.Message, error) {
+// positionGate runs in the claim transaction so overlapping polls cannot
+// both reserve the same digest window. The age checks use the same inbox
+// predicate as the claim, including leases that have run out.
+func positionGate(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where string, args []any, now time.Time) (gate string, carry bool, err error) {
+	var oldestHeld, oldestP3 sql.NullInt64
+	var ready, p0 bool
+	err = tx.QueryRowContext(ctx, `SELECT MIN(CASE WHEN m.priority IN (1, 3) THEN m.created_at END),
+		MIN(CASE WHEN m.priority = 3 THEN m.created_at END),
+		COALESCE(MAX(m.priority IN (-1, 0, 1)), 0),
+		COALESCE(MAX(m.priority = 0), 0) FROM messages m WHERE`+where, args...).Scan(&oldestHeld, &oldestP3, &ready, &p0)
+	if err != nil {
+		return "", false, err
+	}
+
+	// P0 brings held mail at either turn position. P3 that fits counts as
+	// a digest release, including when it rides with a midturn P0.
+	if p0 && f.Thread == "" {
+		return "", true, nil
+	}
+	if f.At == bus.Boundary && (ready || !oldestP3.Valid) {
+		return "", false, nil
+	}
+	if f.At == bus.Midturn && (!oldestHeld.Valid || oldestHeld.Int64 > now.Add(-bus.Valve).UnixMilli()) {
+		return " AND m.priority IN (-1, 0)", false, nil
+	}
+
+	var lastRelease, lastDigest int64
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(released_at), 0),
+		COALESCE(MAX(CASE WHEN digest THEN released_at END), 0)
+		FROM inbox_releases WHERE recipient = ? AND session = ?`, f.Agent, f.Session).Scan(&lastRelease, &lastDigest)
+	if err != nil {
+		return "", false, err
+	}
+	if f.At == bus.Midturn {
+		if lastRelease == 0 || lastRelease <= now.Add(-bus.Valve).UnixMilli() {
+			return "", false, nil
+		}
+		return " AND m.priority IN (-1, 0)", false, nil
+	}
+	cutoff := now.Add(-bus.DigestEvery).UnixMilli()
+	// Cache age can release fresh mail, but overflow still waits for the
+	// next digest window or an immediate message it can ride with.
+	if lastDigest == 0 || lastDigest <= cutoff {
+		if oldestP3.Int64 <= cutoff {
+			return "", false, nil
+		}
+		var idle bool
+		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sessions
+			WHERE agent = ? AND id = ? AND active_at <= ?)`, f.Agent, f.Session, now.Add(-bus.CacheIdle).UnixMilli()).Scan(&idle)
+		if err != nil || idle {
+			return "", false, err
+		}
+	}
+	return " AND m.priority != 3", false, nil
+}
+
+type settleKey struct{ agent, session, predicate string }
+
+type settleWindow struct{ deadline, newest time.Time }
+
+// settleDelay uses only fresh mail that passed the position gate. Holding the
+// claim transaction keeps new arrivals from slipping into a settled batch.
+func (s *SQLite) settleDelay(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where string, args []any, now time.Time) (time.Duration, error) {
+	cutoff := now.Add(-bus.CoalesceMax)
+	var oldest, newest sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT MIN(m.created_at), MAX(m.created_at) FROM messages m WHERE`+where+
+		` AND m.created_at > ?`, append(args, cutoff.UnixMilli())...).Scan(&oldest, &newest)
+	if err != nil {
+		return 0, err
+	}
+	s.settleMu.Lock()
+	defer s.settleMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	for key, window := range s.settling {
+		if window.deadline.Before(cutoff) {
+			delete(s.settling, key)
+		}
+	}
+	key := settleKey{f.Agent, f.Session, where}
+	if !oldest.Valid {
+		delete(s.settling, key)
+		return 0, nil
+	}
+	oldestAt, newestAt := time.UnixMilli(oldest.Int64), time.UnixMilli(newest.Int64)
+	maxWait := min(bus.CoalesceMax, oldestAt.Add(bus.CoalesceMax).Sub(now))
+	// Keep the cap for an overlapping batch when its earliest rows age out
+	// of the query. Without this, a steady stream can keep moving the cap.
+	if window, ok := s.settling[key]; ok && !oldestAt.After(window.newest) {
+		maxWait = min(maxWait, window.deadline.Sub(now))
+	}
+	delay := min(newestAt.Add(bus.Coalesce).Sub(now), maxWait)
+	if delay <= 0 {
+		delete(s.settling, key)
+		return 0, nil
+	}
+	if s.settling == nil {
+		s.settling = make(map[settleKey]settleWindow)
+	}
+	s.settling[key] = settleWindow{deadline: now.Add(maxWait), newest: newestAt}
+	return delay, nil
+}
+
+func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Time) ([]bus.Message, time.Duration, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer tx.Rollback()
 
 	where, args := inboxWhere(f, now)
+	order, cols := "m.seq", msgCols
+	positioned := f.At != ""
+	limit := f.Limit
+	if positioned {
+		gate, carry, err := positionGate(ctx, tx, f, where, args, now)
+		if err != nil {
+			return nil, 0, err
+		}
+		where += gate
+		if f.Thread == "" {
+			delay, err := s.settleDelay(ctx, tx, f, where, args, now)
+			if err != nil || delay > 0 {
+				return nil, delay, err
+			}
+		}
+		if carry {
+			// A carry can exceed the normal batch size, but even tiny
+			// messages must leave the rest queued after 300 rows.
+			limit = 300
+		}
+		order = "CASE m.priority WHEN 0 THEN 0 WHEN 3 THEN 2 ELSE 1 END, m.seq"
+		cols = strings.Replace(msgCols, "m.content", digestContent, 1)
+	}
 	// Sizes first, so only what fits in one batch is read.
-	rows, err := tx.QueryContext(ctx, `SELECT m.id, length(CAST(m.content AS BLOB)) FROM messages m WHERE`+where+` ORDER BY m.seq LIMIT ?`, append(args, f.Limit)...)
+	rows, err := tx.QueryContext(ctx, `SELECT m.id, m.priority, `+contentSize+` FROM messages m WHERE`+where+` ORDER BY `+order+` LIMIT ?`, append(args, limit)...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var ids []any
-	total := 0
+	pointers := make(map[string]int)
+	total, digest := 0, 0
 	for rows.Next() {
 		var id string
-		var size int
-		if err := rows.Scan(&id, &size); err != nil {
+		var priority, size int
+		if err := rows.Scan(&id, &priority, &size); err != nil {
 			rows.Close()
-			return nil, err
+			return nil, 0, err
+		}
+		if positioned && priority == 3 {
+			if size > bus.MaxDigestBytes {
+				// An individually oversized message is shown as a pointer so
+				// it can leave the queue and the full text stays in its thread.
+				pointers[id], size = size, 0
+			}
+			if digest+size > bus.MaxDigestBytes {
+				break
+			}
+			digest += size
 		}
 		if len(ids) > 0 && total+size > bus.MaxBatchBytes {
 			break
@@ -394,27 +573,57 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil || len(ids) == 0 {
-		return []bus.Message{}, err
+		return []bus.Message{}, 0, err
 	}
 	msgs, err := collectMessages(tx.QueryContext(ctx,
-		`SELECT `+msgCols+` FROM messages m WHERE m.id IN (?`+strings.Repeat(", ?", len(ids)-1)+`) ORDER BY m.seq`, ids...))
+		`SELECT `+cols+` FROM messages m WHERE m.id IN (?`+strings.Repeat(", ?", len(ids)-1)+`) ORDER BY `+order, ids...))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+	reserved := false
 	for i := range msgs {
+		m := &msgs[i]
+		m.ContentBytes = pointers[m.ID]
+		m.Status = bus.StatusClaimed
+		var delivered any
 		if f.LeaseUntil.IsZero() {
-			_, err = tx.ExecContext(ctx, `UPDATE messages SET status = 'delivered', delivered_at = ?, taken_by = ? WHERE id = ?`, now.UnixMilli(), f.Session, msgs[i].ID)
-			msgs[i].Status = bus.StatusDelivered
+			m.Status, delivered = bus.StatusDelivered, now.UnixMilli()
 		} else {
-			_, err = tx.ExecContext(ctx, `UPDATE messages SET status = 'claimed', lease_until = ?, taken_by = ? WHERE id = ?`, f.LeaseUntil.UnixMilli(), f.Session, msgs[i].ID)
-			msgs[i].Status = bus.StatusClaimed
+			m.LeaseUntil = f.LeaseUntil.UnixMilli()
 		}
+		var releaseID int64
+		if positioned && (m.Priority == "p3" || (f.At == bus.Midturn && m.Priority == "p1")) {
+			// Keep earlier reservations even when an expired member rides
+			// with another claim. Returning that claim cancels only its own.
+			result, err := tx.ExecContext(ctx, `INSERT INTO inbox_releases (recipient, session, digest, released_at)
+				VALUES (?, ?, ?, ?)`, f.Agent, f.Session, m.Priority == "p3", now.UnixMilli())
+			if err != nil {
+				return nil, 0, err
+			}
+			releaseID, err = result.LastInsertId()
+			if err != nil {
+				return nil, 0, err
+			}
+			reserved = true
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE messages SET status = ?, delivered_at = ?, lease_until = ?, taken_by = ?,
+			release_id = ? WHERE id = ?`, m.Status, delivered, m.LeaseUntil, f.Session, releaseID, m.ID)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
-	return msgs, tx.Commit()
+	if reserved {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM inbox_releases WHERE released_at <= ?`, now.Add(-bus.Valve).UnixMilli()); err != nil {
+			return nil, 0, err
+		}
+	}
+	return msgs, 0, tx.Commit()
 }
+
+const contentSize = `length(CAST(m.content AS BLOB))`
+
+var digestContent = fmt.Sprintf(`CASE WHEN m.priority = 3 AND %[1]s > %[2]d
+	THEN printf('(%%d bytes; read it in the thread)', %[1]s) ELSE m.content END`, contentSize, bus.MaxDigestBytes)
 
 // waiting is the condition for a message still waiting to be taken: queued,
 // or claimed with the lease run out.
@@ -477,7 +686,7 @@ func (s *SQLite) SettleHeld(ctx context.Context, q bus.HoldQuery, build func([]b
 	// Notices need routing details, not full content or caller-supplied metadata.
 	rows, err := tx.QueryContext(ctx, `SELECT m.id, m.thread_id, m.in_reply_to, m.sender, m.recipient,
 		m.from_session, m.to_session, substr(CAST(m.content AS BLOB), 1, ?), '{}',
-		m.status, m.attempts, m.created_at, COALESCE(s.name, '') FROM messages m
+		m.status, m.attempts, m.created_at, m.priority, COALESCE(s.name, '') FROM messages m
 		LEFT JOIN sessions s ON s.agent = m.recipient AND s.id = m.to_session
 		WHERE `+where+` ORDER BY m.seq LIMIT ?`, append([]any{4 * bus.PreviewRunes}, args...)...)
 	if err != nil {
@@ -561,12 +770,14 @@ func (s *SQLite) DueOutbound(ctx context.Context, now time.Time, limit int) ([]b
 		var o bus.Outbound
 		var meta, cfg string
 		var mCreated, aCreated int64
+		var priority int
 		m, a := &o.Message, &o.Agent
-		if err := rows.Scan(&m.ID, &m.ThreadID, &m.InReplyTo, &m.From, &m.To, &m.FromSession, &m.ToSession, &m.Content, &meta, &m.Status, &m.Attempts, &mCreated,
+		if err := rows.Scan(&m.ID, &m.ThreadID, &m.InReplyTo, &m.From, &m.To, &m.FromSession, &m.ToSession, &m.Content, &meta, &m.Status, &m.Attempts, &mCreated, &priority,
 			&a.Name, &a.TokenHash, &a.Delivery, &cfg, &aCreated); err != nil {
 			return nil, err
 		}
 		m.CreatedAt, a.CreatedAt = time.UnixMilli(mCreated).UTC(), time.UnixMilli(aCreated).UTC()
+		m.Priority = priorityName(priority)
 		if err := json.Unmarshal([]byte(meta), &m.Meta); err != nil {
 			return nil, err
 		}
@@ -589,21 +800,43 @@ func (s *SQLite) MarkClaimed(ctx context.Context, id string) error {
 	return err
 }
 
-func (s *SQLite) Settle(ctx context.Context, id, agent string, ok bool, at time.Time) (bool, error) {
-	var res sql.Result
-	var err error
-	if ok {
-		res, err = s.db.ExecContext(ctx, `UPDATE messages SET status = 'delivered', delivered_at = ?, lease_until = 0
-			WHERE id = ? AND recipient = ? AND status = 'claimed'`, at.UnixMilli(), id, agent)
-	} else {
-		res, err = s.db.ExecContext(ctx, `UPDATE messages SET status = 'queued', lease_until = 0
-			WHERE id = ? AND recipient = ? AND status = 'claimed'`, id, agent)
+func (s *SQLite) Settle(ctx context.Context, id, agent string, ok bool, at time.Time, leaseUntil int64) (bool, error) {
+	if !ok {
+		return s.returnClaim(ctx, id, agent, leaseUntil)
 	}
+	res, err := s.db.ExecContext(ctx, `UPDATE messages SET status = 'delivered', delivered_at = ?, lease_until = 0
+		WHERE id = ? AND recipient = ? AND status = 'claimed' AND (?4 = 0 OR lease_until = ?4)`, at.UnixMilli(), id, agent, leaseUntil)
 	if err != nil {
 		return false, err
 	}
 	n, err := res.RowsAffected()
 	return n > 0, err
+}
+
+func (s *SQLite) returnClaim(ctx context.Context, id, agent string, leaseUntil int64) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var releaseID int64
+	err = tx.QueryRowContext(ctx, `UPDATE messages SET status = 'queued', lease_until = 0
+		WHERE id = ? AND recipient = ? AND status = 'claimed' AND (?3 = 0 OR lease_until = ?3) RETURNING release_id`, id, agent, leaseUntil).Scan(&releaseID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if releaseID != 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM inbox_releases WHERE id = ?`, releaseID); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *SQLite) MarkReplied(ctx context.Context, id, agent, session string, sameAgent bool) (bool, error) {
@@ -655,6 +888,7 @@ func (s *SQLite) MoveSession(ctx context.Context, agent, from, to string) error 
 	for _, q := range []string{
 		`UPDATE messages SET to_session = ? WHERE recipient = ? AND to_session = ?`,
 		`UPDATE messages SET taken_by = ? WHERE recipient = ? AND taken_by = ?`,
+		`UPDATE inbox_releases SET session = ? WHERE recipient = ? AND session = ?`,
 		`UPDATE messages SET from_session = ? WHERE sender = ? AND from_session = ?`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, to, agent, from); err != nil {
@@ -854,8 +1088,9 @@ func collectTracked(rows *sql.Rows, err error) ([]Tracked, error) {
 		var t Tracked
 		var meta string
 		var created, delivered, errorAt, next int64
+		var priority int
 		m := &t.Message
-		if err := rows.Scan(&m.ID, &m.ThreadID, &m.InReplyTo, &m.From, &m.To, &m.FromSession, &m.ToSession, &m.Content, &meta, &m.Status, &m.Attempts, &created,
+		if err := rows.Scan(&m.ID, &m.ThreadID, &m.InReplyTo, &m.From, &m.To, &m.FromSession, &m.ToSession, &m.Content, &meta, &m.Status, &m.Attempts, &created, &priority,
 			&delivered, &t.TakenBy, &t.Error, &errorAt, &next); err != nil {
 			return nil, err
 		}
@@ -863,6 +1098,7 @@ func collectTracked(rows *sql.Rows, err error) ([]Tracked, error) {
 			return nil, err
 		}
 		m.CreatedAt = time.UnixMilli(created).UTC()
+		m.Priority = priorityName(priority)
 		t.Delivered, t.ErrorAt = unixMilli(delivered), unixMilli(errorAt)
 		if m.Status == bus.StatusQueued && t.Error != "" {
 			t.Retry = unixMilli(next)

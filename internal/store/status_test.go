@@ -164,7 +164,7 @@ func TestTrackThreadAndWaiting(t *testing.T) {
 	insert(t, st, "m2", "t1", "bob", "alice", now)
 	insert(t, st, "m3", "t2", "alice", "bob", now)
 
-	got, err := st.ClaimInbox(ctx, bus.ClaimFilter{Agent: "bob", Thread: "t1", Session: "s9", Unpinned: true, LiveSince: now.Add(-time.Minute), Limit: 10}, now)
+	got, _, err := st.ClaimInbox(ctx, bus.ClaimFilter{Agent: "bob", Thread: "t1", Session: "s9", Unpinned: true, LiveSince: now.Add(-time.Minute), Limit: 10}, now)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("claim = %+v, %v", got, err)
 	}

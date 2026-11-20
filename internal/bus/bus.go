@@ -57,7 +57,17 @@ const (
 	noticeKey = "notice"
 )
 
+const (
+	DigestEvery = 20 * time.Minute
+	Valve       = 40 * time.Minute
+	CacheIdle   = 50 * time.Minute
+	Coalesce    = 3 * time.Second
+	CoalesceMax = 10 * time.Second
+)
+
 type Bus struct {
+	// Now, when set before use, supplies the clock for inbox and session times.
+	Now        func() time.Time
 	store      Store
 	deliverers map[string]Deliverer
 	log        *slog.Logger
@@ -77,10 +87,12 @@ type Bus struct {
 	listening     atomic.Pointer[listening]
 	lastExpire    time.Time
 
-	mu      sync.Mutex
-	waiters map[string]map[chan struct{}]struct{}
-	kick    chan struct{}
-	watch   watchers
+	replyMu   sync.Mutex
+	mu        sync.Mutex
+	positions map[[2]string]string
+	waiters   map[string]map[chan struct{}]struct{}
+	kick      chan struct{}
+	watch     watchers
 }
 
 func New(s Store, log *slog.Logger, ds ...Deliverer) *Bus {
@@ -88,6 +100,7 @@ func New(s Store, log *slog.Logger, ds ...Deliverer) *Bus {
 		store:      s,
 		deliverers: make(map[string]Deliverer),
 		log:        log,
+		positions:  make(map[[2]string]string),
 		waiters:    make(map[string]map[chan struct{}]struct{}),
 		kick:       make(chan struct{}, 1),
 	}
@@ -102,6 +115,13 @@ func New(s Store, log *slog.Logger, ds ...Deliverer) *Bus {
 		b.deliverers[d.Kind()] = d
 	}
 	return b
+}
+
+func (b *Bus) now() time.Time {
+	if b.Now != nil {
+		return b.Now()
+	}
+	return time.Now()
 }
 
 func HashToken(token string) string {
@@ -157,7 +177,7 @@ func (b *Bus) listAgents(ctx context.Context, sessions func(context.Context, Age
 
 // Sessions returns the agent's running sessions, with its default marked.
 func (b *Bus) Sessions(ctx context.Context, a Agent) ([]Session, error) {
-	live, err := b.store.LiveSessions(ctx, a.Name, time.Now().Add(-SessionTTL))
+	live, err := b.store.LiveSessions(ctx, a.Name, b.now().Add(-SessionTTL))
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +304,7 @@ func (b *Bus) ReportSession(ctx context.Context, agent, id string, in SessionInp
 	if len(in.Branch) > maxBranchBytes || strings.ContainsFunc(in.Branch, unicode.IsControl) {
 		in.Branch = ""
 	}
-	now := time.Now().UTC()
+	now := b.now().UTC()
 	s := Session{ID: id, Agent: agent, Name: in.Name, Cwd: in.Cwd, Branch: in.Branch, Tier: in.Tier, State: in.State, ActiveAt: in.ActiveAt, LastSeen: now}
 	if s.ActiveAt.IsZero() || s.ActiveAt.After(now) {
 		s.ActiveAt = now
@@ -310,7 +330,7 @@ func (b *Bus) ReportSession(ctx context.Context, agent, id string, in SessionInp
 // default session without delay. Messages pinned to it wait for it to come
 // back; see claimFilter.
 func (b *Bus) EndSession(ctx context.Context, agent, id string) error {
-	now := time.Now().UTC()
+	now := b.now().UTC()
 	if err := b.store.EndSession(ctx, agent, id, now); err != nil {
 		return err
 	}
@@ -529,6 +549,11 @@ func heldNotices(held []HeldMessage, expired bool, agents map[string]Agent, hold
 // the parent's thread (and its other participant when To is empty), and only
 // participants may post into an existing thread.
 func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, error) {
+	switch in.Priority {
+	case "", "p0", "p1", "p3":
+	default:
+		return Message{}, fmt.Errorf("%w: priority must be p0, p1 or p3", ErrInvalid)
+	}
 	if strings.TrimSpace(in.Content) == "" {
 		return Message{}, fmt.Errorf("%w: content is required", ErrInvalid)
 	}
@@ -627,7 +652,7 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		}
 		toSession, others, name = s.ID, more, s.Name
 	}
-	if err := b.admit(ctx, from, to.Name, in.FromSession, toSession); err != nil {
+	if err := b.admit(ctx, from, to.Name, in.FromSession, toSession, in.Priority); err != nil {
 		return Message{}, err
 	}
 
@@ -644,24 +669,17 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		FromSession: in.FromSession,
 		ToSession:   toSession,
 		Content:     in.Content,
+		Priority:    in.Priority,
 		Meta:        in.Meta,
 		Status:      StatusQueued,
-		CreatedAt:   time.Now().UTC(),
+		CreatedAt:   b.now().UTC(),
 	}
 	// Stored with the message, so a notice can't also tell the sender.
 	if m.ToSession != "" && to.Delivery == DeliveryPull && b.stopped(ctx, to.Name, m.ToSession) {
 		m.Held = RecipientSessionEnded
 	}
-	if err := b.store.InsertMessage(ctx, m); err != nil {
+	if err := b.saveSend(ctx, &m, parent); err != nil {
 		return Message{}, err
-	}
-	b.emitMessage(StatusQueued, m, "", "")
-	if parent.ID != "" {
-		if changed, err := b.store.MarkReplied(ctx, parent.ID, from, in.FromSession, parent.From == parent.To); err != nil {
-			b.log.Error("mark replied", "id", parent.ID, "err", err)
-		} else if changed {
-			b.emitMessage(StatusReplied, parent, "", "")
-		}
 	}
 	m.Note = b.deliveryNote(ctx, to, m)
 	if len(others) > 0 {
@@ -682,6 +700,39 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	return m, nil
 }
 
+// Serialize the first-reply check with the insert and the existing replied mark.
+func (b *Bus) saveSend(ctx context.Context, m *Message, parent Message) error {
+	if parent.ID != "" {
+		b.replyMu.Lock()
+		defer b.replyMu.Unlock()
+	}
+	if m.Priority == "p3" {
+		firstReply := false
+		if parent.ID != "" && parent.From == m.To && m.ToSession != "" && parent.FromSession == m.ToSession {
+			current, err := b.store.GetMessage(ctx, parent.ID)
+			if err != nil {
+				return err
+			}
+			firstReply = current.Status != StatusReplied
+		}
+		if firstReply || AsksQuestions(*m) {
+			m.Priority = "p1"
+		}
+	}
+	if err := b.store.InsertMessage(ctx, *m); err != nil {
+		return err
+	}
+	b.emitMessage(StatusQueued, *m, "", "")
+	if parent.ID != "" {
+		if changed, err := b.store.MarkReplied(ctx, parent.ID, m.From, m.FromSession, parent.From == parent.To); err != nil {
+			b.log.Error("mark replied", "id", parent.ID, "err", err)
+		} else if changed {
+			b.emitMessage(StatusReplied, parent, "", "")
+		}
+	}
+	return nil
+}
+
 // Receive claims queued messages for agent, long-polling up to wait when the
 // inbox is empty.
 func (b *Bus) Receive(ctx context.Context, agent, threadID string, wait time.Duration) ([]Message, error) {
@@ -690,6 +741,11 @@ func (b *Bus) Receive(ctx context.Context, agent, threadID string, wait time.Dur
 
 // ReceiveFor is Receive with session scoping and leases.
 func (b *Bus) ReceiveFor(ctx context.Context, in ReceiveInput) ([]Message, error) {
+	switch in.At {
+	case "", Midturn, Boundary:
+	default:
+		return nil, fmt.Errorf("%w: at must be midturn or boundary", ErrInvalid)
+	}
 	deadline := time.Now().Add(min(in.Wait, MaxWait))
 	for {
 		// Subscribe before claiming so a send between the two isn't missed.
@@ -702,11 +758,13 @@ func (b *Bus) ReceiveFor(ctx context.Context, in ReceiveInput) ([]Message, error
 			held, err = b.store.SessionPullOnly(ctx, in.Agent, in.Session)
 		}
 		var msgs []Message
+		var settleIn time.Duration
 		if err == nil && !held {
+			now := b.now()
 			var f ClaimFilter
-			f, err = b.claimFilter(ctx, in)
+			f, err = b.claimFilter(ctx, in, now)
 			if err == nil {
-				msgs, err = b.store.ClaimInbox(ctx, f, time.Now())
+				msgs, settleIn, err = b.store.ClaimInbox(ctx, f, now)
 			}
 		}
 		if err != nil || len(msgs) > 0 {
@@ -725,6 +783,9 @@ func (b *Bus) ReceiveFor(ctx context.Context, in ReceiveInput) ([]Message, error
 		}
 		if held {
 			remaining = min(remaining, PullOnlyCheck)
+		}
+		if settleIn > 0 {
+			remaining = min(remaining, settleIn)
 		}
 		timer := time.NewTimer(remaining)
 		select {
@@ -781,18 +842,18 @@ func (b *Bus) SetPullOnly(ctx context.Context, addr string, on bool) (Session, e
 
 // Unread counts what the receiver would get from ReceiveFor right now.
 func (b *Bus) Unread(ctx context.Context, in ReceiveInput) (int, error) {
-	f, err := b.claimFilter(ctx, in)
+	now := b.now()
+	f, err := b.claimFilter(ctx, in, now)
 	if err != nil {
 		return 0, err
 	}
-	return b.store.CountInbox(ctx, f, time.Now())
+	return b.store.CountInbox(ctx, f, now)
 }
 
-func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput) (ClaimFilter, error) {
-	now := time.Now()
-	f := ClaimFilter{Agent: in.Agent, Thread: in.Thread, Session: in.Session, LiveSince: now.Add(-SessionTTL), Limit: inboxBatch}
+func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput, now time.Time) (ClaimFilter, error) {
+	f := ClaimFilter{Agent: in.Agent, Thread: in.Thread, Session: in.Session, At: in.At, LiveSince: now.Add(-SessionTTL), Limit: inboxBatch}
 	if in.Lease > 0 {
-		f.LeaseUntil = now.Add(in.Lease)
+		f.LeaseUntil = now.Add(max(in.Lease, time.Millisecond))
 	}
 	if in.Session == "" {
 		// Not a session: it takes only mail that isn't for a running one
@@ -818,30 +879,53 @@ func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput) (ClaimFilter, er
 	if err != nil {
 		return f, err
 	}
+	if in.Push {
+		for _, session := range live {
+			if session.ID == in.Session {
+				b.mu.Lock()
+				key := [2]string{in.Agent, in.Session}
+				if in.At == "" {
+					delete(b.positions, key)
+				} else {
+					b.positions[key] = in.At
+				}
+				b.mu.Unlock()
+				break
+			}
+		}
+	}
 	d := defaultSession(live, a)
 	f.Unpinned = d != nil && d.ID == in.Session
 	return f, nil
 }
 
 // Ack confirms the agent got a claimed message.
-func (b *Bus) Ack(ctx context.Context, agent, id string) error {
-	changed, err := b.store.Settle(ctx, id, agent, true, time.Now())
-	if changed {
-		if m, err := b.store.GetMessage(ctx, id); err == nil {
-			b.emitMessage(StatusDelivered, m, "", "")
-		}
-	}
-	return err
+func (b *Bus) Ack(ctx context.Context, agent, id string, lease ...int64) error {
+	return b.settle(ctx, agent, id, true, lease)
 }
 
 // Nack returns a claimed message to the queue because it couldn't be shown.
-func (b *Bus) Nack(ctx context.Context, agent, id string) error {
-	changed, err := b.store.Settle(ctx, id, agent, false, time.Now())
-	if changed {
+func (b *Bus) Nack(ctx context.Context, agent, id string, lease ...int64) error {
+	return b.settle(ctx, agent, id, false, lease)
+}
+
+func (b *Bus) settle(ctx context.Context, agent, id string, ok bool, lease []int64) error {
+	var until int64
+	if len(lease) > 0 {
+		until = lease[0]
+	}
+	changed, err := b.store.Settle(ctx, id, agent, ok, b.now(), until)
+	if !changed {
+		return err
+	}
+	if !ok {
 		b.notify(agent)
-		// Given back by a session that has since closed (a /clear while it
-		// held the message): it is held now, and its sender is told.
-		if m, err := b.store.GetMessage(ctx, id); err == nil && m.ToSession != "" && !b.running(ctx, agent, m.ToSession) {
+	}
+	if m, err := b.store.GetMessage(ctx, id); err == nil {
+		if ok {
+			b.emitMessage(StatusDelivered, m, "", "")
+		} else if m.ToSession != "" && !b.running(ctx, agent, m.ToSession) {
+			// A /clear can end the conversation while it holds the claim.
 			b.noticeHeld(ctx, false)
 		}
 	}
@@ -889,7 +973,7 @@ func (b *Bus) Notice(ctx context.Context, m Message, kind, text string) error {
 
 // admit decides whether from may message to right now. Rules about who may
 // reach whom belong here, including any later ones for other machines.
-func (b *Bus) admit(ctx context.Context, from, to, fromSession, toSession string) error {
+func (b *Bus) admit(ctx context.Context, from, to, fromSession, toSession, priority string) error {
 	limit := b.LoopLimit
 	if limit == 0 {
 		limit = DefaultLoopLimit
@@ -897,17 +981,25 @@ func (b *Bus) admit(ctx context.Context, from, to, fromSession, toSession string
 	if limit < 0 {
 		return nil
 	}
-	n, err := b.store.CountSent(ctx, from, to, fromSession, toSession, time.Now().Add(-LoopWindow))
+	n, err := b.store.CountSent(ctx, from, to, fromSession, toSession, b.now().Add(-LoopWindow))
 	if err != nil {
 		return err
 	}
-	if n >= limit {
+	reached := n >= limit
+	reason := "which looks like a loop"
+	if priority == "p0" {
+		// The same window counts all priorities. Divide the count so doubling
+		// a very large configured limit cannot overflow.
+		reached = n/2 >= limit
+		reason = "which reaches the p0 limit and looks like a loop"
+	}
+	if reached {
 		if fromSession != "" && toSession != "" {
 			from = (Address{Agent: from, Session: fromSession}).String()
 			to = (Address{Agent: to, Session: toSession}).String()
 		}
-		return fmt.Errorf("%w: %s has sent %s %d messages in the last %v, which looks like a loop; check with your user before continuing",
-			ErrLoop, from, to, n, LoopWindow)
+		return fmt.Errorf("%w: %s has sent %s %d messages in the last %v, %s; check with your user before continuing",
+			ErrLoop, from, to, n, LoopWindow, reason)
 	}
 	return nil
 }
@@ -916,7 +1008,7 @@ func (b *Bus) admit(ctx context.Context, from, to, fromSession, toSession string
 // once the bus has listened long enough to tell (see quiet), it went silent
 // or was never heard from.
 func (b *Bus) stopped(ctx context.Context, agent, id string) bool {
-	now := time.Now()
+	now := b.now()
 	recent, err := b.store.RecentSessions(ctx, agent, now.Add(-SessionKeep))
 	if err != nil {
 		return false // don't claim it stopped when it can't be told
@@ -931,7 +1023,7 @@ func (b *Bus) stopped(ctx context.Context, agent, id string) bool {
 
 // running reports whether agent's session id is running.
 func (b *Bus) running(ctx context.Context, agent, id string) bool {
-	live, err := b.store.LiveSessions(ctx, agent, time.Now().Add(-SessionTTL))
+	live, err := b.store.LiveSessions(ctx, agent, b.now().Add(-SessionTTL))
 	if err != nil {
 		return true // don't claim it closed when it can't be told
 	}
@@ -978,6 +1070,19 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 	}
 	switch target.Tier {
 	case TierPush:
+		b.mu.Lock()
+		at := b.positions[[2]string{to.Name, target.ID}]
+		b.mu.Unlock()
+		if at != "" {
+			switch {
+			case m.Priority == "p0":
+				return "p0: offered after a short batching window; its host may hold peer messages for its user first"
+			case m.Priority == "p1" && at == Midturn:
+				return "held: sees this when its turn ends"
+			case m.Priority == "p3":
+				return "held: goes in its next digest, within about 20 minutes (up to 40 in a long turn)"
+			}
+		}
 		return fmt.Sprintf("queued: %s gets this right away", name)
 	case TierTurn:
 		return fmt.Sprintf("queued: %s sees this at its next tool call or end of turn; if it's idle, it waits for its user", name)

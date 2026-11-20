@@ -142,21 +142,29 @@ func (c *Client) Send(ctx context.Context, in bus.SendInput) (bus.Message, error
 
 // Inbox claims queued messages, long-polling up to wait (the server caps it).
 func (c *Client) Inbox(ctx context.Context, threadID string, wait time.Duration) ([]bus.Message, error) {
-	return c.inbox(ctx, threadID, wait, false)
+	return c.inbox(ctx, threadID, wait, false, "")
 }
 
 // PushInbox is Inbox for a delivery that puts what it gets into the
 // conversation on its own. A pull-only session gets nothing from it.
 func (c *Client) PushInbox(ctx context.Context, wait time.Duration) ([]bus.Message, error) {
-	return c.inbox(ctx, "", wait, true)
+	return c.PushInboxAt(ctx, wait, "")
 }
 
-func (c *Client) inbox(ctx context.Context, threadID string, wait time.Duration, push bool) ([]bus.Message, error) {
+// PushInboxAt supplies the recipient turn position when the host knows it.
+func (c *Client) PushInboxAt(ctx context.Context, wait time.Duration, at string) ([]bus.Message, error) {
+	return c.inbox(ctx, "", wait, true, at)
+}
+
+func (c *Client) inbox(ctx context.Context, threadID string, wait time.Duration, push bool, at string) ([]bus.Message, error) {
 	ctx, cancel := context.WithTimeout(ctx, wait+30*time.Second)
 	defer cancel()
 	q := url.Values{"wait": {strconv.FormatFloat(wait.Seconds(), 'f', -1, 64)}}
 	if push {
 		q.Set("push", "1")
+		if at != "" {
+			q.Set("at", at)
+		}
 	}
 	if threadID != "" {
 		q.Set("thread_id", threadID)
@@ -178,17 +186,23 @@ func (c *Client) Thread(ctx context.Context, threadID string) ([]bus.Message, er
 }
 
 // Ack confirms the agent got a claimed message.
-func (c *Client) Ack(ctx context.Context, id string) error {
-	ctx, cancel := context.WithTimeout(ctx, callTimeout)
-	defer cancel()
-	return c.do(ctx, http.MethodPost, "/v1/messages/"+url.PathEscape(id)+"/ack", nil, nil)
+func (c *Client) Ack(ctx context.Context, id string, lease ...int64) error {
+	return c.settle(ctx, id, "ack", lease)
 }
 
 // Nack returns a claimed message to the queue.
-func (c *Client) Nack(ctx context.Context, id string) error {
+func (c *Client) Nack(ctx context.Context, id string, lease ...int64) error {
+	return c.settle(ctx, id, "nack", lease)
+}
+
+func (c *Client) settle(ctx context.Context, id, verb string, lease []int64) error {
 	ctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	return c.do(ctx, http.MethodPost, "/v1/messages/"+url.PathEscape(id)+"/nack", nil, nil)
+	path := "/v1/messages/" + url.PathEscape(id) + "/" + verb
+	if len(lease) > 0 && lease[0] > 0 {
+		path += "?lease_until=" + strconv.FormatInt(lease[0], 10)
+	}
+	return c.do(ctx, http.MethodPost, path, nil, nil)
 }
 
 // Unread counts messages waiting for this client's session.

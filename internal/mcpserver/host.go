@@ -265,41 +265,116 @@ func (h *claudeHost) Tier() string {
 	return bus.TierPush
 }
 
-// Push writes a user frame to the session's inbox socket: Claude Code shows it
-// between tool calls, or starts a turn if the session is idle, and marks it as
-// coming from a peer. No token is sent on purpose, so a session that skips
-// permission prompts still holds the message for its user to review.
-func (h *claudeHost) Push(ctx context.Context, session string, m bus.Message) error {
-	// The socket belongs to the process, not the conversation, and stays the
-	// same through /clear. So the conversation is checked against the same
-	// read of the registry the socket comes from, just before writing.
-	e, ok, sure := h.entry()
+func (h *claudeHost) position() (string, error) {
+	e, _, sure := h.entry()
 	if !sure {
-		return errUnsure
+		return "", errUnsure
 	}
-	if h.info(e, ok).ID != session {
-		return ErrOtherConversation
+	switch e.Status {
+	case "idle":
+		return bus.Boundary, nil
+	case "busy", "waiting":
+		return bus.Midturn, nil
+	default:
+		return "", nil
+	}
+}
+
+// Push writes a user frame to the session's inbox socket. No token is sent
+// on purpose, so Claude Code can still hold peer messages for its user.
+func (h *claudeHost) Push(ctx context.Context, session string, m bus.Message) error {
+	_, _, err := h.pushClaim(ctx, session, "", []bus.Message{m})
+	return err
+}
+
+const claudeFrameSeparator = "\n\n"
+
+func (h *claudeHost) pushClaim(ctx context.Context, session, at string, msgs []bus.Message) (shown, returned []bus.Message, err error) {
+	text := make([]string, len(msgs))
+	for i, m := range msgs {
+		text[i] = PushText(m)
+	}
+	e, err := h.pushEntry(session)
+	if err != nil {
+		return nil, nil, err
 	}
 	path := socketOf(e)
 	if path == "" {
-		return errors.New("no inbox socket")
+		return nil, nil, errors.New("no inbox socket")
 	}
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", path)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	defer conn.Close()
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	frame, err := json.Marshal(map[string]any{
-		"type":    "user",
-		"message": map[string]string{"role": "user", "content": PushText(m)},
-	})
+	// The socket stays the same through /clear. Recheck the conversation
+	// and turn after connecting and rendering, just before writing.
+	e, err = h.pushEntry(session)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	_, err = conn.Write(append(frame, '\n'))
-	return err
+	if socketOf(e) != path {
+		return nil, nil, errUnsure
+	}
+	shown = msgs
+	// Positioned claims put P0 first. A P0 batch is allowed at either
+	// position, even if the recipient started a turn after the claim.
+	p0 := len(msgs) > 0 && msgs[0].Priority == "p0"
+	if at == bus.Boundary && !p0 && (e.Status == "busy" || e.Status == "waiting") {
+		shown = nil
+		kept := text[:0]
+		for i, m := range msgs {
+			if m.Priority == "" {
+				shown = append(shown, m)
+				kept = append(kept, text[i])
+			} else {
+				returned = append(returned, m)
+			}
+		}
+		text = kept
+	}
+	if len(shown) == 0 {
+		return nil, returned, nil
+	}
+	// Keep the claim in order. The first member always goes through,
+	// and PushText already replaces individually oversized bodies.
+	size := len(text[0])
+	for i := 1; i < len(text); i++ {
+		size += len(claudeFrameSeparator) + len(text[i])
+		if size > bus.MaxPushFrameBytes {
+			returned = append(returned, shown[i:]...)
+			shown, text = shown[:i], text[:i]
+			break
+		}
+	}
+	frame, err := encodeClaudeFrame(text)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err = conn.Write(append(frame, '\n')); err != nil {
+		return nil, nil, err
+	}
+	return shown, returned, nil
+}
+
+func (h *claudeHost) pushEntry(session string) (claudeEntry, error) {
+	e, ok, sure := h.entry()
+	if !sure {
+		return claudeEntry{}, errUnsure
+	}
+	if h.info(e, ok).ID != session {
+		return claudeEntry{}, ErrOtherConversation
+	}
+	return e, nil
+}
+
+func encodeClaudeFrame(text []string) ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"type":    "user",
+		"message": map[string]string{"role": "user", "content": strings.Join(text, claudeFrameSeparator)},
+	})
 }
 
 func (h *claudeHost) Observe(json.RawMessage) {}
@@ -328,8 +403,8 @@ const maxPushBytes = 100 << 10
 // PushText is what a push puts into a conversation for m.
 func PushText(m bus.Message) string {
 	text := MessageText(m)
-	if len(text) > maxPushBytes {
-		return fmt.Sprintf("<birdie-message from=%q message_id=%q thread_id=%q>\nThis message is too long to show here (%d bytes). Read it with the birdie get_thread tool, and answer with send_message, in_reply_to %q.\n</birdie-message>", m.From, m.ID, m.ThreadID, len(m.Content), m.ID)
+	if m.ContentBytes > 0 || len(text) > maxPushBytes {
+		return fmt.Sprintf("<birdie-message from=%q message_id=%q thread_id=%q>\nThis message is too long to show here (%d bytes). Read it with the birdie get_thread tool, and answer with send_message, in_reply_to %q.\n</birdie-message>", m.From, m.ID, m.ThreadID, max(m.ContentBytes, len(m.Content)), m.ID)
 	}
 	return text
 }

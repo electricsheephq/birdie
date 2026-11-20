@@ -39,5 +39,15 @@ VALUES ('msg_old', 'thr_old', 'a', 'b', 'hello', 'queued', 1);`); err != nil {
 			t.Fatalf("m = %+v, %v", m, err)
 		}
 		st.Close()
+		raw, err := sql.Open("sqlite", "file:"+path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var priority int
+		err = raw.QueryRow("SELECT priority FROM messages WHERE id = 'msg_old'").Scan(&priority)
+		raw.Close()
+		if err != nil || priority != -1 {
+			t.Fatalf("old row priority = %d, %v, want -1", priority, err)
+		}
 	}
 }

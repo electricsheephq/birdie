@@ -108,7 +108,7 @@ func ago(t, now time.Time) string {
 // recently active one, and the others come back so the sender can choose.
 // A session that isn't running is never swapped for another.
 func (b *Bus) findSession(ctx context.Context, to Agent, addr Address) (Session, []SessionRef, error) {
-	now := time.Now()
+	now := b.now()
 	recent, err := b.store.RecentSessions(ctx, to.Name, now.Add(-SessionKeep))
 	if err != nil {
 		return Session{}, nil, err
@@ -217,7 +217,7 @@ func othersNote(to Agent, name string, others []SessionRef) string {
 // one running, the message is refused, with the sessions that are, so the
 // sender can address one.
 func (b *Bus) chosenSession(ctx context.Context, to Agent) (Session, []SessionRef, error) {
-	live, err := b.store.LiveSessions(ctx, to.Name, time.Now().Add(-SessionTTL))
+	live, err := b.store.LiveSessions(ctx, to.Name, b.now().Add(-SessionTTL))
 	if err != nil {
 		return Session{}, nil, err
 	}
