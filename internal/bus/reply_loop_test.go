@@ -103,6 +103,7 @@ func TestARecipientReplyMarksTheParentAndOnlyEmitsOnce(t *testing.T) {
 		{"queued for the replying session of a different agent", "codex", "claude", "claude/recipient", "recipient", bus.StatusQueued},
 		{"queued for a session of a different agent replying without a session", "codex", "claude", "claude/recipient", "", bus.StatusQueued},
 		{"expired for a session of the same agent", "claude", "claude", "claude/recipient", "recipient", bus.StatusExpired},
+		{"unpinned and queued for a different agent, answered by another of its sessions", "claude", "codex", "codex", "lane2", bus.StatusQueued},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()

@@ -615,7 +615,7 @@ func (s *SQLite) MarkReplied(ctx context.Context, id, agent, session string, sam
 		       OR (?5 = '' AND NOT ?4)
 		       OR (?5 != '' AND (
 		           (status = 'claimed' AND taken_by = ?5)
-		           OR (status = 'queued' AND to_session = ?5))))`,
+		           OR (status = 'queued' AND (to_session = ?5 OR (to_session = '' AND NOT ?4))))))`,
 		time.Now().UnixMilli(), id, agent, sameAgent, session)
 	if err != nil {
 		return false, err
