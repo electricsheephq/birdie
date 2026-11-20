@@ -461,20 +461,20 @@ func positionGate(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where stri
 	return " AND m.priority != 3", false, nil
 }
 
-type settleKey struct{ agent, session string }
+type settleKey struct{ agent, session, where string }
 
 type settleWindow struct {
-	deadline time.Time
-	through  int64
+	deadline       time.Time
+	first, through int64
 }
 
 // Fresh mail sets the delay, but older due mail can still belong to the
 // outstanding batch. The claim transaction keeps both checks on one snapshot.
-func (s *SQLite) settleDelay(ctx context.Context, tx *sql.Tx, key settleKey, where string, args []any, now time.Time) (time.Duration, error) {
+func (s *SQLite) settleDelay(ctx context.Context, tx *sql.Tx, key settleKey, args []any, now time.Time) (time.Duration, error) {
 	cutoff := now.Add(-bus.CoalesceMax)
 	var oldestFresh, newest, first, last sql.NullInt64
 	err := tx.QueryRowContext(ctx, `SELECT MIN(m.created_at) FILTER (WHERE m.created_at > ?1),
-		MAX(m.created_at), MIN(m.seq), MAX(m.seq) FROM messages m WHERE`+where,
+		MAX(m.created_at), MIN(m.seq), MAX(m.seq) FROM messages m WHERE`+key.where,
 		append([]any{cutoff.UnixMilli()}, args...)...).Scan(&oldestFresh, &newest, &first, &last)
 	if err != nil {
 		return 0, err
@@ -493,10 +493,20 @@ func (s *SQLite) settleDelay(ctx context.Context, tx *sql.Tx, key settleKey, whe
 	}
 	oldestAt, newestAt := time.UnixMilli(oldestFresh.Int64), time.UnixMilli(newest.Int64)
 	maxWait := min(bus.CoalesceMax, oldestAt.Add(bus.CoalesceMax).Sub(now))
-	// Compare all due rows, so a sparse poll keeps its deadline even after
-	// every row it saw before has aged out of the fresh window.
-	if window, ok := s.settling[key]; ok && first.Int64 <= window.through {
-		maxWait = min(maxWait, window.deadline.Sub(now))
+	batchFirst := first.Int64
+	// Covered rows can keep the deadline even after they age out of the
+	// fresh window. A newly due row outside the range cannot keep it alive.
+	if window, ok := s.settling[key]; ok {
+		var overlaps bool
+		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM messages m WHERE`+key.where+
+			` AND m.seq BETWEEN ? AND ?)`, append(args, window.first, window.through)...).Scan(&overlaps)
+		if err != nil {
+			return 0, err
+		}
+		if overlaps {
+			batchFirst = window.first
+			maxWait = min(maxWait, window.deadline.Sub(now))
+		}
 	}
 	delay := min(newestAt.Add(bus.Coalesce).Sub(now), maxWait)
 	if delay <= 0 {
@@ -505,7 +515,7 @@ func (s *SQLite) settleDelay(ctx context.Context, tx *sql.Tx, key settleKey, whe
 	if s.settling == nil {
 		s.settling = make(map[settleKey]settleWindow)
 	}
-	s.settling[key] = settleWindow{deadline: now.Add(maxWait), through: last.Int64}
+	s.settling[key] = settleWindow{deadline: now.Add(maxWait), first: batchFirst, through: last.Int64}
 	return delay, nil
 }
 
@@ -520,7 +530,7 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 	order, cols := "m.seq", msgCols
 	positioned := f.At != ""
 	settle := positioned && f.Thread == ""
-	key := settleKey{f.Agent, f.Session}
+	var key settleKey
 	limit := f.Limit
 	if positioned {
 		gate, carry, err := positionGate(ctx, tx, f, where, args, now)
@@ -529,7 +539,8 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 		}
 		where += gate
 		if settle {
-			delay, err := s.settleDelay(ctx, tx, key, where, args, now)
+			key = settleKey{f.Agent, f.Session, where}
+			delay, err := s.settleDelay(ctx, tx, key, args, now)
 			if err != nil || delay > 0 {
 				return nil, delay, err
 			}
