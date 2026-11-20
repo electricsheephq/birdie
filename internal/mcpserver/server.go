@@ -31,6 +31,7 @@ import (
 const (
 	defaultProtocol = "2025-06-18"
 	pollWait        = 50 * time.Second
+	claudePollWait  = 5 * time.Second
 	maxReplyWait    = 10 * time.Minute
 )
 
@@ -480,7 +481,25 @@ func (s *Server) pump(ctx context.Context) {
 			continue
 		}
 		polled, pollConv := s.acting()
-		msgs, err := s.c.PushInbox(ctx, pollWait)
+		claude, _ := s.currentHost().(*claudeHost)
+		at, wait := "", pollWait
+		if claude != nil && claude.Tier() == bus.TierPush {
+			var err error
+			at, err = claude.position()
+			if err != nil {
+				pause(ctx, unsureRetry)
+				continue
+			}
+			if at != "" {
+				// Re-read the registry on the next poll, even when a turn
+				// ends or mail becomes due without waking this one.
+				wait = claudePollWait
+			}
+		} else {
+			claude = nil
+		}
+		// A turn change never cancels a poll that may already hold a claim.
+		msgs, err := s.c.PushInboxAt(ctx, wait, at)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -495,9 +514,10 @@ func (s *Server) pump(ctx context.Context) {
 		var stop error
 		failed, relearn := false, false
 		b := s.newBatch(ctx)
+		var ready []bus.Message
 		for _, m := range msgs {
-			// Checked before each message, not once per batch: /clear can
-			// come while one is being shown.
+			// The conversation can change between members or while a
+			// waiter is being handed its reply.
 			if stop == nil {
 				stop = s.check(polled, pollConv)
 			}
@@ -521,6 +541,10 @@ func (s *Server) pump(ctx context.Context) {
 				relearn = true
 				continue
 			}
+			if claude != nil {
+				ready = append(ready, m)
+				continue
+			}
 			if failed {
 				// Back to the queue for the next try, or for check_inbox.
 				b.nack(m)
@@ -538,6 +562,36 @@ func (s *Server) pump(ctx context.Context) {
 			}
 			s.remember(m, pollConv)
 			b.ack(m)
+		}
+		if len(ready) > 0 {
+			var shown, returned []bus.Message
+			if stop == nil {
+				stop = s.check(polled, pollConv)
+			}
+			if stop == nil {
+				shown, returned, err = claude.pushClaim(ctx, polled, at, ready)
+				switch {
+				case errors.Is(err, ErrOtherConversation), errors.Is(err, errUnsure):
+					stop = err
+				case err != nil:
+					s.log.Printf("push claim: %v", err)
+					failed = true
+				}
+			}
+			if stop != nil || failed {
+				returned = ready
+			}
+			// Remember the whole frame before settling any member. If an
+			// ack fails, any member returned after its lease was still shown.
+			for _, m := range shown {
+				s.remember(m, pollConv)
+			}
+			for _, m := range shown {
+				b.ack(m)
+			}
+			for _, m := range returned {
+				b.nack(m)
+			}
 		}
 		if relearn {
 			// The bus handed these out, so it may say pull-only is off now:
@@ -664,11 +718,11 @@ func (s *Server) newBatch(ctx context.Context) *batch {
 func (b *batch) ack(m bus.Message)  { b.settle(m, "ack", b.s.c.Ack) }
 func (b *batch) nack(m bus.Message) { b.settle(m, "nack", b.s.c.Nack) }
 
-func (b *batch) settle(m bus.Message, verb string, call func(context.Context, string) error) {
+func (b *batch) settle(m bus.Message, verb string, call func(context.Context, string, ...int64) error) {
 	if b.stalled {
 		return
 	}
-	err := call(b.ctx, m.ID)
+	err := call(b.ctx, m.ID, m.LeaseUntil)
 	if err == nil {
 		return
 	}

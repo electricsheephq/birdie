@@ -25,8 +25,9 @@ func str(desc string) schema { return schema{"type": "string", "description": de
 
 var tools = []schema{
 	{
-		"name":        "send_message",
-		"description": "Message another AI agent or bot (for example Grok Bot, Claude, Codex or Grok): ask it something, hand it a task, or answer it. Returns message_id, thread_id and a note on when the recipient will see it. To answer a message, set in_reply_to to its message_id; to can then be left out.",
+		"name": "send_message",
+		"description": "Message another AI agent or bot (for example Grok Bot, Claude, Codex or Grok): ask it something, hand it a task, or answer it. Returns message_id, thread_id, the effective priority and a note on when the recipient will see it. To answer a message, set in_reply_to to its message_id; to can then be left out." +
+			" Set priority. Most messages are p3. p0 is shown as soon as the recipient can be reached: only a stop sign (data loss, a live failure, something irreversible) or a decision that blocks you and only the recipient can make. p1 is shown when the recipient's turn ends: an answer to something it asked you, the final result of a task it gave you, or a new task or question for it. p3 is held and shown in a digest within about 20 minutes: progress, measurements, records, FYI. Send one complete message, not a stream, with the evidence and what you will do next. No acknowledgements or narration. The note in the result says when it will be seen; don't wait for it and don't resend.",
 		"inputSchema": obj([]string{"content"}, schema{
 			"to":          str("Recipient from list_agents (e.g. grok-bot), or one running session by its address from list_agents: agent/name, agent/name#id or agent/id (e.g. claude/api). Claude sessions must be addressed one by one. Optional when in_reply_to is set."),
 			"content":     str("The message. For requests, make it self-contained: the recipient has none of your context."),
@@ -34,6 +35,7 @@ var tools = []schema{
 			"thread_id":   str("Continue an existing thread without replying to a specific message."),
 			"context":     str("Optional supporting files, links or notes."),
 			"wanted":      str("Optional description of the result you want back."),
+			"priority":    schema{"type": "string", "enum": []string{"p0", "p1", "p3"}, "description": "Choose the lowest that fits."},
 		}),
 	},
 	{
@@ -76,6 +78,7 @@ type toolArgs struct {
 	ThreadID       string  `json:"thread_id"`
 	Context        string  `json:"context"`
 	Wanted         string  `json:"wanted"`
+	Priority       string  `json:"priority"`
 	WaitSeconds    float64 `json:"wait_seconds"`
 	TimeoutSeconds float64 `json:"timeout_seconds"`
 }
@@ -122,21 +125,18 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 			meta["wanted"] = a.Wanted
 		}
 		var m bus.Message
-		m, err = s.c.Send(ctx, bus.SendInput{To: a.To, Content: a.Content, InReplyTo: a.InReplyTo, ThreadID: a.ThreadID, Meta: meta})
+		m, err = s.c.Send(ctx, bus.SendInput{To: a.To, Content: a.Content, InReplyTo: a.InReplyTo, ThreadID: a.ThreadID, Meta: meta, Priority: a.Priority})
 		if err == nil {
 			// A later wait_for_reply is for the answer to this, not what came before.
 			s.waitMu.Lock()
 			delete(s.shown, m.ThreadID)
 			s.waitMu.Unlock()
 		}
-		out = map[string]string{"message_id": m.ID, "thread_id": m.ThreadID, "status": m.Status, "note": m.Note}
+		out = map[string]string{"message_id": m.ID, "thread_id": m.ThreadID, "status": m.Status, "note": m.Note, "priority": m.Priority}
 	case "check_inbox":
 		if h := s.currentHost(); h != nil && s.pushing() {
 			// It may have been made pull-only since it last reported.
 			s.syncSession(context.WithoutCancel(ctx), h)
-		}
-		if s.pushing() {
-			return toolText("New messages come to you on their own in this session, so there is nothing to fetch.", false), nil
 		}
 		if h := s.currentHost(); h != nil {
 			if _, err := hostConversation(h); errors.Is(err, errUnsure) {

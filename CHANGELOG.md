@@ -35,6 +35,11 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 
 ### Added
 
+- `send_message` accepts `p0`, `p1`, or `p3`. Claude Code offers P0
+  immediately, shows P1 at turn boundaries, and batches P3 into digests.
+  Unranked messages keep their existing delivery. `check_inbox` can read held
+  messages while pushes are on.
+
 - Clarify-back. A session that isn't sure what a new request wants replies
   `(question / not a steer)` with up to 3 numbered questions. The sender then
   sees the thread as `awaiting_clarification` (#17).
