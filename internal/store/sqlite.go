@@ -461,21 +461,17 @@ func positionGate(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where stri
 	return " AND m.priority != 3", false, nil
 }
 
-type settleKey struct{ agent, session, where string }
+type settleKey struct{ agent, session, predicate string }
 
-type settleWindow struct {
-	deadline       time.Time
-	first, through int64
-}
+type settleWindow struct{ deadline, newest time.Time }
 
-// Fresh mail sets the delay, but older due mail can still belong to the
-// outstanding batch. The claim transaction keeps both checks on one snapshot.
-func (s *SQLite) settleDelay(ctx context.Context, tx *sql.Tx, key settleKey, args []any, now time.Time) (time.Duration, error) {
+// settleDelay uses only fresh mail that passed the position gate. Holding the
+// claim transaction keeps new arrivals from slipping into a settled batch.
+func (s *SQLite) settleDelay(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where string, args []any, now time.Time) (time.Duration, error) {
 	cutoff := now.Add(-bus.CoalesceMax)
-	var oldestFresh, newest, first, last sql.NullInt64
-	err := tx.QueryRowContext(ctx, `SELECT MIN(m.created_at) FILTER (WHERE m.created_at > ?1),
-		MAX(m.created_at), MIN(m.seq), MAX(m.seq) FROM messages m WHERE`+key.where,
-		append([]any{cutoff.UnixMilli()}, args...)...).Scan(&oldestFresh, &newest, &first, &last)
+	var oldest, newest sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT MIN(m.created_at), MAX(m.created_at) FROM messages m WHERE`+where+
+		` AND m.created_at > ?`, append(args, cutoff.UnixMilli())...).Scan(&oldest, &newest)
 	if err != nil {
 		return 0, err
 	}
@@ -484,38 +480,32 @@ func (s *SQLite) settleDelay(ctx context.Context, tx *sql.Tx, key settleKey, arg
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if !first.Valid {
+	for key, window := range s.settling {
+		if window.deadline.Before(cutoff) {
+			delete(s.settling, key)
+		}
+	}
+	key := settleKey{f.Agent, f.Session, where}
+	if !oldest.Valid {
 		delete(s.settling, key)
 		return 0, nil
 	}
-	if !oldestFresh.Valid {
-		return 0, nil
-	}
-	oldestAt, newestAt := time.UnixMilli(oldestFresh.Int64), time.UnixMilli(newest.Int64)
+	oldestAt, newestAt := time.UnixMilli(oldest.Int64), time.UnixMilli(newest.Int64)
 	maxWait := min(bus.CoalesceMax, oldestAt.Add(bus.CoalesceMax).Sub(now))
-	batchFirst := first.Int64
-	// Covered rows can keep the deadline even after they age out of the
-	// fresh window. A newly due row outside the range cannot keep it alive.
-	if window, ok := s.settling[key]; ok {
-		var overlaps bool
-		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM messages m WHERE`+key.where+
-			` AND m.seq BETWEEN ? AND ?)`, append(args, window.first, window.through)...).Scan(&overlaps)
-		if err != nil {
-			return 0, err
-		}
-		if overlaps {
-			batchFirst = window.first
-			maxWait = min(maxWait, window.deadline.Sub(now))
-		}
+	// Keep the cap for an overlapping batch when its earliest rows age out
+	// of the query. Without this, a steady stream can keep moving the cap.
+	if window, ok := s.settling[key]; ok && !oldestAt.After(window.newest) {
+		maxWait = min(maxWait, window.deadline.Sub(now))
 	}
 	delay := min(newestAt.Add(bus.Coalesce).Sub(now), maxWait)
 	if delay <= 0 {
+		delete(s.settling, key)
 		return 0, nil
 	}
 	if s.settling == nil {
 		s.settling = make(map[settleKey]settleWindow)
 	}
-	s.settling[key] = settleWindow{deadline: now.Add(maxWait), first: batchFirst, through: last.Int64}
+	s.settling[key] = settleWindow{deadline: now.Add(maxWait), newest: newestAt}
 	return delay, nil
 }
 
@@ -529,8 +519,6 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 	where, args := inboxWhere(f, now)
 	order, cols := "m.seq", msgCols
 	positioned := f.At != ""
-	settle := positioned && f.Thread == ""
-	var key settleKey
 	limit := f.Limit
 	if positioned {
 		gate, carry, err := positionGate(ctx, tx, f, where, args, now)
@@ -538,9 +526,8 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 			return nil, 0, err
 		}
 		where += gate
-		if settle {
-			key = settleKey{f.Agent, f.Session, where}
-			delay, err := s.settleDelay(ctx, tx, key, args, now)
+		if f.Thread == "" {
+			delay, err := s.settleDelay(ctx, tx, f, where, args, now)
 			if err != nil || delay > 0 {
 				return nil, delay, err
 			}
@@ -630,17 +617,7 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 			return nil, 0, err
 		}
 	}
-	if settle {
-		// Clear the window only once the claim commits, before another poll
-		// can use it for the next batch.
-		s.settleMu.Lock()
-		defer s.settleMu.Unlock()
-	}
-	err = tx.Commit()
-	if err == nil && settle {
-		delete(s.settling, key)
-	}
-	return msgs, 0, err
+	return msgs, 0, tx.Commit()
 }
 
 const contentSize = `length(CAST(m.content AS BLOB))`

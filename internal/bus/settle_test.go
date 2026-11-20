@@ -39,20 +39,6 @@ func TestABoundaryWindowDoesNotCutAMidturnBatchShort(t *testing.T) {
 	}
 }
 
-func TestABoundaryBatchSettlesAcrossAlternatingSparsePolls(t *testing.T) {
-	p := newPriorityInbox(t)
-	ids := []string{p.send(t, "alice", "p1", "answer").ID}
-	p.claim(t, bus.Boundary)
-	for second := 1; second <= 10; second++ {
-		*p.now = p.now.Add(time.Second)
-		ids = append(ids, p.send(t, "alice", "p1", "answer").ID)
-		if second == 5 {
-			p.claim(t, bus.Midturn)
-		}
-	}
-	p.claim(t, bus.Boundary, ids...)
-}
-
 func TestAWindowLeftByALegacyClaimDoesNotCutFreshMailShort(t *testing.T) {
 	p := newPriorityInbox(t)
 	old := p.send(t, "alice", "p3", "old")

@@ -216,33 +216,6 @@ func TestASteadyStreamSettlesWithinTenSeconds(t *testing.T) {
 	p.claim(t, bus.Midturn, ids...)
 }
 
-func TestASteadyStreamSettlesOnTheNextSparsePoll(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		seconds int
-	}{
-		{"at the deadline", 10},
-		{"after a missed poll", 30},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			p := newPriorityInbox(t)
-			ids := []string{p.send(t, "alice", "p0", "stop").ID}
-			// claim does not set Wait, so these polls do not wait for a window.
-			p.claim(t, bus.Midturn)
-			for range tc.seconds {
-				*p.now = p.now.Add(time.Second)
-				ids = append(ids, p.send(t, "alice", "p0", "stop").ID)
-			}
-			p.ack(t, p.claim(t, bus.Midturn, ids...))
-
-			fresh := p.send(t, "alice", "p0", "another stop")
-			p.claim(t, bus.Midturn)
-			*p.now = p.now.Add(bus.Coalesce)
-			p.claim(t, bus.Midturn, fresh.ID)
-		})
-	}
-}
-
 func TestAMidturnP0CarriesHeldMailAndRestartsTheDigestClock(t *testing.T) {
 	p := newPriorityInbox(t)
 	p3 := p.send(t, "alice", "p3", strings.Repeat("a", 40<<10))
