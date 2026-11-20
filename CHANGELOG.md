@@ -37,8 +37,11 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 
 - `send_message` accepts `p0`, `p1`, or `p3`. Claude Code offers P0
   immediately, shows P1 at turn boundaries, and batches P3 into digests.
-  Unranked messages keep their existing delivery. `check_inbox` can read held
-  messages while pushes are on.
+  Unranked messages keep their existing delivery. Claude Code's `check_inbox`
+  can read held messages while pushes are on. Claude Code push frames carry up
+  to 256 KiB of rendered text and return overflow to the queue. P0 bypasses
+  the loop guard and still counts toward it. Oversized P3 messages show a
+  pointer preview in the activity feed.
 
 - Clarify-back. A session that isn't sure what a new request wants replies
   `(question / not a steer)` with up to 3 numbered questions. The sender then

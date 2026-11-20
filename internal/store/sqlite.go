@@ -550,7 +550,8 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 
 const contentSize = `length(CAST(m.content AS BLOB))`
 
-var digestContent = fmt.Sprintf(`CASE WHEN m.priority = 3 AND %s > %d THEN '' ELSE m.content END`, contentSize, bus.MaxDigestBytes)
+var digestContent = fmt.Sprintf(`CASE WHEN m.priority = 3 AND %[1]s > %[2]d
+	THEN printf('(%%d bytes; read it in the thread)', %[1]s) ELSE m.content END`, contentSize, bus.MaxDigestBytes)
 
 // waiting is the condition for a message still waiting to be taken: queued,
 // or claimed with the lease run out.

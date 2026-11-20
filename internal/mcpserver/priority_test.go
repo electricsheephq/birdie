@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -228,6 +229,32 @@ func TestAClaudeStreamReachesOneSocketFramePerDigest(t *testing.T) {
 	}
 }
 
+func TestAClaudeFrameReturnsTheOverflowInClaimOrder(t *testing.T) {
+	f := newClaudeInbox(t, "idle")
+	poll := f.poll(t, "boundary")
+	body := strings.Repeat("é", 45<<10)
+	p3 := f.send(t, "alice", "p3", "short update")
+	p1 := f.send(t, "alice", "p1", body)
+	unranked := f.send(t, "bob", "", body)
+	p0 := f.send(t, "carol", "p0", body)
+
+	poll.resume <- nil
+	if frame := f.frame(t, p0, p1); len(frame) > 256<<10 {
+		t.Fatalf("first frame is %d bytes", len(frame))
+	}
+	poll = f.poll(t, "boundary")
+	f.statusIs(t, p0, bus.StatusDelivered)
+	f.statusIs(t, p1, bus.StatusDelivered)
+	f.statusIs(t, unranked, bus.StatusQueued)
+	f.statusIs(t, p3, bus.StatusQueued)
+
+	poll.resume <- nil
+	f.frame(t, unranked, p3)
+	f.poll(t, "boundary")
+	f.statusIs(t, unranked, bus.StatusDelivered)
+	f.statusIs(t, p3, bus.StatusDelivered)
+}
+
 func TestABusyClaudeShowsOnlyP0UntilItsTurnEnds(t *testing.T) {
 	f := newClaudeInbox(t, "busy")
 	poll := f.poll(t, "midturn")
@@ -294,6 +321,40 @@ func TestCheckInboxTakesHeldMailEvenWhileClaudePushes(t *testing.T) {
 	var conv uint64
 	result, rpcErr := f.srv.callTool(context.Background(), json.RawMessage(`{"name":"check_inbox"}`), &taken, &conv)
 	if rpcErr != nil || len(taken) != 1 || taken[0].ID != p3 {
+		t.Fatalf("check_inbox took %+v, result %v, error %v", taken, result, rpcErr)
+	}
+}
+
+func TestCheckInboxLeavesMailForCodexPush(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/sessions/desk":
+			io.WriteString(w, "{}")
+		case "/v1/inbox":
+			t.Error("a pushing Codex session tried to claim mail with check_inbox")
+			io.WriteString(w, `{"messages":[{"id":"msg_waiting"}]}`)
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(api.Close)
+	s := New(client.New(api.URL, "test-tok"), "codex", "test", false, log.New(io.Discard, "", 0))
+	s.host = &codexHost{thread: "desk"}
+	if !s.pushing() {
+		t.Fatal("Codex is not in push mode")
+	}
+
+	var taken []bus.Message
+	var conv uint64
+	result, rpcErr := s.callTool(context.Background(), json.RawMessage(`{"name":"check_inbox"}`), &taken, &conv)
+	want := toolText("New messages come to you on their own in this session, so there is nothing to fetch.", false)
+	if rpcErr != nil || len(taken) != 0 || !reflect.DeepEqual(result, want) {
 		t.Fatalf("check_inbox took %+v, result %v, error %v", taken, result, rpcErr)
 	}
 }

@@ -186,7 +186,7 @@ type Message struct {
 	ToSession   string `json:"to_session,omitempty"`
 	Content     string `json:"content"`
 	Priority    string `json:"priority,omitempty"`
-	// ContentBytes replaces Content in a positioned claim for an oversized P3.
+	// ContentBytes gives the full body size when a positioned claim uses a P3 pointer.
 	ContentBytes int               `json:"content_bytes,omitempty"`
 	Meta         map[string]string `json:"meta,omitempty"`
 	Status       string            `json:"status"`

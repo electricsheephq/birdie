@@ -102,6 +102,36 @@ func TestAP0PassesFiftyHeldMessagesAtEitherPosition(t *testing.T) {
 	}
 }
 
+func TestAP0PassesTheLoopGuardAndCountsTowardIt(t *testing.T) {
+	p := newPriorityInbox(t)
+	p.LoopLimit = 0
+	p.report(t, time.Time{})
+	ctx := context.Background()
+	if err := p.ReportSession(ctx, "alice", "lane", bus.SessionInput{Tier: bus.TierPush}); err != nil {
+		t.Fatal(err)
+	}
+	send := func(priority string) error {
+		_, err := p.Send(ctx, "alice", bus.SendInput{
+			FromSession: "lane", To: "bob/desk", Priority: priority, Content: "update",
+		})
+		return err
+	}
+	for i := range bus.DefaultLoopLimit {
+		if err := send("p3"); err != nil {
+			t.Fatalf("send %d: %v", i+1, err)
+		}
+	}
+	if err := send("p3"); !errors.Is(err, bus.ErrLoop) {
+		t.Fatalf("13th send with p3: %v, want ErrLoop", err)
+	}
+	if err := send("p0"); err != nil {
+		t.Fatalf("13th send with p0: %v", err)
+	}
+	if err := send("p3"); !errors.Is(err, bus.ErrLoop) || !strings.Contains(err.Error(), "13 messages") {
+		t.Fatalf("p3 after p0: %v, want ErrLoop counting all 13 sends", err)
+	}
+}
+
 func TestAP1SentMidturnWaitsForTheBoundaryAndRidesWithP3(t *testing.T) {
 	p := newPriorityInbox(t)
 	p.report(t, time.Time{})
@@ -158,6 +188,23 @@ func TestOverflowAndExpiredLeasesRespectTheDigestReservation(t *testing.T) {
 	p.claim(t, "boundary")
 	*p.now = p.now.Add(bus.DigestEvery)
 	p.claim(t, "boundary", second.ID)
+}
+
+func TestAnOversizedP3ClaimGivesWatchersAPointerPreview(t *testing.T) {
+	p := newPriorityInbox(t)
+	body := strings.Repeat("é", 40<<10)
+	m := p.send(t, "alice", "p3", body)
+	*p.now = p.now.Add(bus.DigestEvery)
+	events, stop := p.Watch()
+	defer stop()
+
+	msgs := p.claim(t, "boundary", m.ID)
+	if msgs[0].ContentBytes != len(body) {
+		t.Fatalf("claimed pointer size = %d, want %d", msgs[0].ContentBytes, len(body))
+	}
+	if e := next(t, events); e.Type != bus.StatusClaimed || e.ID != m.ID || e.Text != "(81920 bytes; read it in the thread)" {
+		t.Fatalf("claimed pointer event = %+v", e)
+	}
 }
 
 func TestLegacyClaimsAndUnrankedMailKeepTheirDelivery(t *testing.T) {

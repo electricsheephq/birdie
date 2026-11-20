@@ -287,14 +287,15 @@ func (h *claudeHost) Push(ctx context.Context, session string, m bus.Message) er
 	return err
 }
 
+const (
+	maxClaudeFrameBytes  = 256 << 10
+	claudeFrameSeparator = "\n\n"
+)
+
 func (h *claudeHost) pushClaim(ctx context.Context, session, at string, msgs []bus.Message) (shown, returned []bus.Message, err error) {
 	text := make([]string, len(msgs))
 	for i, m := range msgs {
 		text[i] = PushText(m)
-	}
-	frame, err := encodeClaudeFrame(text)
-	if err != nil {
-		return nil, nil, err
 	}
 	e, err := h.pushEntry(session)
 	if err != nil {
@@ -332,13 +333,25 @@ func (h *claudeHost) pushClaim(ctx context.Context, session, at string, msgs []b
 				returned = append(returned, m)
 			}
 		}
-		if len(shown) == 0 {
-			return nil, returned, nil
+		text = kept
+	}
+	if len(shown) == 0 {
+		return nil, returned, nil
+	}
+	// Keep the claim in order. The first member always goes through,
+	// and PushText already replaces individually oversized bodies.
+	size := len(text[0])
+	for i := 1; i < len(text); i++ {
+		size += len(claudeFrameSeparator) + len(text[i])
+		if size > maxClaudeFrameBytes {
+			returned = append(returned, shown[i:]...)
+			shown, text = shown[:i], text[:i]
+			break
 		}
-		frame, err = encodeClaudeFrame(kept)
-		if err != nil {
-			return nil, nil, err
-		}
+	}
+	frame, err := encodeClaudeFrame(text)
+	if err != nil {
+		return nil, nil, err
 	}
 	if _, err = conn.Write(append(frame, '\n')); err != nil {
 		return nil, nil, err
@@ -360,7 +373,7 @@ func (h *claudeHost) pushEntry(session string) (claudeEntry, error) {
 func encodeClaudeFrame(text []string) ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"type":    "user",
-		"message": map[string]string{"role": "user", "content": strings.Join(text, "\n\n")},
+		"message": map[string]string{"role": "user", "content": strings.Join(text, claudeFrameSeparator)},
 	})
 }
 

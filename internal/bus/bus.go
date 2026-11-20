@@ -650,7 +650,7 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		}
 		toSession, others, name = s.ID, more, s.Name
 	}
-	if err := b.admit(ctx, from, to.Name, in.FromSession, toSession); err != nil {
+	if err := b.admit(ctx, from, to.Name, in.FromSession, toSession, in.Priority); err != nil {
 		return Message{}, err
 	}
 
@@ -967,12 +967,12 @@ func (b *Bus) Notice(ctx context.Context, m Message, kind, text string) error {
 
 // admit decides whether from may message to right now. Rules about who may
 // reach whom belong here, including any later ones for other machines.
-func (b *Bus) admit(ctx context.Context, from, to, fromSession, toSession string) error {
+func (b *Bus) admit(ctx context.Context, from, to, fromSession, toSession, priority string) error {
 	limit := b.LoopLimit
 	if limit == 0 {
 		limit = DefaultLoopLimit
 	}
-	if limit < 0 {
+	if limit < 0 || priority == "p0" {
 		return nil
 	}
 	n, err := b.store.CountSent(ctx, from, to, fromSession, toSession, b.now().Add(-LoopWindow))
