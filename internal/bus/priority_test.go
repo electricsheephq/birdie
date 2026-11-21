@@ -152,11 +152,23 @@ func TestASenderGetsDeliveryNotesForWarmAndColdTurnRecipients(t *testing.T) {
 			t.Errorf("%q note = %q, want %q", tc.priority, got, tc.note)
 		}
 	}
-	*p.now = p.now.Add(bus.CacheIdle + time.Millisecond)
-	p.report(t, p.now.Add(-bus.CacheIdle-time.Millisecond))
+	const warm = "held: goes in its next digest, within about 20 minutes"
 	const cold = "held: it is idle, so this waits for its next turn (at most 12 hours)"
-	if got := p.sendToDesk(t, "alice", "p3", "update").Note; got != cold {
-		t.Errorf("cold note = %q, want %q", got, cold)
+	active := *p.now
+	for _, tc := range []struct {
+		age  time.Duration
+		note string
+	}{
+		{30*time.Minute - time.Millisecond, warm},
+		{30 * time.Minute, warm},
+		{30*time.Minute + time.Millisecond, cold},
+		{bus.CacheIdle + time.Millisecond, cold},
+	} {
+		*p.now = active.Add(tc.age)
+		p.report(t, active)
+		if got := p.sendToDesk(t, "alice", "p3", "update").Note; got != tc.note {
+			t.Errorf("note at activity age %v = %q, want %q", tc.age, got, tc.note)
+		}
 	}
 }
 

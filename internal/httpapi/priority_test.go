@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -79,14 +80,19 @@ func TestAClientCanClaimAtTurnAndAnUnknownPositionIsStillRejected(t *testing.T) 
 func TestTheSessionsAPIOnlyCountsQueuedMailForTheAddressedSession(t *testing.T) {
 	api, b := priorityAPI(t)
 	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	b.Now = func() time.Time { return now }
+	if err := b.ReportSession(ctx, "bob", "desk", bus.SessionInput{Tier: bus.TierPush}); err != nil {
+		t.Fatal(err)
+	}
 	for _, session := range [][2]string{{"alice", "desk"}, {"bob", "other"}} {
-		if err := b.ReportSession(ctx, session[0], session[1], bus.SessionInput{Tier: bus.TierPush}); err != nil {
+		if err := b.ReportSession(ctx, session[0], session[1], bus.SessionInput{Tier: bus.TierPull}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	send := func(from, to string) bus.Message {
+	send := func(from, to, priority string) bus.Message {
 		t.Helper()
-		m, err := b.Send(ctx, from, bus.SendInput{To: to, Content: "update"})
+		m, err := b.Send(ctx, from, bus.SendInput{To: to, Content: "update", Priority: priority})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -117,7 +123,13 @@ func TestTheSessionsAPIOnlyCountsQueuedMailForTheAddressedSession(t *testing.T) 
 		}
 		return counts
 	}
-	delivered := send("alice", "bob/desk")
+	checkHeld := func(want map[string]float64) {
+		t.Helper()
+		if got := readHeld(); !maps.Equal(got, want) {
+			t.Errorf("held counts = %v, want %v", got, want)
+		}
+	}
+	delivered := send("alice", "bob/desk", "")
 	claim := func() {
 		t.Helper()
 		if msgs, err := b.ReceiveFor(ctx, bus.ReceiveInput{Agent: "bob", Session: "desk", Lease: time.Minute}); err != nil || len(msgs) != 1 {
@@ -128,14 +140,18 @@ func TestTheSessionsAPIOnlyCountsQueuedMailForTheAddressedSession(t *testing.T) 
 	if err := b.Ack(ctx, "bob", delivered.ID); err != nil {
 		t.Fatal(err)
 	}
-	send("alice", "bob/desk")
+	send("alice", "bob/desk", "")
 	claim() // still claimed, with no confirmation yet
-	send("alice", "bob/desk")
-	send("alice", "bob/desk")
-	send("bob", "alice/desk")
-	if got := readHeld(); len(got) != 2 || got["bob/desk"] != 2 || got["alice/desk"] != 1 {
-		t.Fatalf("held counts = %v, want bob/desk=2 and alice/desk=1 with no held field for bob/other", got)
+	if m := send("alice", "bob", "p3"); m.ToSession != "" {
+		t.Fatalf("agent-only mail was pinned to %q", m.ToSession)
 	}
+	checkHeld(map[string]float64{"bob/desk": 1})
+	send("alice", "bob/desk", "p3")
+	checkHeld(map[string]float64{"bob/desk": 2})
+	send("bob", "alice/desk", "")
+	checkHeld(map[string]float64{"bob/desk": 2, "alice/desk": 1})
+	now = now.Add(time.Minute)
+	checkHeld(map[string]float64{"bob/desk": 3, "alice/desk": 1})
 }
 
 type failedInboxWriter struct {

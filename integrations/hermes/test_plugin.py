@@ -157,8 +157,9 @@ class PluginCase(unittest.TestCase):
 
 
 class PluginTest(PluginCase):
-    KEEP_WARM = ("⟦pulse o:occurrence a:1 n:tag⟧ [HeartBeat 2.0 · keep-warm wake]"
-                 "\nThis turn only keeps the prompt cache warm. Reply with exactly: [SILENT]")
+    KEEP_WARM = ("⟦pulse o:wake/occurrence a:1⟧ [HeartBeat 2.0 · keep-warm wake]"
+                 "\nThis turn only keeps the prompt cache warm. Do no work and call no tools. Reply with exactly: [SILENT]")
+    KEEP_WARM_TAGGED = KEEP_WARM.replace("a:1⟧", "a:1 n:0123456789abcdef⟧")
 
     def test_the_send_tool_accepts_only_the_supported_priorities_and_passes_them(self):
         ctx, _ = self.load()
@@ -266,26 +267,80 @@ class PluginTest(PluginCase):
     def test_a_keep_warm_turn_returns_folded_frames_and_the_next_normal_turn_confirms_them(self):
         self.write_config(True)
         ctx, network = self.load()
+        session = "folded-keep-warm"
         with mock.patch.object(network, "start_threads"):
-            self.turn(ctx, user_message="hello")
-            conversation = network.conversation("s1")
+            self.turn(ctx, session=session, user_message="hello")
+            conversation = network.conversation(session)
             active_at = conversation.active_at
             sent = peer("POST", "/v1/messages", {"to": f"hermes/{conversation.id}", "content": "folded"})
             claimed = network.bus.inbox(conversation.id)[0]
             network.deliver(conversation, claimed)
             self.assertIn(sent["id"], conversation.pending)
             text = ctx.injected[0][1]
-            self.turn(ctx, user_message=self.KEEP_WARM + "\n\n" + text)
+            self.turn(ctx, session=session, user_message=self.KEEP_WARM + "\n\n" + text)
             self.assertEqual(status(sent["id"]), "queued")
             self.assertNotIn(sent["id"], conversation.pending)
             self.assertNotIn(sent["id"], conversation.delivered)
             self.assertTrue(conversation.wake)
-            ctx.hooks["post_llm_call"](session_id="s1")
+            ctx.hooks["post_llm_call"](session_id=session)
             network.deliver(conversation, network.bus.inbox(conversation.id)[0])
             self.assertEqual(len(ctx.injected), 2)
-            self.turn(ctx, user_message=ctx.injected[1][1])
+            self.turn(ctx, session=session, user_message=ctx.injected[1][1])
         self.assertEqual(status(sent["id"]), "delivered")
         self.assertGreater(conversation.active_at, active_at)
+
+    def test_only_first_line_keep_warm_headers_are_quiet_even_with_a_gateway_prefix(self):
+        ctx, network = self.load()
+        wake = ("⟦pulse o:wake/occurrence a:1 n:0123456789abcdef⟧ "
+                "[HeartBeat 2.0 · wake wake · armed by you 1h ago]")
+        for text, quiet in (
+            (self.KEEP_WARM, True),
+            (self.KEEP_WARM_TAGGED, True),
+            ("[Name] " + self.KEEP_WARM_TAGGED, True),
+            ("[Name] " + wake + "] " + self.KEEP_WARM_TAGGED, True),
+            (wake, False),
+            ("[Name] " + wake, False),
+            ("hello\n[Name] " + self.KEEP_WARM_TAGGED, False),
+            ("[" + "x" * 1024 + "] " + self.KEEP_WARM_TAGGED, False),
+        ):
+            with self.subTest(header=text.partition("\n")[0][:120]):
+                self.turn(ctx, user_message="hello")
+                conversation = network.conversation("s1")
+                self.turn(ctx, user_message=text)
+                self.assertEqual(conversation.quiet(), quiet)
+                ctx.hooks["post_llm_call"](session_id="s1")
+
+    def test_a_normal_turn_ends_quiet_even_if_the_keep_warm_post_hook_did_not_run(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, user_message="hello")
+            conversation = network.conversation("s1")
+            self.turn(ctx, user_message=self.KEEP_WARM)
+            self.assertTrue(conversation.quiet())
+            self.turn(ctx, user_message="a real turn")
+        self.assertFalse(conversation.quiet())
+        network.deliver(conversation, {"id": "urgent", "priority": "p1", "content": "answer"})
+        self.assertIn("urgent", plugin.shown_ids(ctx.injected[0][1]))
+
+    def test_quiet_gives_back_only_claims_hermes_has_not_already_accepted(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, user_message="hello")
+        conversation = network.conversation("s1")
+        network.deliver(conversation, {"id": "pending", "priority": "p3"})
+        conversation.mark_delivered("shown")
+        self.turn(ctx, user_message=self.KEEP_WARM)
+        with mock.patch.object(network.bus, "nack") as nack, mock.patch.object(network.bus, "ack") as ack:
+            network.deliver(conversation, {"id": "shown", "priority": "p3"},
+                            {"id": "pending", "priority": "p3", "lease_until": 2},
+                            {"id": "fresh", "priority": "p3", "lease_until": 3})
+        nack.assert_called_once_with("fresh", lease_until=3, timeout=10)
+        ack.assert_called_once_with("shown")
+        self.assertEqual(len(ctx.injected), 1)
+        self.assertEqual(conversation.pending["pending"][0]["lease_until"], 2)
+        self.assertIn("shown", conversation.delivered)
 
     def test_an_older_hermes_without_the_post_hook_resumes_pushes_at_the_quiet_cap(self):
         class OlderContext(Context):
@@ -554,27 +609,63 @@ class PluginTest(PluginCase):
         self.assertLessEqual(plugin.CONFIRM_SECONDS, 5)
 
     def test_a_reply_handed_to_a_wait_that_is_ending_is_still_shown(self):
-        # The wait's last look comes just before the reply is handed to it, so
-        # the wait never returns it. It must come back and be shown, not be lost.
+        self.write_config(True)
+        ctx, network = self.load()
+        session = "late-reply"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session=session)
+        sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}, session=session))
+        conversation = network.conversation(session)
+        thread = sent["thread_id"]
+        reply_to = peer_inbox(5)[0]["id"]
+        peer("POST", "/v1/messages", {"in_reply_to": reply_to, "content": "first reply"})
+        self.assertEqual(len(network.take(conversation, thread=thread)), 1)
+        network.start_threads(conversation)
+        late = {}
+
         class Late(plugin.queue.Queue):
             def get(self, block=True, timeout=None):
                 if not block:
                     return super().get(block, timeout)
+                if not late:
+                    late.update(peer("POST", "/v1/messages", {"in_reply_to": reply_to,
+                                     "content": "the late reply", "priority": "p3"}))
                 time.sleep(timeout or 0)
                 raise plugin.queue.Empty
+
+        try:
+            with mock.patch.object(plugin.queue, "Queue", Late):
+                result = self.call(ctx, "birdie_wait_for_reply", {"thread_id": thread, "timeout_seconds": 0.5}, session=session)
+            self.assertEqual(late["priority"], "p3")
+            self.assertIn("the late reply", result)
+            self.assertEqual(status(late["id"]), "delivered")
+            self.assertIn(late["id"], conversation.delivered)
+            self.assertEqual(ctx.injected, [])
+        finally:
+            network.take(conversation, thread=thread)
+
+    def test_a_pushing_wait_leaves_held_mail_on_other_threads_queued(self):
         self.write_config(True)
         ctx, network = self.load()
-        self.turn(ctx)
-        sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}))
-        conversation = network.conversation("s1")
-        with mock.patch.object(plugin.queue, "Queue", Late):
-            waiting = threading.Thread(target=network.wait_pushed, args=(conversation, sent["thread_id"], 1.5))
-            waiting.start()
-            self.assertTrue(wait_until(lambda: sent["thread_id"] in conversation.waiting))
-            peer("POST", "/v1/messages", {"in_reply_to": peer_inbox(5)[0]["id"], "content": "the late reply"})
-            waiting.join()
-        self.assertTrue(wait_until(lambda: ctx.injected, 6), "the reply was lost")
-        self.assertIn("the late reply", ctx.injected[0][1])
+        session = "wait-scoping"
+        self.turn(ctx, session=session)
+        conversation = network.conversation(session)
+        sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}, session=session))
+        thread = sent["thread_id"]
+        target = f"hermes/{conversation.id}"
+        elsewhere = peer("POST", "/v1/messages", {"to": target, "content": "unrelated", "priority": "p3"})
+        followup = peer("POST", "/v1/messages", {"to": target, "thread_id": thread,
+                        "content": "on the waited thread", "priority": "p3"})
+        try:
+            result = self.call(ctx, "birdie_wait_for_reply", {"thread_id": thread, "timeout_seconds": 0.5}, session=session)
+            self.assertEqual(status(elsewhere["id"]), "queued")
+            self.assertIn("on the waited thread", result)
+            self.assertNotIn("unrelated", result)
+            self.assertEqual(status(followup["id"]), "delivered")
+            self.assertEqual(ctx.injected, [])
+        finally:
+            network.take(conversation, thread=thread)
+            network.take(conversation, thread=elsewhere["thread_id"])
 
     def test_a_pull_only_conversation_gets_nothing_pushed(self):
         self.write_config(True)

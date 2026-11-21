@@ -958,12 +958,12 @@ func (s *SQLite) RecentSessions(ctx context.Context, agent string, since time.Ti
 		WHERE agent = ? AND last_seen >= ? ORDER BY active_at DESC, id`, agent, since.UnixMilli()))
 }
 
-func (s *SQLite) QueuedBySession(ctx context.Context) (map[[2]string]int, error) {
-	// Start with agents so the inbox index only visits each recipient's queued mail.
+func (s *SQLite) QueuedBySession(ctx context.Context, now time.Time) (map[[2]string]int, error) {
+	// Start with agents and constrain status so the inbox index skips settled mail.
 	rows, err := s.db.QueryContext(ctx, `SELECT m.recipient, m.to_session, COUNT(*)
 		FROM agents a CROSS JOIN messages m ON m.recipient = a.name
-		WHERE a.delivery = 'pull' AND m.status = 'queued' AND m.to_session != ''
-		GROUP BY m.recipient, m.to_session`)
+		WHERE a.delivery = 'pull' AND m.status IN ('queued', 'claimed') AND `+waiting+`
+		GROUP BY m.recipient, m.to_session`, now.UnixMilli())
 	if err != nil {
 		return nil, err
 	}

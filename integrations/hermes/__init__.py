@@ -68,6 +68,16 @@ NOTIFY_SECONDS = 2
 KEEP_WARM = re.compile(r"^⟦pulse o:[^\s⟧]+ a:[0-9]+(?: n:[^\s⟧]+)?⟧ \[HeartBeat 2\.0 · keep-warm [^\]\r\n]+\]$")
 
 
+def is_keep_warm(text):
+    first = text.partition("\n")[0]
+    if not first.startswith("["):
+        return bool(KEEP_WARM.match(first))
+    # Match heartbeat2/intake.py:marker: gateway sender names can contain delimiters.
+    delimiter = "] ⟦pulse "
+    candidates = [first[m.start() + 2:] for m in re.finditer(re.escape(delimiter), first[:1024 + len(delimiter)])]
+    return any(KEEP_WARM.match(candidate) for candidate in reversed(candidates))
+
+
 class BusError(Exception):
     def __init__(self, message, status=0):
         super().__init__(message)
@@ -450,15 +460,18 @@ class Network:
     def before_turn(self, session_id="", platform="", parent_session_id="", is_first_turn=False, **kwargs):
         try:
             text = turn_text(kwargs.get("user_message"))
-            keep_warm = KEEP_WARM.match(text.partition("\n")[0])
+            keep_warm = is_keep_warm(text)
             # A keep-warm ping alone mustn't register an active session.
             conversation = self.conversation(session_id, platform or "", parent_session_id, create=not keep_warm)
             if "user_message" in kwargs:
                 self.sees_turn_text = True
-                if keep_warm:
-                    if conversation is not None:
-                        self.quiet_turn(conversation, session_id, kwargs.get("turn_id", ""), text)
-                    return None
+            if keep_warm:
+                if conversation is not None:
+                    self.quiet_turn(conversation, session_id, kwargs.get("turn_id", ""), text)
+                return None
+            with conversation.lock:
+                conversation.quiet_until = 0.0  # a real turn can follow a missing post_llm_call
+            if "user_message" in kwargs:
                 self.confirm_shown(conversation, text)
             lines = []
             if is_first_turn and not self.intro_in_prompt:
@@ -663,27 +676,28 @@ class Network:
             with conversation.lock:
                 quiet = conversation.quiet()
                 reserved = self.sees_turn_text
-                if not quiet:
-                    for m in messages:
-                        ident = m["id"]
-                        if ident in conversation.delivered:
-                            seen.append(m)
-                        elif ident in conversation.pending:
-                            # A new claim renews the lease, not the time to show it.
-                            _, deadline = conversation.pending[ident]
-                            conversation.pending[ident] = (m, deadline)
-                        elif (waiter := conversation.waiting.get(m.get("thread_id", ""))) is not None:
-                            waiter.put(m)
-                        else:
-                            ready.append(m)
-                            # A turn can show this before inject_message returns.
-                            if reserved:
-                                conversation.pending[ident] = (m, time.monotonic() + PENDING_SECONDS)
-            if quiet:
-                self.give_back(messages)
-                return
+                for m in messages:
+                    ident = m["id"]
+                    if ident in conversation.delivered:
+                        seen.append(m)
+                    elif ident in conversation.pending:
+                        # A new claim renews the lease, not the time to show it.
+                        _, deadline = conversation.pending[ident]
+                        conversation.pending[ident] = (m, deadline)
+                    elif quiet:
+                        ready.append(m)
+                    elif (waiter := conversation.waiting.get(m.get("thread_id", ""))) is not None:
+                        waiter.put(m)
+                    else:
+                        ready.append(m)
+                        # A turn can show this before inject_message returns.
+                        if reserved:
+                            conversation.pending[ident] = (m, time.monotonic() + PENDING_SECONDS)
             for m in seen:
                 self.confirm_delivery(m["id"])
+            if quiet:
+                self.give_back(ready)
+                return
             if not ready:
                 return
             if conversation.pull_only:
@@ -842,7 +856,7 @@ class Network:
                 raise InterruptedError
 
     def wait_pushed(self, conversation, thread, seconds):
-        """While delivery is running it owns the inbox, so it hands this thread over.
+        """Take replies handed over by delivery, or claim held mail on this thread.
         Returns None for the messages if the conversation turns out to be pull-only:
         then nothing is handed over, and the caller fetches instead."""
         with conversation.lock:
@@ -873,17 +887,21 @@ class Network:
                 if conversation.pull_only:
                     return None, False
                 try:
-                    message = waiter.get(timeout=min(WAIT_STEP_SECONDS, max(0.01, deadline - time.monotonic())))
+                    messages = [waiter.get(timeout=min(WAIT_STEP_SECONDS, max(0.01, deadline - time.monotonic())))]
                 except queue.Empty:
                     if self.interrupted(conversation):
                         raise InterruptedError from None
-                    continue
-                conversation.mark_delivered(message["id"])
-                try:
-                    self.bus.ack(message["id"])
-                except BusError as err:
-                    log.debug("birdie: confirm: %s", err)  # it comes back and is confirmed then
-                return [message], False
+                    # A turn poll can hold a lone p3 longer than this wait.
+                    try:
+                        messages = self.bus.inbox(conversation.id, wait=0, thread=thread)
+                    except BusError as err:
+                        log.debug("birdie: thread inbox: %s", err)
+                        continue
+                if messages:
+                    for message in messages:
+                        conversation.mark_delivered(message["id"])
+                        self.confirm_delivery(message["id"])
+                    return messages, False
             return [], False
         finally:
             with conversation.lock:

@@ -136,7 +136,7 @@ type Session struct {
 	State string `json:"state,omitempty"`
 	// Default marks the session that takes new conversations.
 	Default bool `json:"default,omitempty"`
-	// Held counts queued mail addressed to this session on agent listings.
+	// Held counts mail waiting for this session on agent listings.
 	Held int `json:"held,omitempty"`
 	// ActiveAt is when its user or model last did something. While it is idle
 	// or waiting, that is when it stopped.
@@ -348,8 +348,9 @@ type Store interface {
 	// RecentSessions returns the agent's sessions seen since a time, running
 	// or not.
 	RecentSessions(ctx context.Context, agent string, since time.Time) ([]Session, error)
-	// QueuedBySession counts queued messages by recipient agent and session.
-	QueuedBySession(ctx context.Context) (map[[2]string]int, error)
+	// QueuedBySession counts waiting messages by recipient agent and session,
+	// including expired leases and the empty session for unpinned mail.
+	QueuedBySession(ctx context.Context, now time.Time) (map[[2]string]int, error)
 
 	Close() error
 }
