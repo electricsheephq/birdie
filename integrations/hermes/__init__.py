@@ -44,6 +44,7 @@ CLARIFY = "(question / not a steer)"  # starts a reply that asks before acting
 STATUS_SECONDS = 2  # how long wait_for_reply's extra read of the thread's status may take
 AWAITING = "Thread status: awaiting_clarification (its latest reply asks the agent that started it questions before acting)."
 MAX_PUSH_BYTES = 100 << 10  # a longer message is pushed as a pointer to birdie_get_thread
+MAX_DIGEST_BODY_BYTES = 64 << 10  # matches the bus's MaxDigestBytes for p3 bodies
 MAX_DIGEST_PUSH_BYTES = 256 << 10  # rendered frames, including any ready mail carrying the digest
 # How long a pushed message may wait for the turn that shows it. Hermes can accept a
 # push and drop it later, and its turn can also wait behind a long one.
@@ -211,16 +212,19 @@ def asks_questions(message):
 
 
 def push_frame(message):
-    """What a push puts into the conversation: the message, or a pointer to read it
-    with birdie_get_thread when it is longer than MAX_PUSH_BYTES."""
-    text = frame(message)
-    if len(text.encode()) <= MAX_PUSH_BYTES:
-        return text
+    """Render the same push from a claimed message or the thread's full copy."""
+    full_size = message.get("content_bytes")
+    if not full_size:
+        full_size = len(message.get("content", "").encode())
+        if message.get("priority") != "p3" or full_size <= MAX_DIGEST_BODY_BYTES:
+            text = frame(message)
+            if len(text.encode()) <= MAX_PUSH_BYTES:
+                return text
     ident = message.get("id", "")
     return "\n".join([
         f'<{TAG} from={json.dumps(message.get("from", ""))} message_id={json.dumps(ident)} '
         f'thread_id={json.dumps(message.get("thread_id", ""))}>',
-        f'This message is too long to show here ({len(message.get("content", "").encode())} bytes). '
+        f'This message is too long to show here ({full_size} bytes). '
         f'Read it with birdie_get_thread, and answer with birdie_send_message, in_reply_to "{ident}".',
         f"</{TAG}>"])
 
@@ -985,9 +989,19 @@ class Network:
         if self.pushing(conversation):
             self.report(conversation)  # it may have been made pull-only since
         if self.pushing(conversation):
-            return "New messages come to you on their own in this conversation, so there is nothing to fetch."
-        wait = max(0, min(float(args.get("wait_seconds") or 0), MAX_CHECK_SECONDS))
-        messages = self.take(conversation, wait)
+            messages = []
+            for message in self.bus.inbox(conversation.id, wait=0):
+                ident = message["id"]
+                with conversation.lock:
+                    # A reclaimed push no longer needs to wait for its turn.
+                    conversation.pending.pop(ident, None)
+                    if ident not in conversation.delivered:
+                        conversation.remember(ident)
+                        messages.append(message)
+                self.confirm_delivery(ident)
+        else:
+            wait = max(0, min(float(args.get("wait_seconds") or 0), MAX_CHECK_SECONDS))
+            messages = self.take(conversation, wait)
         return "\n\n".join(frame(m) for m in messages) if messages else "No new messages."
 
     def wait_for_reply(self, conversation, args):
@@ -1058,7 +1072,7 @@ TOOLS = (
      ["content"]),
     ("birdie_check_inbox", "check_inbox",
      "Fetch new messages other agents sent you. Each message is returned once.",
-     {"wait_seconds": {"type": "number", "description": "Wait up to this long (max 120) if the inbox is empty. Default 0."}},
+     {"wait_seconds": {"type": "number", "description": "Wait if the inbox is empty and pushes are off. Default 0, max 120 seconds."}},
      []),
     ("birdie_wait_for_reply", "wait_for_reply",
      "Wait for the answer to a message you sent, when your user is waiting on it. Returns it, or says none came in time.",

@@ -269,6 +269,67 @@ class PluginTest(PluginCase):
         for m in [answer, *held]:
             self.assertEqual(status(m["id"]), "delivered")
 
+    def test_check_inbox_fetches_held_mail_and_later_mail_still_pushes(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        session = "check-held"
+        self.turn(ctx, session=session, user_message="hello")
+        target = f"hermes/{network.conversation(session).id}"
+        held = peer("POST", "/v1/messages", {"to": target, "content": "held for a digest", "priority": "p3"})
+        self.assertEqual(status(held["id"]), "queued")
+        self.assertIn("held for a digest", self.call(ctx, "birdie_check_inbox", session=session))
+        self.assertEqual(status(held["id"]), "delivered")
+        self.assertEqual(ctx.injected, [])
+
+        next_mail = peer("POST", "/v1/messages", {"to": target, "content": "push as usual", "priority": "p1"})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        text = ctx.injected[0][1]
+        self.assertEqual(list(plugin.shown_ids(text)), [next_mail["id"]])
+        self.turn(ctx, session=session, user_message=text)
+        self.assertEqual(status(next_mail["id"]), "delivered")
+
+    def test_check_inbox_confirms_already_shown_mail_without_showing_it_again(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        session = "check-shown"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session=session, user_message="hello")
+            conversation = network.conversation(session)
+            sent = peer("POST", "/v1/messages", {"to": f"hermes/{conversation.id}", "content": "already shown"})
+            claimed = network.bus.inbox(conversation.id)
+            network.deliver(conversation, claimed[0])
+            # The turn arrived after the claim was given back, so its ack can't deliver it yet.
+            network.give_back(claimed)
+            self.turn(ctx, session=session, user_message=ctx.injected[0][1])
+        self.assertIn(sent["id"], conversation.delivered)
+        self.assertEqual(status(sent["id"]), "queued")
+
+        with mock.patch.object(network.bus, "inbox", wraps=network.bus.inbox) as inbox:
+            result = self.call(ctx, "birdie_check_inbox", {"wait_seconds": 120}, session=session)
+        self.assertEqual(result, "No new messages.")
+        inbox.assert_called_once_with(conversation.id, wait=0)
+        self.assertEqual(status(sent["id"]), "delivered")
+        self.assertEqual(len(ctx.injected), 1)
+
+    def test_check_inbox_clears_the_pending_push_when_it_reclaims_the_mail(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        session = "check-pending"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session=session, user_message="hello")
+        conversation = network.conversation(session)
+        sent = peer("POST", "/v1/messages", {"to": f"hermes/{conversation.id}", "content": "waiting for its turn"})
+        claimed = network.bus.inbox(conversation.id)
+        with mock.patch.object(plugin, "PENDING_SECONDS", 0):
+            network.deliver(conversation, claimed[0])
+        # Let the tool take the mail again as it could after its lease ran out.
+        network.give_back(claimed)
+        self.assertIn("waiting for its turn", self.call(ctx, "birdie_check_inbox", session=session))
+        self.assertEqual(status(sent["id"]), "delivered")
+        network.expire_pending(conversation)
+        self.assertNotIn(sent["id"], conversation.pending)
+        self.assertTrue(network.pushing(conversation))
+
     def test_a_keep_warm_turn_adds_no_context_or_activity_and_pauses_pushes_until_its_post_hook(self):
         self.write_config(True)
         ctx, network = self.load()
@@ -633,6 +694,35 @@ class PluginTest(PluginCase):
         self.turn(ctx, user_message=old_ctx.injected[0][1])
         # Delivered now, so when the old claim runs out it isn't taken and put in again.
         self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 4), "the new copy didn't confirm it")
+
+    def test_an_oversized_digest_frame_matches_its_thread_copy_and_confirms_after_reload(self):
+        self.write_config(True)
+        old_ctx, old = self.load()
+        session = "oversized-digest"
+        with mock.patch.object(old, "start_threads"):
+            self.turn(old_ctx, session=session, user_message="hello")
+        conversation = old.conversation(session)
+        target = f"hermes/{conversation.id}"
+        # Over the 64 KiB body budget in bytes, and below the ordinary push limit.
+        body = "é" * ((32 << 10) + 1)
+        sent = peer("POST", "/v1/messages", {"to": target, "content": body, "priority": "p3"})
+        peer("POST", "/v1/messages", {"to": target, "content": "carry the digest", "priority": "p1"})
+        claims = old.bus.inbox(conversation.id, wait=5, push=True, at="turn")
+        claimed = next(message for message in claims if message["id"] == sent["id"])
+        full = old.bus.call("GET", f"/v1/threads/{sent['thread_id']}")["messages"][0]
+        self.assertEqual(claimed["content_bytes"], len(body.encode()))
+        self.assertEqual(full["content"], body)
+        with self.subTest("same pointer in the claim and the thread"):
+            rendered = plugin.push_frame(claimed)
+            self.assertTrue(rendered == plugin.push_frame(full), "claim and thread produced different frames")
+            self.assertIn("birdie_get_thread", rendered)
+
+        old.deliver_digest(conversation, claims)
+        old.close()
+        ctx, _ = self.load()
+        self.turn(ctx, session=session, user_message=old_ctx.injected[0][1])
+        self.assertEqual(status(sent["id"]), "delivered", "the new copy didn't confirm the digest frame")
+        self.assertEqual(ctx.injected, [])
 
     def test_a_pasted_tag_doesnt_confirm_a_push_another_conversation_waits_for(self):
         self.write_config(True)
