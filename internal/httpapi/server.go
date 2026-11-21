@@ -93,6 +93,16 @@ func (s *server) inbox(w http.ResponseWriter, r *http.Request, a bus.Agent) {
 	}
 	in := bus.ReceiveInput{Agent: a.Name, Thread: r.URL.Query().Get("thread_id"), Session: r.URL.Query().Get("session"), Wait: wait,
 		Push: r.URL.Query().Get("push") == "1", At: r.URL.Query().Get("at")}
+	if in.At == bus.Turn {
+		if v := r.URL.Query().Get("digest"); strings.TrimLeft(v, "0123456789") == "" {
+			// ParseUint saturates at 16 bits on overflow. Cap seconds before converting to a duration.
+			seconds, _ := strconv.ParseUint(v, 10, 16)
+			if limit := uint64(bus.MaxDigest / time.Second); seconds > limit {
+				seconds = limit
+			}
+			in.Digest = time.Duration(int64(seconds)) * time.Second
+		}
+	}
 	if v := r.URL.Query().Get("lease"); v != "" {
 		secs, err := strconv.ParseFloat(v, 64)
 		if err != nil || secs < 0 {

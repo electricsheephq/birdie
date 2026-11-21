@@ -40,6 +40,11 @@ func (p priorityInbox) report(t *testing.T, active time.Time) {
 func (p priorityInbox) send(t *testing.T, from, priority, body string) bus.Message {
 	t.Helper()
 	p.report(t, time.Time{})
+	return p.sendToDesk(t, from, priority, body)
+}
+
+func (p priorityInbox) sendToDesk(t *testing.T, from, priority, body string) bus.Message {
+	t.Helper()
 	m, err := p.Send(context.Background(), from, bus.SendInput{To: "bob/desk", Content: body, Priority: priority})
 	if err != nil {
 		t.Fatal(err)
@@ -65,6 +70,104 @@ func (p priorityInbox) ack(t *testing.T, msgs []bus.Message) {
 	for _, m := range msgs {
 		if err := p.Ack(context.Background(), "bob", m.ID); err != nil {
 			t.Fatal(err)
+		}
+	}
+}
+
+func TestATurnClaimTakesP1WhileTheSessionIsCold(t *testing.T) {
+	p := newPriorityInbox(t)
+	p.report(t, p.now.Add(-time.Hour))
+	m := p.sendToDesk(t, "alice", "p1", "answer")
+	*p.now = p.now.Add(bus.Coalesce)
+	p.claim(t, "turn", m.ID)
+}
+
+func TestATurnClaimHoldsP3WhileColdAndTakesItWhenActivityResumes(t *testing.T) {
+	p := newPriorityInbox(t)
+	p.report(t, p.now.Add(-time.Hour))
+	m := p.sendToDesk(t, "alice", "p3", "update")
+	*p.now = p.now.Add(bus.DigestEvery)
+	p.report(t, p.now.Add(-time.Hour))
+	p.claim(t, "turn")
+	p.report(t, *p.now)
+	p.claim(t, "turn", m.ID)
+}
+
+func TestATurnClaimTakesOneColdDigestAtTwelveHours(t *testing.T) {
+	p := newPriorityInbox(t)
+	first := p.send(t, "alice", "p3", "older update")
+	*p.now = p.now.Add(time.Minute)
+	second := p.send(t, "carol", "p3", "newer update")
+	*p.now = p.now.Add(11*time.Hour + 59*time.Minute - time.Millisecond)
+	p.report(t, p.now.Add(-time.Hour))
+	p.claim(t, "turn")
+	*p.now = p.now.Add(time.Millisecond)
+	p.claim(t, "turn", first.ID, second.ID)
+}
+
+func TestATurnClaimLetsP3RideWithImmediateMailInPriorityOrder(t *testing.T) {
+	for _, priority := range []string{"p0", "p1", ""} {
+		name := priority
+		if name == "" {
+			name = "unranked"
+		}
+		t.Run(name, func(t *testing.T) {
+			p := newPriorityInbox(t)
+			p.report(t, p.now.Add(-time.Hour))
+			update := p.sendToDesk(t, "alice", "p3", "update")
+			answer := p.sendToDesk(t, "carol", priority, "answer")
+			*p.now = p.now.Add(bus.Coalesce)
+			p.claim(t, "turn", answer.ID, update.ID)
+		})
+	}
+}
+
+func TestAWarmTurnClaimSpacesDigestsAndKeepsTheByteBudget(t *testing.T) {
+	p := newPriorityInbox(t)
+	first := p.send(t, "alice", "p3", strings.Repeat("a", 48<<10))
+	second := p.send(t, "carol", "p3", strings.Repeat("b", 48<<10))
+	*p.now = p.now.Add(bus.DigestEvery - time.Millisecond)
+	p.report(t, *p.now)
+	p.claim(t, "turn")
+	*p.now = p.now.Add(time.Millisecond)
+	p.ack(t, p.claim(t, "turn", first.ID))
+	*p.now = p.now.Add(bus.DigestEvery - time.Millisecond)
+	p.report(t, *p.now)
+	p.claim(t, "turn")
+	*p.now = p.now.Add(time.Millisecond)
+	p.claim(t, "turn", second.ID)
+}
+
+func TestASenderGetsDeliveryNotesForWarmAndColdTurnRecipients(t *testing.T) {
+	p := newPriorityInbox(t)
+	p.report(t, *p.now)
+	p.claim(t, "turn")
+	for _, tc := range []struct{ priority, note string }{
+		{"p0", "goes now; it starts its next turn"},
+		{"p1", "goes now; it sees this when its current turn ends, or at once if it is idle"},
+		{"p3", "held: goes in its next digest, within about 20 minutes"},
+		{"", "queued: bob gets this right away"},
+	} {
+		if got := p.send(t, "alice", tc.priority, "hello").Note; got != tc.note {
+			t.Errorf("%q note = %q, want %q", tc.priority, got, tc.note)
+		}
+	}
+	const warm = "held: goes in its next digest, within about 20 minutes"
+	const cold = "held: goes in its next digest (one every 20 minutes) while it is active, otherwise with its next turn (at most 12 hours)"
+	active := *p.now
+	for _, tc := range []struct {
+		age  time.Duration
+		note string
+	}{
+		{30*time.Minute - time.Millisecond, warm},
+		{30 * time.Minute, warm},
+		{30*time.Minute + time.Millisecond, cold},
+		{bus.CacheIdle + time.Millisecond, cold},
+	} {
+		*p.now = active.Add(tc.age)
+		p.report(t, active)
+		if got := p.sendToDesk(t, "alice", "p3", "update").Note; got != tc.note {
+			t.Errorf("note at activity age %v = %q, want %q", tc.age, got, tc.note)
 		}
 	}
 }

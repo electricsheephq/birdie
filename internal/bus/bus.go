@@ -59,11 +59,19 @@ const (
 
 const (
 	DigestEvery = 20 * time.Minute
+	MinDigest   = 10 * time.Minute
+	MaxDigest   = 50 * time.Minute
 	Valve       = 40 * time.Minute
 	CacheIdle   = 50 * time.Minute
+	HoldCeiling = 12 * time.Hour
 	Coalesce    = 3 * time.Second
 	CoalesceMax = 10 * time.Second
 )
+
+type claimPosition struct {
+	at     string
+	digest time.Duration
+}
 
 type Bus struct {
 	// Now, when set before use, supplies the clock for inbox and session times.
@@ -89,7 +97,7 @@ type Bus struct {
 
 	replyMu   sync.Mutex
 	mu        sync.Mutex
-	positions map[[2]string]string
+	positions map[[2]string]claimPosition
 	waiters   map[string]map[chan struct{}]struct{}
 	kick      chan struct{}
 	watch     watchers
@@ -100,7 +108,7 @@ func New(s Store, log *slog.Logger, ds ...Deliverer) *Bus {
 		store:      s,
 		deliverers: make(map[string]Deliverer),
 		log:        log,
-		positions:  make(map[[2]string]string),
+		positions:  make(map[[2]string]claimPosition),
 		waiters:    make(map[string]map[chan struct{}]struct{}),
 		kick:       make(chan struct{}, 1),
 	}
@@ -164,12 +172,23 @@ func (b *Bus) listAgents(ctx context.Context, sessions func(context.Context, Age
 	if err != nil {
 		return nil, err
 	}
+	queued, err := b.store.QueuedBySession(ctx, b.now())
+	if err != nil {
+		return nil, err
+	}
 	for i := range agents {
 		if agents[i].Delivery != DeliveryPull {
 			continue
 		}
 		if agents[i].Sessions, err = sessions(ctx, agents[i]); err != nil {
 			return nil, err
+		}
+		for j, s := range agents[i].Sessions {
+			held := queued[[2]string{s.Agent, s.ID}]
+			if s.Default {
+				held += queued[[2]string{s.Agent, ""}]
+			}
+			agents[i].Sessions[j].Held = held
 		}
 	}
 	return agents, nil
@@ -742,9 +761,9 @@ func (b *Bus) Receive(ctx context.Context, agent, threadID string, wait time.Dur
 // ReceiveFor is Receive with session scoping and leases.
 func (b *Bus) ReceiveFor(ctx context.Context, in ReceiveInput) ([]Message, error) {
 	switch in.At {
-	case "", Midturn, Boundary:
+	case "", Midturn, Boundary, Turn:
 	default:
-		return nil, fmt.Errorf("%w: at must be midturn or boundary", ErrInvalid)
+		return nil, fmt.Errorf("%w: at must be midturn, boundary or turn", ErrInvalid)
 	}
 	deadline := time.Now().Add(min(in.Wait, MaxWait))
 	for {
@@ -852,6 +871,12 @@ func (b *Bus) Unread(ctx context.Context, in ReceiveInput) (int, error) {
 
 func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput, now time.Time) (ClaimFilter, error) {
 	f := ClaimFilter{Agent: in.Agent, Thread: in.Thread, Session: in.Session, At: in.At, LiveSince: now.Add(-SessionTTL), Limit: inboxBatch}
+	if in.At == Turn {
+		f.Digest = DigestEvery
+		if in.Digest > 0 {
+			f.Digest = min(MaxDigest, max(MinDigest, in.Digest))
+		}
+	}
 	if in.Lease > 0 {
 		f.LeaseUntil = now.Add(max(in.Lease, time.Millisecond))
 	}
@@ -887,7 +912,7 @@ func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput, now time.Time) (
 				if in.At == "" {
 					delete(b.positions, key)
 				} else {
-					b.positions[key] = in.At
+					b.positions[key] = claimPosition{at: in.At, digest: f.Digest}
 				}
 				b.mu.Unlock()
 				break
@@ -1071,9 +1096,22 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 	switch target.Tier {
 	case TierPush:
 		b.mu.Lock()
-		at := b.positions[[2]string{to.Name, target.ID}]
+		position := b.positions[[2]string{to.Name, target.ID}]
 		b.mu.Unlock()
-		if at != "" {
+		at := position.at
+		if at == Turn {
+			switch m.Priority {
+			case "p0":
+				return "goes now; it starts its next turn"
+			case "p1":
+				return "goes now; it sees this when its current turn ends, or at once if it is idle"
+			case "p3":
+				if target.ActiveAt.UnixMilli() >= b.now().Add(-(CacheIdle - position.digest)).UnixMilli() {
+					return fmt.Sprintf("held: goes in its next digest, within about %.4g minutes", position.digest.Minutes())
+				}
+				return fmt.Sprintf("held: goes in its next digest (one every %.4g minutes) while it is active, otherwise with its next turn (at most 12 hours)", position.digest.Minutes())
+			}
+		} else if at != "" {
 			switch {
 			case m.Priority == "p0":
 				return "p0: offered after a short batching window; its host may hold peer messages for its user first"

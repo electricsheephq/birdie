@@ -136,6 +136,8 @@ type Session struct {
 	State string `json:"state,omitempty"`
 	// Default marks the session that takes new conversations.
 	Default bool `json:"default,omitempty"`
+	// Held counts mail waiting for this session on agent listings.
+	Held int `json:"held,omitempty"`
 	// ActiveAt is when its user or model last did something. While it is idle
 	// or waiting, that is when it stopped.
 	ActiveAt time.Time `json:"active_at"`
@@ -210,6 +212,7 @@ type Message struct {
 const (
 	Midturn           = "midturn"
 	Boundary          = "boundary"
+	Turn              = "turn"
 	MaxDigestBytes    = 64 << 10
 	MaxPushFrameBytes = 256 << 10
 )
@@ -239,14 +242,17 @@ type ReceiveInput struct {
 	// Push marks a claim by a delivery that puts messages into the session's
 	// conversation on its own. A pull-only session gets nothing from one.
 	Push bool
-	// At is the recipient turn position, or empty for legacy delivery.
+	// At is Midturn, Boundary, Turn (a push starts its own turn), or empty for legacy delivery.
 	At string
+	// Digest overrides the interval for Turn. Zero uses DigestEvery.
+	Digest time.Duration
 }
 
 // ClaimFilter is ReceiveInput as the store needs it.
 type ClaimFilter struct {
 	Agent, Thread, Session string
 	At                     string
+	Digest                 time.Duration // Effective interval for Turn.
 	// Unpinned also takes messages not pinned to any session.
 	Unpinned bool
 	// Orphans, with Unpinned, also takes messages pinned to a session that is
@@ -345,6 +351,9 @@ type Store interface {
 	// RecentSessions returns the agent's sessions seen since a time, running
 	// or not.
 	RecentSessions(ctx context.Context, agent string, since time.Time) ([]Session, error)
+	// QueuedBySession counts waiting messages by recipient agent and session,
+	// including expired leases and the empty session for unpinned mail.
+	QueuedBySession(ctx context.Context, now time.Time) (map[[2]string]int, error)
 
 	Close() error
 }

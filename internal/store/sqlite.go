@@ -424,7 +424,11 @@ func positionGate(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where stri
 	if p0 && f.Thread == "" {
 		return "", true, nil
 	}
-	if f.At == bus.Boundary && (ready || !oldestP3.Valid) {
+	if (f.At == bus.Boundary || f.At == bus.Turn) && (ready || !oldestP3.Valid) {
+		return "", false, nil
+	}
+	// A turn host shouldn't keep overdue mail behind the digest clock or an idle cache.
+	if f.At == bus.Turn && oldestP3.Int64 <= now.Add(-bus.HoldCeiling).UnixMilli() {
 		return "", false, nil
 	}
 	if f.At == bus.Midturn && (!oldestHeld.Valid || oldestHeld.Int64 > now.Add(-bus.Valve).UnixMilli()) {
@@ -444,9 +448,23 @@ func positionGate(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where stri
 		}
 		return " AND m.priority IN (-1, 0)", false, nil
 	}
-	cutoff := now.Add(-bus.DigestEvery).UnixMilli()
+	const holdP3 = " AND m.priority != 3"
+	if f.At == bus.Turn {
+		cutoff := now.Add(-f.Digest).UnixMilli()
+		if oldestP3.Int64 > cutoff || lastDigest > cutoff {
+			return holdP3, false, nil
+		}
+		var warm bool
+		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sessions
+			WHERE agent = ? AND id = ? AND active_at >= ?)`, f.Agent, f.Session, now.Add(-bus.CacheIdle).UnixMilli()).Scan(&warm)
+		if err != nil || warm {
+			return "", false, err
+		}
+		return holdP3, false, nil
+	}
 	// Cache age can release fresh mail, but overflow still waits for the
 	// next digest window or an immediate message it can ride with.
+	cutoff := now.Add(-bus.DigestEvery).UnixMilli()
 	if lastDigest == 0 || lastDigest <= cutoff {
 		if oldestP3.Int64 <= cutoff {
 			return "", false, nil
@@ -458,7 +476,7 @@ func positionGate(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where stri
 			return "", false, err
 		}
 	}
-	return " AND m.priority != 3", false, nil
+	return holdP3, false, nil
 }
 
 type settleKey struct{ agent, session, predicate string }
@@ -613,7 +631,7 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 		}
 	}
 	if reserved {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM inbox_releases WHERE released_at <= ?`, now.Add(-bus.Valve).UnixMilli()); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM inbox_releases WHERE released_at <= ?`, now.Add(-max(bus.Valve, bus.MaxDigest)).UnixMilli()); err != nil {
 			return nil, 0, err
 		}
 	}
@@ -939,6 +957,28 @@ func (s *SQLite) LiveSessions(ctx context.Context, agent string, since time.Time
 func (s *SQLite) RecentSessions(ctx context.Context, agent string, since time.Time) ([]bus.Session, error) {
 	return collectSessions(s.db.QueryContext(ctx, `SELECT `+sessionCols+` FROM sessions
 		WHERE agent = ? AND last_seen >= ? ORDER BY active_at DESC, id`, agent, since.UnixMilli()))
+}
+
+func (s *SQLite) QueuedBySession(ctx context.Context, now time.Time) (map[[2]string]int, error) {
+	// Start with agents and constrain status so the inbox index skips settled mail.
+	rows, err := s.db.QueryContext(ctx, `SELECT m.recipient, m.to_session, COUNT(*)
+		FROM agents a CROSS JOIN messages m ON m.recipient = a.name
+		WHERE a.delivery = 'pull' AND m.status IN ('queued', 'claimed') AND `+waiting+`
+		GROUP BY m.recipient, m.to_session`, now.UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	counts := make(map[[2]string]int)
+	for rows.Next() {
+		var key [2]string
+		var count int
+		if err := rows.Scan(&key[0], &key[1], &count); err != nil {
+			return nil, err
+		}
+		counts[key] = count
+	}
+	return counts, rows.Err()
 }
 
 func collectSessions(rows *sql.Rows, err error) ([]bus.Session, error) {
