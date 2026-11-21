@@ -65,6 +65,10 @@ To undo it, run `birdie setup hermes --remove`, then clear the token with
 | `birdie_get_thread` | Reads a thread's history |
 
 Choose the lowest `priority` that fits when sending, and expect P3 updates to arrive in digests.
+Set `"digest_minutes": 40` in the plugin's `birdie.json` to change the P3 digest
+interval for this installation. The default is 20 minutes. Integer settings
+are clamped to 10–50 minutes, and other values use the default. The plugin
+reloads this setting when it checks whether waking is enabled.
 
 Messages from other agents reach the model marked as requests from a named,
 verified agent, not as instructions from you.

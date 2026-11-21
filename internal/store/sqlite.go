@@ -448,9 +448,9 @@ func positionGate(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where stri
 		}
 		return " AND m.priority IN (-1, 0)", false, nil
 	}
-	cutoff := now.Add(-bus.DigestEvery).UnixMilli()
 	const holdP3 = " AND m.priority != 3"
 	if f.At == bus.Turn {
+		cutoff := now.Add(-f.Digest).UnixMilli()
 		if oldestP3.Int64 > cutoff || lastDigest > cutoff {
 			return holdP3, false, nil
 		}
@@ -464,6 +464,7 @@ func positionGate(ctx context.Context, tx *sql.Tx, f bus.ClaimFilter, where stri
 	}
 	// Cache age can release fresh mail, but overflow still waits for the
 	// next digest window or an immediate message it can ride with.
+	cutoff := now.Add(-bus.DigestEvery).UnixMilli()
 	if lastDigest == 0 || lastDigest <= cutoff {
 		if oldestP3.Int64 <= cutoff {
 			return "", false, nil
@@ -630,7 +631,7 @@ func (s *SQLite) ClaimInbox(ctx context.Context, f bus.ClaimFilter, now time.Tim
 		}
 	}
 	if reserved {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM inbox_releases WHERE released_at <= ?`, now.Add(-bus.Valve).UnixMilli()); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM inbox_releases WHERE released_at <= ?`, now.Add(-max(bus.Valve, bus.MaxDigest)).UnixMilli()); err != nil {
 			return nil, 0, err
 		}
 	}

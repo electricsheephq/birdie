@@ -244,12 +244,15 @@ type ReceiveInput struct {
 	Push bool
 	// At is Midturn, Boundary, Turn (a push starts its own turn), or empty for legacy delivery.
 	At string
+	// Digest overrides the interval for Turn. Zero uses DigestEvery.
+	Digest time.Duration
 }
 
 // ClaimFilter is ReceiveInput as the store needs it.
 type ClaimFilter struct {
 	Agent, Thread, Session string
 	At                     string
+	Digest                 time.Duration // Effective interval for Turn.
 	// Unpinned also takes messages not pinned to any session.
 	Unpinned bool
 	// Orphans, with Unpinned, also takes messages pinned to a session that is

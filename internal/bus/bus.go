@@ -59,12 +59,19 @@ const (
 
 const (
 	DigestEvery = 20 * time.Minute
+	MinDigest   = 10 * time.Minute
+	MaxDigest   = 50 * time.Minute
 	Valve       = 40 * time.Minute
 	CacheIdle   = 50 * time.Minute
 	HoldCeiling = 12 * time.Hour
 	Coalesce    = 3 * time.Second
 	CoalesceMax = 10 * time.Second
 )
+
+type claimPosition struct {
+	at     string
+	digest time.Duration
+}
 
 type Bus struct {
 	// Now, when set before use, supplies the clock for inbox and session times.
@@ -90,7 +97,7 @@ type Bus struct {
 
 	replyMu   sync.Mutex
 	mu        sync.Mutex
-	positions map[[2]string]string
+	positions map[[2]string]claimPosition
 	waiters   map[string]map[chan struct{}]struct{}
 	kick      chan struct{}
 	watch     watchers
@@ -101,7 +108,7 @@ func New(s Store, log *slog.Logger, ds ...Deliverer) *Bus {
 		store:      s,
 		deliverers: make(map[string]Deliverer),
 		log:        log,
-		positions:  make(map[[2]string]string),
+		positions:  make(map[[2]string]claimPosition),
 		waiters:    make(map[string]map[chan struct{}]struct{}),
 		kick:       make(chan struct{}, 1),
 	}
@@ -864,6 +871,12 @@ func (b *Bus) Unread(ctx context.Context, in ReceiveInput) (int, error) {
 
 func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput, now time.Time) (ClaimFilter, error) {
 	f := ClaimFilter{Agent: in.Agent, Thread: in.Thread, Session: in.Session, At: in.At, LiveSince: now.Add(-SessionTTL), Limit: inboxBatch}
+	if in.At == Turn {
+		f.Digest = DigestEvery
+		if in.Digest > 0 {
+			f.Digest = min(MaxDigest, max(MinDigest, in.Digest))
+		}
+	}
 	if in.Lease > 0 {
 		f.LeaseUntil = now.Add(max(in.Lease, time.Millisecond))
 	}
@@ -899,7 +912,7 @@ func (b *Bus) claimFilter(ctx context.Context, in ReceiveInput, now time.Time) (
 				if in.At == "" {
 					delete(b.positions, key)
 				} else {
-					b.positions[key] = in.At
+					b.positions[key] = claimPosition{at: in.At, digest: f.Digest}
 				}
 				b.mu.Unlock()
 				break
@@ -1083,8 +1096,9 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 	switch target.Tier {
 	case TierPush:
 		b.mu.Lock()
-		at := b.positions[[2]string{to.Name, target.ID}]
+		position := b.positions[[2]string{to.Name, target.ID}]
 		b.mu.Unlock()
+		at := position.at
 		if at == Turn {
 			switch m.Priority {
 			case "p0":
@@ -1092,10 +1106,10 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 			case "p1":
 				return "goes now; it sees this when its current turn ends, or at once if it is idle"
 			case "p3":
-				if target.ActiveAt.UnixMilli() >= b.now().Add(-(CacheIdle - DigestEvery)).UnixMilli() {
-					return "held: goes in its next digest, within about 20 minutes"
+				if target.ActiveAt.UnixMilli() >= b.now().Add(-(CacheIdle - position.digest)).UnixMilli() {
+					return fmt.Sprintf("held: goes in its next digest, within about %.4g minutes", position.digest.Minutes())
 				}
-				return "held: it is idle, so this waits for its next turn (at most 12 hours)"
+				return fmt.Sprintf("held: goes in its next digest (one every %.4g minutes) while it is active, otherwise with its next turn (at most 12 hours)", position.digest.Minutes())
 			}
 		} else if at != "" {
 			switch {

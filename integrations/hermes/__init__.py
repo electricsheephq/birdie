@@ -89,6 +89,11 @@ def load_config():
     return json.loads(CONFIG.read_text(encoding="utf-8"))
 
 
+def digest_seconds(config):
+    minutes = config.get("digest_minutes")
+    return 60 * (max(10, min(50, minutes)) if type(minutes) is int else 20)
+
+
 def read_token():
     """Asks Hermes, so a gateway serving several profiles gives this profile's secret."""
     try:
@@ -135,12 +140,14 @@ class Bus:
             raise BusError(f"can't reach birdie at {self.url}; is `birdie serve` running?") from None
         return json.loads(raw) if raw else {}
 
-    def inbox(self, session, wait=0, thread=None, push=False, at=None):
+    def inbox(self, session, wait=0, thread=None, push=False, at=None, digest=None):
         query = {"wait": wait}
         if push:
             query["push"] = 1  # a pull-only session gets nothing pushed
             if at:
                 query["at"] = at
+            if at == "turn" and digest is not None:
+                query["digest"] = digest
         if session:
             query.update(session=session, lease=LEASE_SECONDS)
         if thread:
@@ -328,6 +335,7 @@ class Network:
         self.ctx = ctx
         self.agent = config["agent"]
         self.bus = Bus(config["url"])
+        self.digest_seconds = digest_seconds(config)
         self.lock = threading.Lock()
         self.conversations = {}
         self.sessions = {}  # Hermes session id -> conversation id
@@ -386,7 +394,9 @@ class Network:
     def wake_allowed(self):
         """Read each time, so turning wake off applies at once, even to an idle conversation."""
         try:
-            return load_config().get("wake") is True
+            config = load_config()
+            self.digest_seconds = digest_seconds(config)
+            return config.get("wake") is True
         except (OSError, ValueError):
             return False
 
@@ -636,7 +646,8 @@ class Network:
                 continue
             at = "turn" if time.monotonic() >= self.turn_retry_at else None
             try:
-                messages = self.bus.inbox(conversation.id, wait=POLL_SECONDS, push=True, at=at)
+                messages = self.bus.inbox(conversation.id, wait=POLL_SECONDS, push=True, at=at,
+                                          digest=self.digest_seconds)
             except BusError as err:
                 if at and err.status == 400 and "at must be" in str(err):
                     with self.lock:

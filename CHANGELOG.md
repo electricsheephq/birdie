@@ -50,6 +50,8 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   hold P3-only digests for cold sessions up to 12 hours. HeartBeat keep-warm
   turns pause Birdie pushes, and `list_agents`
   shows queued mail counts per session (#54).
+- Hermes installations can set `digest_minutes` in `birdie.json` to change
+  the P3 digest interval. The default is 20 minutes, with a range of 10–50.
 - Clarify-back. A session that isn't sure what a new request wants replies
   `(question / not a steer)` with up to 3 numbered questions. The sender then
   sees the thread as `awaiting_clarification` (#17).

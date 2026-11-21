@@ -133,8 +133,8 @@ class PluginCase(unittest.TestCase):
         for message in bus.inbox(""):
             bus.ack(message["id"])
 
-    def write_config(self, wake):
-        plugin.CONFIG.write_text(json.dumps({"agent": "hermes", "url": URL, "wake": wake}))
+    def write_config(self, wake, **settings):
+        plugin.CONFIG.write_text(json.dumps({"agent": "hermes", "url": URL, "wake": wake, **settings}))
 
     def load(self, **kwargs):
         ctx = Context(**kwargs)
@@ -205,6 +205,50 @@ class PluginTest(PluginCase):
         self.assertEqual(positions, ["turn", None, None, "turn"])
         self.assertEqual(len(ctx.injected), 2)
         warning.assert_called_once()
+
+    def test_turn_claims_use_the_current_digest_setting_and_legacy_claims_omit_it(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx)
+        conversation = network.conversation("s1")
+
+        def claim_query():
+            def call(method, path, **kwargs):
+                conversation.closed.set()
+                observed.update(urllib.parse.parse_qs(urllib.parse.urlsplit(path).query))
+                return {}
+
+            observed = {}
+            with mock.patch.object(network.bus, "call", side_effect=call):
+                network.deliver_loop(conversation)
+            conversation.closed.clear()
+            return observed
+
+        for settings, seconds in (
+            ({}, "1200"),
+            ({"digest_minutes": 40}, "2400"),
+            ({"digest_minutes": 5}, "600"),
+            ({"digest_minutes": 90}, "3000"),
+            ({"digest_minutes": "40"}, "1200"),
+            ({"digest_minutes": True}, "1200"),
+            ({"digest_minutes": 40.0}, "1200"),
+        ):
+            with self.subTest(settings=settings):
+                self.write_config(True, **settings)
+                with mock.patch.object(network, "start_threads"):
+                    self.turn(ctx)
+                query = claim_query()
+                self.assertEqual(query.get("at"), ["turn"])
+                self.assertEqual(query.get("digest"), [seconds])
+
+        network.turn_retry_at = time.monotonic() + 60
+        self.write_config(True, digest_minutes=40)
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx)
+        query = claim_query()
+        self.assertNotIn("at", query)
+        self.assertNotIn("digest", query)
 
     def test_push_puts_a_p1_and_its_p3_digest_in_one_turn(self):
         self.write_config(True)

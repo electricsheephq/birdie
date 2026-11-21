@@ -153,7 +153,7 @@ func TestASenderGetsDeliveryNotesForWarmAndColdTurnRecipients(t *testing.T) {
 		}
 	}
 	const warm = "held: goes in its next digest, within about 20 minutes"
-	const cold = "held: it is idle, so this waits for its next turn (at most 12 hours)"
+	const cold = "held: goes in its next digest (one every 20 minutes) while it is active, otherwise with its next turn (at most 12 hours)"
 	active := *p.now
 	for _, tc := range []struct {
 		age  time.Duration

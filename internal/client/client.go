@@ -142,7 +142,7 @@ func (c *Client) Send(ctx context.Context, in bus.SendInput) (bus.Message, error
 
 // Inbox claims queued messages, long-polling up to wait (the server caps it).
 func (c *Client) Inbox(ctx context.Context, threadID string, wait time.Duration) ([]bus.Message, error) {
-	return c.inbox(ctx, threadID, wait, false, "")
+	return c.inbox(ctx, threadID, wait, false, "", 0)
 }
 
 // PushInbox is Inbox for a delivery that puts what it gets into the
@@ -153,10 +153,15 @@ func (c *Client) PushInbox(ctx context.Context, wait time.Duration) ([]bus.Messa
 
 // PushInboxAt supplies the recipient turn position. Use bus.Turn when a push starts a turn.
 func (c *Client) PushInboxAt(ctx context.Context, wait time.Duration, at string) ([]bus.Message, error) {
-	return c.inbox(ctx, "", wait, true, at)
+	return c.inbox(ctx, "", wait, true, at, 0)
 }
 
-func (c *Client) inbox(ctx context.Context, threadID string, wait time.Duration, push bool, at string) ([]bus.Message, error) {
+// PushTurnInbox claims mail for a host that starts a turn on push, with an optional digest interval.
+func (c *Client) PushTurnInbox(ctx context.Context, wait, digest time.Duration) ([]bus.Message, error) {
+	return c.inbox(ctx, "", wait, true, bus.Turn, digest)
+}
+
+func (c *Client) inbox(ctx context.Context, threadID string, wait time.Duration, push bool, at string, digest time.Duration) ([]bus.Message, error) {
 	ctx, cancel := context.WithTimeout(ctx, wait+30*time.Second)
 	defer cancel()
 	q := url.Values{"wait": {strconv.FormatFloat(wait.Seconds(), 'f', -1, 64)}}
@@ -164,6 +169,9 @@ func (c *Client) inbox(ctx context.Context, threadID string, wait time.Duration,
 		q.Set("push", "1")
 		if at != "" {
 			q.Set("at", at)
+		}
+		if at == bus.Turn && digest > 0 {
+			q.Set("digest", strconv.FormatInt(int64(max(1, digest/time.Second)), 10))
 		}
 	}
 	if threadID != "" {
