@@ -83,6 +83,8 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 
 ### Fixed
 
+- Hermes can fetch held mail with `birdie_check_inbox` while pushes are on.
+- Oversized p3 pushes use the same thread pointer before and after a Hermes plugin reload, so a turn that shows one can confirm it.
 - Answers for a closed session no longer reach another one (#6). With the
   MCP bridge, they are held for it (#2).
 - A session's whole id isn't refused just after birdie restarts or the
