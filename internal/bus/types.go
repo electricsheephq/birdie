@@ -136,6 +136,8 @@ type Session struct {
 	State string `json:"state,omitempty"`
 	// Default marks the session that takes new conversations.
 	Default bool `json:"default,omitempty"`
+	// Held counts queued mail addressed to this session on agent listings.
+	Held int `json:"held,omitempty"`
 	// ActiveAt is when its user or model last did something. While it is idle
 	// or waiting, that is when it stopped.
 	ActiveAt time.Time `json:"active_at"`
@@ -210,6 +212,7 @@ type Message struct {
 const (
 	Midturn           = "midturn"
 	Boundary          = "boundary"
+	Turn              = "turn"
 	MaxDigestBytes    = 64 << 10
 	MaxPushFrameBytes = 256 << 10
 )
@@ -239,7 +242,7 @@ type ReceiveInput struct {
 	// Push marks a claim by a delivery that puts messages into the session's
 	// conversation on its own. A pull-only session gets nothing from one.
 	Push bool
-	// At is the recipient turn position, or empty for legacy delivery.
+	// At is Midturn, Boundary, Turn (a push starts its own turn), or empty for legacy delivery.
 	At string
 }
 
@@ -345,6 +348,8 @@ type Store interface {
 	// RecentSessions returns the agent's sessions seen since a time, running
 	// or not.
 	RecentSessions(ctx context.Context, agent string, since time.Time) ([]Session, error)
+	// QueuedBySession counts queued messages by recipient agent and session.
+	QueuedBySession(ctx context.Context) (map[[2]string]int, error)
 
 	Close() error
 }

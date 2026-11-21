@@ -61,6 +61,7 @@ const (
 	DigestEvery = 20 * time.Minute
 	Valve       = 40 * time.Minute
 	CacheIdle   = 50 * time.Minute
+	HoldCeiling = 12 * time.Hour
 	Coalesce    = 3 * time.Second
 	CoalesceMax = 10 * time.Second
 )
@@ -164,12 +165,19 @@ func (b *Bus) listAgents(ctx context.Context, sessions func(context.Context, Age
 	if err != nil {
 		return nil, err
 	}
+	queued, err := b.store.QueuedBySession(ctx)
+	if err != nil {
+		return nil, err
+	}
 	for i := range agents {
 		if agents[i].Delivery != DeliveryPull {
 			continue
 		}
 		if agents[i].Sessions, err = sessions(ctx, agents[i]); err != nil {
 			return nil, err
+		}
+		for j, s := range agents[i].Sessions {
+			agents[i].Sessions[j].Held = queued[[2]string{s.Agent, s.ID}]
 		}
 	}
 	return agents, nil
@@ -742,9 +750,9 @@ func (b *Bus) Receive(ctx context.Context, agent, threadID string, wait time.Dur
 // ReceiveFor is Receive with session scoping and leases.
 func (b *Bus) ReceiveFor(ctx context.Context, in ReceiveInput) ([]Message, error) {
 	switch in.At {
-	case "", Midturn, Boundary:
+	case "", Midturn, Boundary, Turn:
 	default:
-		return nil, fmt.Errorf("%w: at must be midturn or boundary", ErrInvalid)
+		return nil, fmt.Errorf("%w: at must be midturn, boundary or turn", ErrInvalid)
 	}
 	deadline := time.Now().Add(min(in.Wait, MaxWait))
 	for {
@@ -1073,7 +1081,19 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 		b.mu.Lock()
 		at := b.positions[[2]string{to.Name, target.ID}]
 		b.mu.Unlock()
-		if at != "" {
+		if at == Turn {
+			switch m.Priority {
+			case "p0":
+				return "goes now; it starts its next turn"
+			case "p1":
+				return "goes now; it sees this when its current turn ends, or at once if it is idle"
+			case "p3":
+				if target.ActiveAt.UnixMilli() >= b.now().Add(-CacheIdle).UnixMilli() {
+					return "held: goes in its next digest, within about 20 minutes"
+				}
+				return "held: it is idle, so this waits for its next turn (at most 12 hours)"
+			}
+		} else if at != "" {
 			switch {
 			case m.Priority == "p0":
 				return "p0: offered after a short batching window; its host may hold peer messages for its user first"

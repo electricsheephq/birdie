@@ -151,7 +151,7 @@ func (c *Client) PushInbox(ctx context.Context, wait time.Duration) ([]bus.Messa
 	return c.PushInboxAt(ctx, wait, "")
 }
 
-// PushInboxAt supplies the recipient turn position when the host knows it.
+// PushInboxAt supplies the recipient turn position. Use bus.Turn when a push starts a turn.
 func (c *Client) PushInboxAt(ctx context.Context, wait time.Duration, at string) ([]bus.Message, error) {
 	return c.inbox(ctx, "", wait, true, at)
 }
