@@ -65,7 +65,8 @@ HEARTBEAT2_WANTED = "heartbeat2:notifier_wanted"
 HEARTBEAT2_NOTIFIER = "heartbeat2_notifier"
 NOTIFY_SECONDS = 2
 # HeartBeat 2.0 writes this first line in heartbeat2/wake_text.py:render_keep_warm.
-KEEP_WARM = re.compile(r"^⟦pulse o:[^\s⟧]+ a:[0-9]+(?: n:[^\s⟧]+)?⟧ \[HeartBeat 2\.0 · keep-warm [^\]\r\n]+\]$")
+KEEP_WARM = re.compile(r"^⟦pulse o:[^\s⟧]+ a:[0-9]+(?: n:(?P<tag>[^\s⟧]+))?⟧"
+                       r" \[HeartBeat 2\.0 · keep-warm [^\]\r\n]+\]$")
 
 
 def is_keep_warm(text):
@@ -75,7 +76,7 @@ def is_keep_warm(text):
     # Match heartbeat2/intake.py:marker: gateway sender names can contain delimiters.
     delimiter = "] ⟦pulse "
     candidates = [first[m.start() + 2:] for m in re.finditer(re.escape(delimiter), first[:1024 + len(delimiter)])]
-    return any(KEEP_WARM.match(candidate) for candidate in reversed(candidates))
+    return any((match := KEEP_WARM.match(candidate)) and match["tag"] for candidate in reversed(candidates))
 
 
 class BusError(Exception):
@@ -282,8 +283,12 @@ class Conversation:
             return message_id in self.delivered
 
     def mark_delivered(self, message_id):
+        """Remember the delivery and return whether it was new."""
         with self.lock:
+            if message_id in self.delivered:
+                return False
             self.remember(message_id)
+            return True
 
     def remember(self, message_id):
         """mark_delivered, for a caller that holds the lock."""
@@ -897,11 +902,13 @@ class Network:
                     except BusError as err:
                         log.debug("birdie: thread inbox: %s", err)
                         continue
-                if messages:
-                    for message in messages:
-                        conversation.mark_delivered(message["id"])
-                        self.confirm_delivery(message["id"])
-                    return messages, False
+                fresh = []
+                for message in messages:
+                    if conversation.mark_delivered(message["id"]):
+                        fresh.append(message)
+                    self.confirm_delivery(message["id"])
+                if fresh:
+                    return fresh, False
             return [], False
         finally:
             with conversation.lock:

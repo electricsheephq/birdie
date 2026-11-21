@@ -310,6 +310,12 @@ class PluginTest(PluginCase):
                 self.assertEqual(conversation.quiet(), quiet)
                 ctx.hooks["post_llm_call"](session_id="s1")
 
+    def test_a_keep_warm_header_needs_a_tag_only_with_a_sender_prefix(self):
+        self.assertTrue(plugin.is_keep_warm(self.KEEP_WARM))
+        self.assertTrue(plugin.is_keep_warm(self.KEEP_WARM_TAGGED))
+        self.assertTrue(plugin.is_keep_warm("[Name] " + self.KEEP_WARM_TAGGED))
+        self.assertFalse(plugin.is_keep_warm("[Name] " + self.KEEP_WARM))
+
     def test_a_normal_turn_ends_quiet_even_if_the_keep_warm_post_hook_did_not_run(self):
         self.write_config(True)
         ctx, network = self.load()
@@ -666,6 +672,79 @@ class PluginTest(PluginCase):
         finally:
             network.take(conversation, thread=thread)
             network.take(conversation, thread=elsewhere["thread_id"])
+
+    def test_a_pushing_wait_confirms_mail_already_shown_and_waits_for_a_new_reply(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        session = "wait-dedupe"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session=session, user_message="hello")
+        conversation = network.conversation(session)
+        sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}, session=session))
+        reply_to = peer_inbox(5)[0]["id"]
+        old = peer("POST", "/v1/messages", {"in_reply_to": reply_to, "content": "already shown"})
+        with mock.patch.object(plugin, "PENDING_SECONDS", 0):
+            network.deliver(conversation, network.bus.inbox(conversation.id)[0])
+        network.expire_pending(conversation)
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session=session, user_message=ctx.injected[0][1])
+        self.assertIn(old["id"], conversation.delivered)
+        self.assertEqual(status(old["id"]), "queued")
+
+        fresh = {}
+        inbox = network.bus.inbox
+
+        def inbox_with_next_reply(*args, **kwargs):
+            # The first wait claim contains only the reply the turn already showed.
+            if status(old["id"]) == "delivered" and not fresh:
+                fresh.update(peer("POST", "/v1/messages", {"in_reply_to": reply_to, "content": "new reply"}))
+            return inbox(*args, **kwargs)
+
+        with mock.patch.object(network.bus, "inbox", side_effect=inbox_with_next_reply):
+            result = self.call(ctx, "birdie_wait_for_reply",
+                               {"thread_id": sent["thread_id"], "timeout_seconds": 3}, session=session)
+        self.assertEqual(status(old["id"]), "delivered")
+        self.assertNotIn("already shown", result)
+        self.assertIn("new reply", result)
+        self.assertEqual(fresh["thread_id"], sent["thread_id"])
+        self.assertEqual(status(fresh["id"]), "delivered")
+
+    def test_a_pushing_wait_gives_back_a_reply_handed_over_at_its_final_step(self):
+        self.write_config(True)
+        ctx, network = self.load()
+        session = "wait-final-drain"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session=session, user_message="hello")
+        conversation = network.conversation(session)
+        sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}, session=session))
+        reply_to = peer_inbox(5)[0]["id"]
+        reply = peer("POST", "/v1/messages", {"in_reply_to": reply_to, "content": "past the deadline"})
+        claimed, = network.bus.inbox(conversation.id)
+
+        class LastStep(plugin.queue.Queue):
+            def get(self, block=True, timeout=None):
+                try:
+                    return super().get(block, timeout)
+                except plugin.queue.Empty:
+                    if block:
+                        # Delivery hands it over after the final blocking get times out.
+                        network.deliver(conversation, claimed)
+                    raise
+
+        with mock.patch.object(plugin.queue, "Queue", LastStep), mock.patch.object(plugin, "WAIT_STEP_SECONDS", 1):
+            result = self.call(ctx, "birdie_wait_for_reply",
+                               {"thread_id": sent["thread_id"], "timeout_seconds": 0.1}, session=session)
+        self.assertIn("No reply yet", result)
+        self.assertEqual(ctx.injected, [])
+        self.assertEqual(status(reply["id"]), "queued", "the wait must nack the handed-over reply")
+
+        reclaimed, = network.bus.inbox(conversation.id, wait=5, push=True, at="turn")
+        self.assertEqual(reclaimed["id"], reply["id"])
+        network.deliver(conversation, reclaimed)
+        self.assertIn("past the deadline", ctx.injected[0][1])
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session=session, user_message=ctx.injected[0][1])
+        self.assertEqual(status(reply["id"]), "delivered")
 
     def test_a_pull_only_conversation_gets_nothing_pushed(self):
         self.write_config(True)
