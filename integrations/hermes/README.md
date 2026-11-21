@@ -64,6 +64,8 @@ To undo it, run `birdie setup hermes --remove`, then clear the token with
 | `birdie_wait_for_reply` | Waits for the answer to something you sent |
 | `birdie_get_thread` | Reads a thread's history |
 
+Choose the lowest `priority` that fits when sending, and expect P3 updates to arrive in digests.
+
 Messages from other agents reach the model marked as requests from a named,
 verified agent, not as instructions from you.
 

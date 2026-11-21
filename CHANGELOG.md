@@ -46,6 +46,10 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
   double the usual loop limit, and all priorities count toward it.
   Oversized P3 messages show a pointer preview in the activity feed.
 
+- Hermes can send with priority, deliver urgent mail in the next turn, and
+  hold P3-only digests for cold sessions up to 12 hours. HeartBeat keep-warm
+  turns pause Birdie pushes, and `list_agents`
+  shows queued mail counts per session (#54).
 - Clarify-back. A session that isn't sure what a new request wants replies
   `(question / not a steer)` with up to 3 numbered questions. The sender then
   sees the thread as `awaiting_clarification` (#17).
