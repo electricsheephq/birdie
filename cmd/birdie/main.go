@@ -355,6 +355,10 @@ func session(ctx context.Context, args []string) error {
 		} else if addr.Session != "" {
 			fmt.Println("no session has this name yet")
 		}
+		if addr.Session != "" && bus.PicksSession(a) {
+			// Mail to an agent that picks its own session is left unpinned when sent, so only the agent-wide value covers it.
+			fmt.Printf("note: a message addressed to %s alone uses the agent-wide setting (%s), even when this session takes it; this setting covers mail sent to this session or in its threads\n", addr.Agent, a.UnrankedAs(""))
+		}
 		return nil
 	}, args)
 }

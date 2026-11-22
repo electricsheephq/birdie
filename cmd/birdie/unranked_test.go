@@ -144,3 +144,21 @@ func unrankedSessions(t *testing.T) (*store.SQLite, func(string) (string, error)
 		return string(out), runErr
 	}
 }
+
+func TestSessionUnrankedNotesThatBareMailToASessionPickingAgentUsesTheAgentSetting(t *testing.T) {
+	st, run := unrankedSessions(t)
+	ctx := context.Background()
+	if err := st.CreateAgent(ctx, bus.Agent{Name: "bob", Delivery: bus.DeliveryPull, TokenHash: "bob-test"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.New(st, nil).ReportSession(ctx, "bob", "b1", bus.SessionInput{Name: "desk"}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run("bob/desk")
+	if err != nil || !strings.Contains(out, "a message addressed to bob alone uses the agent-wide setting (immediate)") {
+		t.Errorf("confirmation = %q, %v", out, err)
+	}
+	if out, err := run("claude/lcm-x"); err != nil || strings.Contains(out, "agent-wide setting") {
+		t.Errorf("claude confirmation = %q, %v; claude doesn't pick its own session", out, err)
+	}
+}

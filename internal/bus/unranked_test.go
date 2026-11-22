@@ -217,3 +217,21 @@ func TestTheSendResultExplainsARecipientDefault(t *testing.T) {
 		}
 	}
 }
+
+func TestBareMailToAnAgentThatPicksItsSessionUsesTheAgentWideSetting(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "bob", nil)
+	for key, value := range map[string]string{"unranked_as:work": "p3", "default_session": "work"} {
+		if err := st.SetAgentConfig(ctx, "bob", key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report(t, b, "bob", "s1", "work", bus.TierPush, time.Now())
+	for _, tc := range []struct{ to, want string }{{"bob", ""}, {"bob/work", "p3"}} {
+		m, err := b.Send(ctx, "alice", bus.SendInput{To: tc.to, Content: "update"})
+		if err != nil || m.Priority != tc.want {
+			t.Errorf("send to %s = %q (session %q), %v; want %q", tc.to, m.Priority, m.ToSession, err, tc.want)
+		}
+	}
+}
