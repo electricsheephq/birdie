@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- The Hermes plugin's HeartBeat notifier sends p1 unless HeartBeat picks a level, so a recipient that holds unranked mail as p3 still sees HeartBeat notices.
 
 Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 

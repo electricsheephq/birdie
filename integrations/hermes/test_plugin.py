@@ -1308,8 +1308,16 @@ class Heartbeat2NotifierTest(PluginCase):
         self.assertEqual(result["status"], "queued")
         self.assertIsNone(result["error"])
         got = peer_inbox(wait=2)
-        self.assertEqual([(m["from"], m["content"], (m.get("meta") or {}).get("source")) for m in got],
-                         [("hermes", "HeartBeat: 'standup' is waiting in the Desktop app.", "heartbeat2")])
+        self.assertEqual([(m["from"], m["content"], (m.get("meta") or {}).get("source"), m.get("priority")) for m in got],
+                         [("hermes", "HeartBeat: 'standup' is waiting in the Desktop app.", "heartbeat2", "p1")])
+
+    def test_the_notifier_sends_p1_unless_heartbeat2_picks_a_level(self):
+        ctx = self.load_with_events()
+        send = ctx.emitted[0][1]["send"]
+        for level, want in (("p3", "p3"), ("p0", "p0"), ("urgent", "p1"), (None, "p1")):
+            self.assertTrue(send("peer", "HeartBeat: level %s" % level, level)["ok"])
+            got = peer_inbox(wait=2)
+            self.assertEqual([m.get("priority") for m in got], [want], level)
 
     def test_heartbeat2_asking_again_gets_the_same_offer_and_unload_withdraws_it(self):
         ctx = self.load_with_events()

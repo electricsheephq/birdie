@@ -332,7 +332,9 @@ def notifier(bus):
     agent and never raises. ok means the bus accepted the message, not that anyone
     read it. It is a closure, not a bound method, because Hermes's plugin event bus
     deep-copies payloads and keeps functions as they are."""
-    def send(target, text):
+    def send(target, text, priority=None):
+        # A HeartBeat notice is meant to be seen, so it is p1 unless the caller picks a level:
+        # a recipient whose unranked mail is held as p3 would otherwise hold it.
         result = {"ok": False, "message_id": None, "status": None, "error": None}
         try:
             target = str(target or "").strip()
@@ -342,6 +344,7 @@ def notifier(bus):
                 return result
             message = bus.call("POST", "/v1/messages", {
                 "to": target, "content": text, "meta": {"source": "heartbeat2"},
+                "priority": priority if priority in ("p0", "p1", "p3") else "p1",
             }, timeout=NOTIFY_SECONDS)
             result.update(ok=True, message_id=message.get("id") or None, status=message.get("status") or "queued")
         except Exception as err:
