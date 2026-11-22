@@ -156,42 +156,70 @@ func (b *Bus) Authenticate(ctx context.Context, token string) (Agent, error) {
 	return a, err
 }
 
-// Agents lists every agent with its running sessions.
+// Agents lists every agent with its running sessions and stopped sessions with held mail.
 func (b *Bus) Agents(ctx context.Context) ([]Agent, error) {
-	return b.listAgents(ctx, b.Sessions)
+	return b.listAgents(ctx, false)
 }
 
 // AgentsWithRecentSessions lists every agent with its sessions from the last
 // day, as RecentSessions returns them.
 func (b *Bus) AgentsWithRecentSessions(ctx context.Context) ([]Agent, error) {
-	return b.listAgents(ctx, b.RecentSessions)
+	return b.listAgents(ctx, true)
 }
 
-func (b *Bus) listAgents(ctx context.Context, sessions func(context.Context, Agent) ([]Session, error)) ([]Agent, error) {
+func (b *Bus) listAgents(ctx context.Context, recent bool) ([]Agent, error) {
 	agents, err := b.store.ListAgents(ctx)
 	if err != nil {
 		return nil, err
 	}
-	queued, err := b.store.QueuedBySession(ctx, b.now())
+	now := b.now().Truncate(time.Millisecond)
+	queued, err := b.store.QueuedBySession(ctx, now, now.Add(-b.holdFor()))
 	if err != nil {
 		return nil, err
+	}
+	var since time.Time
+	if recent {
+		since = now.Add(-SessionRetention)
 	}
 	for i := range agents {
 		if agents[i].Delivery != DeliveryPull {
 			continue
 		}
-		if agents[i].Sessions, err = sessions(ctx, agents[i]); err != nil {
+		sessions, err := b.recentSessions(ctx, agents[i], now, since)
+		if err != nil {
 			return nil, err
 		}
-		for j, s := range agents[i].Sessions {
-			held := queued[[2]string{s.Agent, s.ID}]
+		for _, s := range sessions {
+			s.Held = queued[[2]string{s.Agent, s.ID}]
 			if s.Default {
-				held += queued[[2]string{s.Agent, ""}]
+				s.Held += queued[[2]string{s.Agent, ""}]
 			}
-			agents[i].Sessions[j].Held = held
+			s.Running = s.Live(now)
+			if !recent && !s.Running && s.Held == 0 {
+				continue
+			}
+			s.Warm = s.cacheWarm(now)
+			s.DeliveryNote = sessionDeliveryNote(s, now)
+			agents[i].Sessions = append(agents[i].Sessions, s)
 		}
 	}
 	return agents, nil
+}
+
+func sessionDeliveryNote(s Session, now time.Time) string {
+	switch {
+	case !s.Running && s.Held > 0:
+		return fmt.Sprintf("not running; %d held, delivered when it comes back", s.Held)
+	case !s.Running:
+		return "not running"
+	case s.Warm:
+		return "warm"
+	}
+	idle := now.Sub(s.ActiveAt)
+	if idle >= time.Hour {
+		return fmt.Sprintf("cold (idle %d h)", idle/time.Hour)
+	}
+	return fmt.Sprintf("cold (idle %d min)", idle/time.Minute)
 }
 
 // Sessions returns the agent's running sessions, with its default marked.
@@ -212,8 +240,12 @@ func (b *Bus) Sessions(ctx context.Context, a Agent) ([]Session, error) {
 // RecentSessions returns the agent's sessions from the last day: the running
 // ones as Sessions returns them, then the ones that stopped, latest first.
 func (b *Bus) RecentSessions(ctx context.Context, a Agent) ([]Session, error) {
-	now := time.Now()
-	all, err := b.store.RecentSessions(ctx, a.Name, now.Add(-SessionRetention))
+	now := b.now()
+	return b.recentSessions(ctx, a, now, now.Add(-SessionRetention))
+}
+
+func (b *Bus) recentSessions(ctx context.Context, a Agent, now, since time.Time) ([]Session, error) {
+	all, err := b.store.RecentSessions(ctx, a.Name, since)
 	if err != nil {
 		return nil, err
 	}
@@ -706,7 +738,7 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	if err := b.saveSend(ctx, &m, parent, unranked); err != nil {
 		return Message{}, err
 	}
-	m.Note = b.deliveryNote(ctx, to, m)
+	m.Note, m.Cost = b.deliveryNote(ctx, to, m)
 	if m.Defaulted {
 		setting := unranked + " by the recipient's setting for unranked mail"
 		if m.Priority != unranked {
@@ -1076,21 +1108,20 @@ func (b *Bus) running(ctx context.Context, agent, id string) bool {
 	return false
 }
 
-// deliveryNote tells the sender when the recipient will see m, naming it by
-// its label.
-func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
+// deliveryNote tells the sender when the recipient will see m and what it costs.
+func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) (note, cost string) {
 	switch to.Delivery {
 	case DeliveryPull:
 	case "webhook":
-		return fmt.Sprintf("queued: being sent to %s's webhook; it answers in its own time", to.DisplayName())
+		return fmt.Sprintf("queued: being sent to %s's webhook; it answers in its own time", to.DisplayName()), ""
 	case "acp":
-		return fmt.Sprintf("queued: birdie will start %s for this and post its answer on this thread", to.DisplayName())
+		return fmt.Sprintf("queued: birdie will start %s for this and post its answer on this thread", to.DisplayName()), ""
 	default:
-		return "queued"
+		return "queued", ""
 	}
 	live, err := b.Sessions(ctx, to)
 	if err != nil {
-		return "queued"
+		return "queued", ""
 	}
 	var target *Session
 	for i := range live {
@@ -1101,13 +1132,17 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 	if target == nil {
 		if m.ToSession != "" {
 			return fmt.Sprintf("queued: %s is no longer open, so this waits for that session to come back, for up to %s; other sessions don't get it unless one waits on this thread. To reach a %s session that is open now, send a new message to its address (list_agents shows them)",
-				b.sessionLabel(ctx, to, m.ToSession), days(b.holdFor()), to.DisplayName())
+				b.sessionLabel(ctx, to, m.ToSession), days(b.holdFor()), to.DisplayName()), "waits"
 		}
-		return fmt.Sprintf("queued: %s has no open session; it gets this when it next checks or starts", to.DisplayName())
+		return fmt.Sprintf("queued: %s has no open session; it gets this when it next checks or starts", to.DisplayName()), "waits"
 	}
 	name := to.DisplayName()
 	if target.Name != "" {
 		name += " · " + target.Name
+	}
+	now := b.now()
+	if m.Priority != "p3" && target.cacheWarm(now) {
+		cost = "warm"
 	}
 	switch target.Tier {
 	case TierPush:
@@ -1115,33 +1150,36 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) string {
 		position := b.positions[[2]string{to.Name, target.ID}]
 		b.mu.Unlock()
 		at := position.at
+		if cost == "" && m.Priority != "p3" && at != Midturn {
+			cost = "wakes_cold"
+		}
 		if at == Turn {
 			switch m.Priority {
 			case "p0":
-				return "goes now; it starts its next turn"
+				return "goes now; it starts its next turn", cost
 			case "p1":
-				return "goes now; it sees this when its current turn ends, or at once if it is idle"
+				return "goes now; it sees this when its current turn ends, or at once if it is idle", cost
 			case "p3":
-				if target.ActiveAt.UnixMilli() >= b.now().Add(-(CacheIdle - position.digest)).UnixMilli() {
-					return fmt.Sprintf("held: goes in its next digest, within about %.4g minutes", position.digest.Minutes())
+				if target.ActiveAt.UnixMilli() >= now.Add(-(CacheIdle - position.digest)).UnixMilli() {
+					return fmt.Sprintf("held: goes in its next digest, within about %.4g minutes", position.digest.Minutes()), "held"
 				}
-				return fmt.Sprintf("held: goes in its next digest (one every %.4g minutes) while it is active, otherwise with its next turn (at most 12 hours)", position.digest.Minutes())
+				return fmt.Sprintf("held: goes in its next digest (one every %.4g minutes) while it is active, otherwise with its next turn (at most 12 hours)", position.digest.Minutes()), "held"
 			}
 		} else if at != "" {
 			switch {
 			case m.Priority == "p0":
-				return "p0: offered after a short batching window; its host may hold peer messages for its user first"
+				return "p0: offered after a short batching window; its host may hold peer messages for its user first", cost
 			case m.Priority == "p1" && at == Midturn:
-				return "held: sees this when its turn ends"
+				return "held: sees this when its turn ends", "held"
 			case m.Priority == "p3":
-				return "held: goes in its next digest, within about 20 minutes (up to 40 in a long turn)"
+				return "held: goes in its next digest, within about 20 minutes (up to 40 in a long turn)", "held"
 			}
 		}
-		return fmt.Sprintf("queued: %s gets this right away", name)
+		return fmt.Sprintf("queued: %s gets this right away", name), cost
 	case TierTurn:
-		return fmt.Sprintf("queued: %s sees this at its next tool call or end of turn; if it's idle, it waits for its user", name)
+		return fmt.Sprintf("queued: %s sees this at its next tool call or end of turn; if it's idle, it waits for its user", name), cost
 	}
-	return fmt.Sprintf("queued: %s only sees this when it checks its inbox", name)
+	return fmt.Sprintf("queued: %s only sees this when it checks its inbox", name), cost
 }
 
 // sessionLabel names one of to's sessions as people see it: by its name if

@@ -136,6 +136,9 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 		if m.Defaulted {
 			result["defaulted"] = true
 		}
+		if m.Cost != "" {
+			result["cost"] = m.Cost
+		}
 		out = result
 	case "check_inbox":
 		h := s.currentHost()

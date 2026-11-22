@@ -647,6 +647,8 @@ var digestContent = fmt.Sprintf(`CASE WHEN m.priority = 3 AND %[1]s > %[2]d
 // or claimed with the lease run out.
 const waiting = `(m.status = 'queued' OR (m.status = 'claimed' AND m.lease_until > 0 AND m.lease_until <= ?))`
 
+const pinnedHeldSince = `MAX(m.created_at, COALESCE(CASE WHEN s.ended_at > 0 THEN s.ended_at ELSE s.last_seen END, 0))`
+
 func (s *SQLite) SettleHeld(ctx context.Context, q bus.HoldQuery, build func([]bus.HeldMessage) []bus.Message) ([]bus.HeldMessage, []bus.Message, error) {
 	where := `m.sender NOT IN (?, ?) AND ` + waiting + `
 		AND m.recipient IN (SELECT name FROM agents WHERE delivery = 'pull')`
@@ -689,7 +691,7 @@ func (s *SQLite) SettleHeld(ctx context.Context, q bus.HoldQuery, build func([]b
 		// held, so it never expires untold, and an upgrade leaves time to
 		// choose a default before mail sent long ago expires.
 		where += ` AND CASE WHEN m.to_session = '' THEN m.held_at > 0 AND m.held_at < ?
-			ELSE MAX(m.created_at, COALESCE(CASE WHEN s.ended_at > 0 THEN s.ended_at ELSE s.last_seen END, 0)) < ? END`
+			ELSE ` + pinnedHeldSince + ` < ? END`
 		args = append(args, q.Before.UnixMilli(), q.Before.UnixMilli())
 	} else {
 		where += ` AND m.held_at = 0`
@@ -959,12 +961,14 @@ func (s *SQLite) RecentSessions(ctx context.Context, agent string, since time.Ti
 		WHERE agent = ? AND last_seen >= ? ORDER BY active_at DESC, id`, agent, since.UnixMilli()))
 }
 
-func (s *SQLite) QueuedBySession(ctx context.Context, now time.Time) (map[[2]string]int, error) {
+func (s *SQLite) QueuedBySession(ctx context.Context, now, holdSince time.Time) (map[[2]string]int, error) {
 	// Start with agents and constrain status so the inbox index skips settled mail.
 	rows, err := s.db.QueryContext(ctx, `SELECT m.recipient, m.to_session, COUNT(*)
 		FROM agents a CROSS JOIN messages m ON m.recipient = a.name
+		LEFT JOIN sessions s ON s.agent = m.recipient AND s.id = m.to_session
 		WHERE a.delivery = 'pull' AND m.status IN ('queued', 'claimed') AND `+waiting+`
-		GROUP BY m.recipient, m.to_session`, now.UnixMilli())
+		AND (s.id IS NULL OR (s.ended_at = 0 AND s.last_seen >= ?) OR `+pinnedHeldSince+` >= ?)
+		GROUP BY m.recipient, m.to_session`, now.UnixMilli(), now.Add(-bus.SessionTTL).UnixMilli(), holdSince.UnixMilli())
 	if err != nil {
 		return nil, err
 	}

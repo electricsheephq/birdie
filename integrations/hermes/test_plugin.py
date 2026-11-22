@@ -169,6 +169,13 @@ class PluginTest(PluginCase):
         self.assertEqual(result.get("priority"), "p3")
         self.assertIs(result.get("defaulted"), True)
 
+    def test_the_send_tool_returns_the_delivery_cost(self):
+        ctx, network = self.load()
+        sent = {"id": "m1", "thread_id": "t1", "status": "queued", "cost": "wakes_cold"}
+        with mock.patch.object(network.bus, "call", return_value=sent):
+            result = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "update"}))
+        self.assertEqual(result.get("cost"), "wakes_cold")
+
     def test_the_send_tool_accepts_only_the_supported_priorities_and_passes_them(self):
         ctx, _ = self.load()
         self.turn(ctx)
