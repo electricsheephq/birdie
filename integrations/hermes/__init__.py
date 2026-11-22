@@ -978,6 +978,9 @@ class Network:
             conversation.shown.pop(message.get("thread_id", ""), None)
         result = {key: message.get(key, "") for key in ("message_id", "thread_id", "status", "note")}
         result["message_id"] = message.get("id", "")
+        for key in ("priority", "defaulted"):
+            if key in message:
+                result[key] = message[key]
         return json.dumps(result, ensure_ascii=False) + self.unread_note(conversation)
 
     def check_inbox(self, conversation, args):

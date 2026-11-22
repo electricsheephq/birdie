@@ -40,23 +40,23 @@ func TestSessionPullOnly(t *testing.T) {
 		return out.String()
 	}
 	for _, args := range [][]string{{"pull-only"}, {"pull-only", "claude/api"}, {"pull-only", "claude/api", "yes"}} {
-		if err := sessionCmd(ctx, b, nil, nil, args); err == nil || !strings.Contains(err.Error(), "usage") {
+		if err := sessionCmd(ctx, b, nil, nil, nil, args); err == nil || !strings.Contains(err.Error(), "usage") {
 			t.Fatalf("%v: %v", args, err)
 		}
 	}
-	if err := sessionCmd(ctx, b, nil, nil, []string{"pull-only", "claude/api", "on"}); err != nil {
+	if err := sessionCmd(ctx, b, nil, nil, nil, []string{"pull-only", "claude/api", "on"}); err != nil {
 		t.Fatal(err)
 	}
 	if on, _ := st.SessionPullOnly(ctx, "claude", "s1"); !on || !strings.Contains(list(), "pull-only") {
 		t.Fatalf("on: %v\n%s", on, list())
 	}
-	if err := sessionCmd(ctx, b, nil, nil, []string{"pull-only", "claude/s1", "off"}); err != nil {
+	if err := sessionCmd(ctx, b, nil, nil, nil, []string{"pull-only", "claude/s1", "off"}); err != nil {
 		t.Fatal(err)
 	}
 	if on, _ := st.SessionPullOnly(ctx, "claude", "s1"); on || strings.Contains(list(), "pull-only") {
 		t.Fatalf("off: %v\n%s", on, list())
 	}
-	if err := sessionCmd(ctx, b, nil, nil, []string{"pull-only", "claude/gone", "on"}); err == nil {
+	if err := sessionCmd(ctx, b, nil, nil, nil, []string{"pull-only", "claude/gone", "on"}); err == nil {
 		t.Fatal("a session that isn't running was accepted")
 	}
 }

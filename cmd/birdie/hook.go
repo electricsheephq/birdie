@@ -90,9 +90,9 @@ func grokHookOutput(event, text string) (string, error) {
 }
 
 // sessionCmd looks at running sessions and chooses which takes new conversations.
-func sessionCmd(ctx context.Context, b *bus.Bus, setDefault func(agent, name string) error, setFallback func(agent, value string) error, args []string) error {
+func sessionCmd(ctx context.Context, b *bus.Bus, setDefault func(agent, name string) error, setFallback func(agent, value string) error, setUnranked func(addr bus.Address, value string) error, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: birdie session list [--all] | default AGENT [NAME] | fallback AGENT [on|off] | pull-only ADDRESS on|off")
+		return errors.New("usage: birdie session list [--all] | default AGENT [NAME] | fallback AGENT [on|off] | unranked AGENT[/NAME] [immediate|p1|p3] | pull-only ADDRESS on|off")
 	}
 	switch args[0] {
 	case "list":
@@ -124,6 +124,23 @@ func sessionCmd(ctx context.Context, b *bus.Bus, setDefault func(agent, name str
 			value = args[2]
 		}
 		return setFallback(args[1], value)
+	case "unranked":
+		usage := errors.New("usage: birdie session unranked AGENT[/NAME] [immediate|p1|p3] (omit the value to clear the setting)")
+		if len(args) < 2 || len(args) > 3 {
+			return usage
+		}
+		addr, err := bus.ParseAddress(args[1])
+		if err != nil || !bus.ValidName(addr.Agent) || addr.ID != "" || addr.Node != "" {
+			return usage
+		}
+		value := ""
+		if len(args) == 3 {
+			value = args[2]
+			if value != "immediate" && value != "p1" && value != "p3" {
+				return usage
+			}
+		}
+		return setUnranked(addr, value)
 	case "pull-only":
 		if len(args) != 3 || (args[2] != "on" && args[2] != "off") {
 			return errors.New("usage: birdie session pull-only ADDRESS on|off (ADDRESS is agent/name, agent/id or agent/name#id, as birdie session list shows; on: that session gets messages only when it checks, nothing is pushed in; off: back to its usual)")

@@ -132,7 +132,11 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage, taken *[]bus
 			delete(s.shown, m.ThreadID)
 			s.waitMu.Unlock()
 		}
-		out = map[string]string{"message_id": m.ID, "thread_id": m.ThreadID, "status": m.Status, "note": m.Note, "priority": m.Priority}
+		result := map[string]any{"message_id": m.ID, "thread_id": m.ThreadID, "status": m.Status, "note": m.Note, "priority": m.Priority}
+		if m.Defaulted {
+			result["defaulted"] = true
+		}
+		out = result
 	case "check_inbox":
 		h := s.currentHost()
 		if h != nil && s.pushing() {

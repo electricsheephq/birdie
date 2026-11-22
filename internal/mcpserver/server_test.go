@@ -135,6 +135,22 @@ func setupWith(t *testing.T, channel bool, wrap func(http.Handler) http.Handler)
 	return s, client.New(api.URL, "cursor-tok")
 }
 
+func TestTheSendToolShowsWhenARecipientDefaultedThePriority(t *testing.T) {
+	s, _ := setupWith(t, false, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == "POST" && r.URL.Path == "/v1/messages" {
+				io.WriteString(w, `{"id":"m1","thread_id":"t1","status":"queued","priority":"p3","defaulted":true}`)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
+	got := toolJSON(t, s.call("tools/call", map[string]any{"name": "send_message", "arguments": map[string]any{"to": "cursor", "content": "update"}}))
+	if got["priority"] != "p3" || got["defaulted"] != true {
+		t.Fatalf("send_message = %v", got)
+	}
+}
+
 func TestToolsRoundTrip(t *testing.T) {
 	s, cursor := setup(t, false)
 

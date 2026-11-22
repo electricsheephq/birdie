@@ -116,6 +116,28 @@ func (a Agent) DisplayName() string {
 	return LabelOf(a.Name, a.Config)
 }
 
+// UnrankedKey is the config key for an agent or one of its session names.
+func UnrankedKey(name string) string {
+	if name == "" {
+		return "unranked_as"
+	}
+	return "unranked_as:" + name
+}
+
+// UnrankedAs returns the effective setting for unranked mail.
+func (a Agent) UnrankedAs(name string) string {
+	value := a.Config[UnrankedKey(name)]
+	if value == "" {
+		value = a.Config[UnrankedKey("")]
+	}
+	switch value {
+	case "p1", "p3":
+		return value
+	default:
+		return "immediate"
+	}
+}
+
 // Session is one running conversation of an agent, such as one open Claude
 // Code window. All sessions of an agent share its name and token.
 type Session struct {
@@ -188,6 +210,8 @@ type Message struct {
 	ToSession   string `json:"to_session,omitempty"`
 	Content     string `json:"content"`
 	Priority    string `json:"priority,omitempty"`
+	// Defaulted reports on a send result that the recipient set the priority.
+	Defaulted bool `json:"defaulted,omitempty"`
 	// ContentBytes gives the full body size when a positioned claim uses a P3 pointer.
 	ContentBytes int               `json:"content_bytes,omitempty"`
 	Meta         map[string]string `json:"meta,omitempty"`

@@ -693,14 +693,27 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 		Status:      StatusQueued,
 		CreatedAt:   b.now().UTC(),
 	}
-	// Stored with the message, so a notice can't also tell the sender.
-	if m.ToSession != "" && to.Delivery == DeliveryPull && b.stopped(ctx, to.Name, m.ToSession) {
-		m.Held = RecipientSessionEnded
+	var targetName string
+	if m.ToSession != "" && (to.Delivery == DeliveryPull || m.Priority == "") {
+		session, stopped := b.sessionAtSend(ctx, to.Name, m.ToSession)
+		targetName = session.Name
+		// Stored with the message, so a notice can't also tell the sender.
+		if stopped && to.Delivery == DeliveryPull {
+			m.Held = RecipientSessionEnded
+		}
 	}
-	if err := b.saveSend(ctx, &m, parent); err != nil {
+	unranked := to.UnrankedAs(targetName)
+	if err := b.saveSend(ctx, &m, parent, unranked); err != nil {
 		return Message{}, err
 	}
 	m.Note = b.deliveryNote(ctx, to, m)
+	if m.Defaulted {
+		setting := unranked + " by the recipient's setting for unranked mail"
+		if m.Priority != unranked {
+			setting += ", raised to " + m.Priority + " for a first reply or question"
+		}
+		m.Note = setting + "; " + m.Note
+	}
 	if len(others) > 0 {
 		m.OtherSessions = others
 		m.Note += "; " + othersNote(to, name, others)
@@ -720,10 +733,14 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 }
 
 // Serialize the first-reply check with the insert and the existing replied mark.
-func (b *Bus) saveSend(ctx context.Context, m *Message, parent Message) error {
+func (b *Bus) saveSend(ctx context.Context, m *Message, parent Message, unranked string) error {
 	if parent.ID != "" {
 		b.replyMu.Lock()
 		defer b.replyMu.Unlock()
+	}
+	// The web app sends as "me". Personal messages and notices stay unranked.
+	if m.Priority == "" && m.From != "me" && !IsSystemSender(m.From) && (unranked == "p1" || unranked == "p3") {
+		m.Priority, m.Defaulted = unranked, true
 	}
 	if m.Priority == "p3" {
 		firstReply := false
@@ -1029,21 +1046,20 @@ func (b *Bus) admit(ctx context.Context, from, to, fromSession, toSession, prior
 	return nil
 }
 
-// stopped reports whether agent's session id has stopped: it closed, or,
-// once the bus has listened long enough to tell (see quiet), it went silent
-// or was never heard from.
-func (b *Bus) stopped(ctx context.Context, agent, id string) bool {
+// sessionAtSend looks up a pinned session and reports whether it has stopped.
+// After the initial listening window, a silent or unknown session counts as stopped.
+func (b *Bus) sessionAtSend(ctx context.Context, agent, id string) (Session, bool) {
 	now := b.now()
 	recent, err := b.store.RecentSessions(ctx, agent, now.Add(-SessionKeep))
 	if err != nil {
-		return false // don't claim it stopped when it can't be told
+		return Session{}, false // don't claim it stopped when it can't be told
 	}
 	for _, s := range recent {
 		if s.ID == id {
-			return !s.EndedAt.IsZero() || (!s.Live(now) && !b.quiet(now))
+			return s, !s.EndedAt.IsZero() || (!s.Live(now) && !b.quiet(now))
 		}
 	}
-	return !b.quiet(now)
+	return Session{}, !b.quiet(now)
 }
 
 // running reports whether agent's session id is running.

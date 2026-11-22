@@ -320,6 +320,16 @@ func session(ctx context.Context, args []string) error {
 			fmt.Printf("%s: a message addressed to %s alone needs a session's address (birdie session list shows them), unless you chose a default session with `birdie session default`\n", a.DisplayName(), agent)
 		}
 		return nil
+	}, func(addr bus.Address, value string) error {
+		if err := st.SetAgentConfig(ctx, addr.Agent, bus.UnrankedKey(addr.Session), value); err != nil {
+			return fmt.Errorf("set unranked mail for %q: %w", addr, err)
+		}
+		a, err := st.GetAgent(ctx, addr.Agent)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s: unranked mail is handled as %s\n", addr, a.UnrankedAs(addr.Session))
+		return nil
 	}, args)
 }
 
