@@ -130,12 +130,12 @@ so there a wait runs until its timeout.
 
 - At gateway startup, birdie gives adapters time to connect, then restores
   saved messaging conversations on connected adapters without updating
-  their last activity. A new turn is needed if the adapter missed that
-  check, in CLI, TUI or Desktop, for conversations that never had a turn,
-  or after wiping the plugin state.
-- If Hermes changes a conversation's session ID and a pushed turn carries no
-  route, birdie can't confirm that push. It goes back to the inbox after ten
-  minutes if no matching turn shows it.
+  their last activity. Late adapters get another check when they reconnect.
+  Saved conversations expire after 30 days. A route-less turn can find its
+  conversation by its saved ID or a unique pending push frame. Unshown
+  pushes return to the inbox after ten minutes.
+- CLI, TUI and Desktop sessions, conversations that never had a turn while
+  waking was on, and conversations whose plugin state was wiped need a new turn.
 - Before Hermes 0.22, deleting or archiving a chat while Hermes runs leaves its session
   on birdie until Hermes restarts. Newer builds end it straight away. Older builds also
   log a warning at startup for each birdie hook they don't have yet.

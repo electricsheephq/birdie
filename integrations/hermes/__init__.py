@@ -61,6 +61,7 @@ NOT_SESSIONS = {"subagent", "cron", "api", "api_server", "kanban", "webhook", "m
 WAKE_SURFACES = {"cli", "tui", "desktop", "telegram", "discord", "slack", "whatsapp", "signal", "matrix"}
 MESSAGING_SURFACES = WAKE_SURFACES - {"cli", "tui", "desktop"}
 RESTART_STATE = "conversations"
+RESTART_MAX_AGE = 30 * 86400
 RESTORE_WAIT_SECONDS = 180
 RESTORE_POLL_SECONDS = 1
 RESTORE_SETTLE_SECONDS = 20
@@ -254,6 +255,11 @@ def turn_text(user_message):
 # The whole opening tag frame() and push_frame() write. Content can't contain one
 # (frame cleans it), so a message that only mentions another one's id doesn't match.
 SHOWN = re.compile(r'<' + TAG + r' from="(?:[^"\\]|\\.)*" message_id="([^"\\]+)" thread_id="((?:[^"\\]|\\.)*)">')
+SHOWN_FRAME = re.compile(SHOWN.pattern + rf".*?</{TAG}>", re.S)
+
+
+def frame_fingerprint(text):
+    return hashlib.sha256(text.split(f"</{TAG}>", 1)[0].encode()).hexdigest()
 
 
 def shown_ids(text):
@@ -275,6 +281,7 @@ class Conversation:
         self.is_session = is_session
         self.route = ""
         self.restart_record = None
+        self.restored = False
         self.wake = False
         # Someone made this session pull-only (birdie session pull-only), as the
         # bus said when it last reported: nothing is pushed in.
@@ -349,9 +356,10 @@ class Network:
         self.agent = config["agent"]
         self.bus = Bus(config["url"])
         self.digest_seconds = digest_seconds(config)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.conversations = {}
         self.sessions = {}  # Hermes session id -> conversation id
+        self.state_scope = copy_context()  # Pollers also write state for this profile.
         self.closed = threading.Event()
         self.beat = None
         self.restore_thread = None
@@ -422,7 +430,7 @@ class Network:
             return False
         return surface in WAKE_SURFACES and bool(conversation.route or surface == "cli")
 
-    def conversation(self, session_id, platform=None, parent="", *, create=True):
+    def conversation(self, session_id, platform=None, parent="", *, create=True, text=""):
         if not session_id:
             raise BusError("birdie needs an active Hermes conversation")
         with self.lock:
@@ -431,13 +439,19 @@ class Network:
             return known
         is_session = platform is not None and not parent and platform not in NOT_SESSIONS
         route = self.route() if is_session else ""
-        record = known.restart_record if known else None
-        if is_session and not route and record and platform == record["surface"]:
-            # Injected turns can lack the route. The saved session id still ties this one to it.
-            return known
         key = f"{self.optional('profile_name') or getattr(self.ctx, 'profile_name', '') or 'default'}:{route or session_id}"
         ident = "hermes-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         with self.lock:
+            if create and is_session and not route and platform in MESSAGING_SURFACES:
+                known = self.conversations.get(self.sessions.get(session_id))
+                if known and known.restart_record and known.restart_record["surface"] == platform:
+                    return known
+                if known is None:
+                    if (restored := self.restore(False, only_session=session_id, platform=platform)) is not None:
+                        return restored
+                    if (matched := self.match_restored(platform, text)) is not None:
+                        self.sessions.pop(matched.restart_record["session_id"], None)
+                        ident = matched.id
             conversation = self.conversations.get(ident)
             if conversation is None:
                 if not create:
@@ -447,6 +461,8 @@ class Network:
             self.sessions[session_id] = ident
             if route:
                 conversation.route = route
+            if conversation.restart_record:
+                self.update_record(conversation, session_id=session_id)
             return conversation
 
     @staticmethod
@@ -455,7 +471,7 @@ class Network:
 
     def saved_conversations(self):
         try:
-            records = self.ctx.state.get(RESTART_STATE, {})
+            records = self.state_scope.copy().run(lambda: self.ctx.state.get(RESTART_STATE, {}))
             if isinstance(records, dict):
                 return records
             raise ValueError("expected a conversation map")
@@ -465,7 +481,7 @@ class Network:
 
     def write_saved_conversations(self, records):
         try:
-            self.ctx.state.set(RESTART_STATE, records)
+            self.state_scope.copy().run(lambda: self.ctx.state.set(RESTART_STATE, records))
             return True
         except Exception:
             log.debug("birdie: couldn't write saved conversations", exc_info=True)
@@ -473,25 +489,56 @@ class Network:
 
     def save_conversation(self, conversation, session_id, surface):
         with self.lock:
-            if self.closed.is_set() or conversation.closed.is_set():
-                return
             conversation.cwd = self.cwd()
             conversation.name = self.name(conversation.cwd)
-            record = {"id": conversation.id, "route": conversation.route, "session_id": session_id,
-                      "name": conversation.name, "cwd": conversation.cwd, "surface": surface}
-            if conversation.restart_record == record:
+            self.update_record(conversation, id=conversation.id, route=conversation.route, session_id=session_id,
+                               name=conversation.name, cwd=conversation.cwd, surface=surface)
+
+    def update_record(self, conversation, **changes):
+        # The caller holds the Network lock, including across the state read and write.
+        record = {**(conversation.restart_record or {}), **changes}
+        if self.closed.is_set() or conversation.closed.is_set() or conversation.restart_record == record:
+            return
+        records = self.saved_conversations()
+        record = {**record, "saved_at": time.time()}
+        if records is not None and self.write_saved_conversations({**records, conversation.id: record}):
+            conversation.restart_record = record
+
+    def save_pending(self, conversation, accepted=(), *, taken=()):
+        with self.lock, conversation.lock:
+            for message in taken:
+                conversation.pending.pop(message["id"], None)
+            record = conversation.restart_record
+            if record is None:
                 return
-            records = self.saved_conversations()
-            if records is not None and (records.get(conversation.id) == record
-                                        or self.write_saved_conversations({**records, conversation.id: record})):
-                conversation.restart_record = record
+            pending = {ident: saved for ident, saved in record.get("pending", {}).items()
+                       if ident in conversation.pending}
+            for message in accepted:
+                ident = message["id"]
+                if ident in conversation.pending:
+                    _, deadline = conversation.pending[ident]
+                    pending[ident] = (time.time() + (deadline - time.monotonic()),
+                                      frame_fingerprint(push_frame(message)), message.get("lease_until", 0))
+            if pending != record.get("pending", {}):
+                self.update_record(conversation, pending=pending)
+
+    def match_restored(self, surface, text):
+        frames = {(m[1], frame_fingerprint(m[0])) for m in SHOWN_FRAME.finditer(text)}
+        matches = []
+        for c in self.conversations.values() if frames else ():
+            if c.restored and c.restart_record and c.restart_record["surface"] == surface:
+                with c.lock:
+                    if any((ident, m.get("_frame") or frame_fingerprint(push_frame(m))) in frames
+                           for ident, (m, _) in c.pending.items()):
+                        matches.append(c)
+        return matches[0] if len(matches) == 1 else None
 
     def injector_ready(self):
         return getattr(getattr(self.ctx, "_manager", None), "has_gateway_message_injector", False)
 
     def start_restore(self, *_, settle=True):
         with self.restore_lock:
-            if self.restore_thread is not None or self.closed.is_set():
+            if (self.restore_thread is not None and self.restore_thread.is_alive()) or self.closed.is_set():
                 return
             # PluginState resolves its home in the calling context.
             self.restore_thread = threading.Thread(target=copy_context().run, args=(self.restore, settle),
@@ -510,46 +557,72 @@ class Network:
                     if adapter.is_connected}
         return None
 
-    def restore(self, settle):
+    def restore(self, settle, *, only_session="", platform=""):
         deadline = time.monotonic() + RESTORE_WAIT_SECONDS
-        while not self.injector_ready():
+        while not only_session and not self.injector_ready():
             remaining = deadline - time.monotonic()
             if remaining <= 0 or self.closed.wait(min(remaining, RESTORE_POLL_SECONDS)):
+                if remaining <= 0:
+                    log.info("birdie: restored 0 conversation(s); injector did not become ready")
                 return
-        if (settle and self.closed.wait(RESTORE_SETTLE_SECONDS)) or self.closed.is_set() or not self.injector_ready():
+        if not only_session and ((settle and self.closed.wait(RESTORE_SETTLE_SECONDS)) or not self.injector_ready()):
             return
-        surfaces = self.connected_surfaces()
+        surfaces = {platform} if only_session else self.connected_surfaces()
         with self.lock:
             if self.closed.is_set():
                 return
+            stamp = time.time()
+            records = self.saved_conversations() or {}
+            recent = {ident: {"saved_at": stamp, **r} if isinstance(r, dict) else r for ident, r in records.items()
+                      if ident in self.conversations or not isinstance(r, dict)
+                      or r.get("saved_at", stamp) >= stamp - RESTART_MAX_AGE}
+            if recent != records:
+                self.write_saved_conversations(recent)
             restored = []
-            for ident, record in (self.saved_conversations() or {}).items():
-                if self.closed.is_set():
-                    return
+            skipped = 0
+            for ident, record in recent.items():
                 if not isinstance(record, dict) or record.get("id") != ident or any(
                     not isinstance(record.get(field), str) or not record[field]
                     for field in ("route", "session_id", "name", "cwd", "surface")
                 ):
                     continue
                 surface, session_id = record["surface"], record["session_id"]
-                if (surface not in MESSAGING_SURFACES or (surfaces is not None and surface not in surfaces)
+                if (surface not in MESSAGING_SURFACES or (only_session and session_id != only_session)
                         or ident in self.conversations or session_id in self.sessions):
+                    continue
+                if surfaces is not None and surface not in surfaces:
+                    skipped += 1
                     continue
                 conversation = Conversation(ident, record["name"], record["cwd"], True)
                 conversation.route = record["route"]
                 conversation.restart_record = record
+                conversation.restored = True
                 conversation.wake = self.can_wake(conversation, surface)
                 conversation.active_at = RESTORED_ACTIVE_AT
+                # Only metadata crosses a restart. Reclaiming supplies the message again.
+                offset = time.monotonic() - stamp
+                for mid, (deadline, fingerprint, lease) in record.get("pending", {}).items():
+                    stub = {"id": mid, "_frame": fingerprint, "lease_until": lease, "thread_id": None}
+                    conversation.pending[mid] = (stub, deadline + offset)
                 self.sees_turn_text = True
                 self.conversations[ident] = conversation
                 self.sessions[session_id] = ident
+                if only_session:
+                    log.info("birdie: restored 1 conversation(s) on an early turn")
+                    return conversation
                 restored.append(conversation)
+        if only_session:
+            return
+        failed = 0
         for conversation in restored:
             try:
                 self.report(conversation)
             except BusError as err:
+                failed += 1
                 log.debug("birdie: couldn't report a restored session: %s", err)
             self.start_threads(conversation)
+        log.info("birdie: restored %d conversation(s) after restart; %d skipped (adapter not connected); "
+                 "%d bus report(s) failed", len(restored), skipped, failed)
 
     def report(self, conversation):
         if conversation.closed.is_set() or self.closed.is_set():
@@ -598,7 +671,8 @@ class Network:
             text = turn_text(kwargs.get("user_message"))
             keep_warm = is_keep_warm(text)
             # A keep-warm ping alone mustn't register an active session.
-            conversation = self.conversation(session_id, platform or "", parent_session_id, create=not keep_warm)
+            conversation = self.conversation(session_id, platform or "", parent_session_id,
+                                             create=not keep_warm, text=text)
             if "user_message" in kwargs:
                 self.sees_turn_text = True
             if keep_warm:
@@ -645,6 +719,7 @@ class Network:
                     folded.append(entry[0])
                 conversation.expired.pop(ident, None)
         self.give_back(folded, timeout=CONFIRM_SECONDS)
+        self.save_pending(conversation)
 
     def after_turn(self, session_id="", turn_id="", **_):
         with self.lock:
@@ -660,6 +735,9 @@ class Network:
             ident = self.sessions.pop(old_session_id, None)
             if ident and session_id:
                 self.sessions[session_id] = ident
+                conversation = self.conversations[ident]
+                if conversation.restart_record:
+                    self.update_record(conversation, session_id=session_id)
 
     def finalize(self, session_id="", old_session_id="", reason="", **_):
         self.forget([old_session_id or session_id], restarting=reason == "shutdown")
@@ -681,8 +759,10 @@ class Network:
                                and conversation.restart_record is None}
             records = self.saved_conversations() if session_ids and not restarting else None
             if records:
+                mapped = {self.sessions.get(sid) for sid in session_ids}
                 remaining = {ident: record for ident, record in records.items()
-                             if not isinstance(record, dict) or record.get("session_id") not in session_ids}
+                             if ident not in mapped
+                             and (not isinstance(record, dict) or record.get("session_id") not in session_ids)}
                 if remaining != records and self.write_saved_conversations(remaining):
                     for ident in records.keys() - remaining.keys():
                         conversation = self.conversations.get(ident)
@@ -888,6 +968,7 @@ class Network:
                 except Exception:
                     log.warning("birdie: Hermes refused a message", exc_info=True)
             if accepted and reserved:
+                self.save_pending(conversation, ready)
                 return
             if accepted:
                 with conversation.lock:
@@ -941,7 +1022,7 @@ class Network:
             ours = [ident for ident in new if ident in conversation.pending or ident in conversation.expired]
             for ident in ours:
                 entry = conversation.pending.pop(ident, None)
-                if entry is not None:
+                if entry is not None and "_frame" not in entry[0]:
                     conversation.shown.setdefault(entry[0].get("thread_id", ""), []).append(entry[0])
                 # An expired mark is kept through a new push, which Hermes may refuse,
                 # and cleared once a turn shows the message.
@@ -964,6 +1045,7 @@ class Network:
                 # Stopping here keeps a hung bus from holding the turn for each one.
                 log.debug("birdie: confirm: %s", err)
                 break
+        self.save_pending(conversation)
 
     def shows_in_full(self, conversation, text, ident, thread):
         """Whether a turn's text holds the whole frame of a message for this
@@ -999,6 +1081,7 @@ class Network:
         log.warning("birdie: Hermes accepted %d pushed message(s) that no turn showed in %d s; "
                     "they're back in the inbox", len(late), PENDING_SECONDS)
         self.give_back(late)
+        self.save_pending(conversation)
         try:
             self.report(conversation)
         except BusError as err:
@@ -1015,6 +1098,7 @@ class Network:
             if messages:
                 for message in messages:
                     self.bus.ack(message["id"])
+                self.save_pending(conversation, taken=messages)
                 return messages
             if time.monotonic() >= deadline:
                 return []
@@ -1040,6 +1124,7 @@ class Network:
                     self.bus.ack(message["id"])
                 except BusError as err:
                     log.debug("birdie: confirm: %s", err)  # it comes back and is confirmed then
+            self.save_pending(conversation)
             return shown + pushed, True
         try:
             try:
@@ -1068,6 +1153,7 @@ class Network:
                     if conversation.mark_delivered(message["id"]):
                         fresh.append(message)
                     self.confirm_delivery(message["id"])
+                self.save_pending(conversation, taken=messages)
                 if fresh:
                     return fresh, False
             return [], False
@@ -1145,6 +1231,7 @@ class Network:
                         conversation.remember(ident)
                         messages.append(message)
                 self.confirm_delivery(ident)
+            self.save_pending(conversation)
         else:
             wait = max(0, min(float(args.get("wait_seconds") or 0), MAX_CHECK_SECONDS))
             messages = self.take(conversation, wait)
