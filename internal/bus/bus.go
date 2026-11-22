@@ -189,18 +189,23 @@ func (b *Bus) listAgents(ctx context.Context, recent bool) ([]Agent, error) {
 		if err != nil {
 			return nil, err
 		}
+		unpinned := queued[[2]string{agents[i].Name, ""}]
 		for _, s := range sessions {
 			s.Held = queued[[2]string{s.Agent, s.ID}]
 			if s.Default {
-				s.Held += queued[[2]string{s.Agent, ""}]
+				s.Held += unpinned
+				unpinned = 0
 			}
-			s.Running = s.Live(now)
 			if !recent && !s.Running && s.Held == 0 {
 				continue
 			}
-			s.Warm = s.cacheWarm(now)
+			s.Warm = s.Running && s.cacheWarm(now)
 			s.DeliveryNote = sessionDeliveryNote(s, now)
 			agents[i].Sessions = append(agents[i].Sessions, s)
+		}
+		if unpinned > 0 {
+			agents[i].Held = unpinned
+			agents[i].DeliveryNote = fmt.Sprintf("%s: %d held for its next session", agents[i].Name, unpinned)
 		}
 	}
 	return agents, nil
@@ -251,7 +256,8 @@ func (b *Bus) recentSessions(ctx context.Context, a Agent, now, since time.Time)
 	}
 	var live, stopped []Session
 	for _, s := range all {
-		if s.Live(now) {
+		s.Running = s.Live(now)
+		if s.Running {
 			live = append(live, s)
 		} else {
 			stopped = append(stopped, s)
@@ -696,6 +702,7 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 			joins = false
 		}
 	}
+	pinnedForSetting := toSession != ""
 	if toSession == "" && !joins && to.Delivery == DeliveryPull && !PicksSession(to) {
 		s, more, err := b.chosenSession(ctx, to)
 		if err != nil {
@@ -728,7 +735,9 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	var targetName string
 	if m.ToSession != "" && (to.Delivery == DeliveryPull || m.Priority == "") {
 		session, stopped := b.sessionAtSend(ctx, to.Name, m.ToSession)
-		targetName = session.Name
+		if pinnedForSetting {
+			targetName = session.Name
+		}
 		// Stored with the message, so a notice can't also tell the sender.
 		if stopped && to.Delivery == DeliveryPull {
 			m.Held = RecipientSessionEnded
@@ -742,7 +751,7 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	if m.Defaulted {
 		setting := unranked + " by the recipient's setting for unranked mail"
 		if m.Priority != unranked {
-			setting += ", raised to " + m.Priority + " for a first reply or question"
+			setting += ", raised to " + m.Priority + " for a reply to its own message or a question"
 		}
 		m.Note = setting + "; " + m.Note
 	}
@@ -775,15 +784,18 @@ func (b *Bus) saveSend(ctx context.Context, m *Message, parent Message, unranked
 		m.Priority, m.Defaulted = unranked, true
 	}
 	if m.Priority == "p3" {
-		firstReply := false
+		liftReply := false
 		if parent.ID != "" && parent.From == m.To && m.ToSession != "" && parent.FromSession == m.ToSession {
-			current, err := b.store.GetMessage(ctx, parent.ID)
-			if err != nil {
-				return err
+			liftReply = m.Defaulted
+			if !liftReply {
+				current, err := b.store.GetMessage(ctx, parent.ID)
+				if err != nil {
+					return err
+				}
+				liftReply = current.Status != StatusReplied
 			}
-			firstReply = current.Status != StatusReplied
 		}
-		if firstReply || AsksQuestions(*m) {
+		if liftReply || AsksQuestions(*m) {
 			m.Priority = "p1"
 		}
 	}
@@ -1153,6 +1165,24 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) (note, cost
 		if cost == "" && m.Priority != "p3" && at != Midturn {
 			cost = "wakes_cold"
 		}
+		if at != "" && (m.Priority == "p3" || (at == Midturn && m.Priority == "p1")) {
+			f := ClaimFilter{Agent: to.Name, Session: target.ID, Unpinned: target.Default, At: at, Digest: position.digest}
+			open, err := b.store.InboxAllowsHeld(ctx, f, now)
+			if err != nil {
+				return "queued", ""
+			}
+			if open {
+				if at == Boundary && target.ActiveAt.UnixMilli() <= now.Add(-CacheIdle).UnixMilli() {
+					return "goes now; it has been idle over 50 minutes, so this starts its next turn", "wakes_cold"
+				}
+				if target.cacheWarm(now) {
+					cost = "warm"
+				} else if at != Midturn {
+					cost = "wakes_cold"
+				}
+				return "goes now; it can go with the next batch", cost
+			}
+		}
 		if at == Turn {
 			switch m.Priority {
 			case "p0":
@@ -1170,7 +1200,7 @@ func (b *Bus) deliveryNote(ctx context.Context, to Agent, m Message) (note, cost
 			case m.Priority == "p0":
 				return "p0: offered after a short batching window; its host may hold peer messages for its user first", cost
 			case m.Priority == "p1" && at == Midturn:
-				return "held: sees this when its turn ends", "held"
+				return "held: sees this when its turn ends, or during a long turn after about 40 minutes", "held"
 			case m.Priority == "p3":
 				return "held: goes in its next digest, within about 20 minutes (up to 40 in a long turn)", "held"
 			}

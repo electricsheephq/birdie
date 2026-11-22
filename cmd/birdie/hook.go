@@ -125,12 +125,12 @@ func sessionCmd(ctx context.Context, b *bus.Bus, setDefault func(agent, name str
 		}
 		return setFallback(args[1], value)
 	case "unranked":
-		usage := errors.New("usage: birdie session unranked AGENT[/NAME] [immediate|p1|p3] (omit the value to clear the setting)")
+		usage := errors.New("usage: birdie session unranked AGENT[/NAME] [immediate|p1|p3] (also accepts a session address from birdie session list; omit the value to clear)")
 		if len(args) < 2 || len(args) > 3 {
 			return usage
 		}
 		addr, err := bus.ParseAddress(args[1])
-		if err != nil || !bus.ValidName(addr.Agent) || addr.ID != "" || addr.Node != "" {
+		if err != nil || !bus.ValidName(addr.Agent) || addr.Node != "" {
 			return usage
 		}
 		value := ""

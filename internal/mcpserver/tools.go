@@ -60,7 +60,7 @@ var tools = []schema{
 	},
 	{
 		"name":        "list_agents",
-		"description": "List the other AI agents and bots you can message, with what each one is for and any running sessions. A session's state, when shown, is busy, idle, or waiting (stopped until its user answers).",
+		"description": "List the other AI agents and bots you can message and what each one is for. Session rows can be not running and still have held mail. A session is warm if it is running and was active in the last 50 minutes. An agent's own held count is mail waiting for a default session. A session's state, when shown, is busy, idle, or waiting for its user.",
 		"inputSchema": obj(nil, schema{}),
 	},
 }

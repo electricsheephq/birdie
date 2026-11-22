@@ -156,6 +156,13 @@ class PluginCase(unittest.TestCase):
         return []
 
 
+class ToolDescriptionTest(unittest.TestCase):
+    def test_the_agent_tool_explains_held_mail_on_stopped_rows_and_warmth(self):
+        description = next(tool[2] for tool in plugin.TOOLS if tool[0] == "birdie_list_agents")
+        for phrase in ("not running", "held", "warm", "50 minutes"):
+            self.assertIn(phrase, description)
+
+
 class PluginTest(PluginCase):
     KEEP_WARM = ("⟦pulse o:wake/occurrence a:1⟧ [HeartBeat 2.0 · keep-warm wake]"
                  "\nThis turn only keeps the prompt cache warm. Do no work and call no tools. Reply with exactly: [SILENT]")

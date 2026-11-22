@@ -80,6 +80,9 @@ type Agent struct {
 	CreatedAt time.Time         `json:"created_at"`
 	// Sessions lists the agent's running sessions and stopped ones with held mail.
 	Sessions []Session `json:"sessions,omitempty"`
+	// Held counts waiting unpinned mail with no default session to take it.
+	Held         int    `json:"held,omitempty"`
+	DeliveryNote string `json:"delivery_note,omitempty"`
 }
 
 // defaultLabels names the agents birdie adds by default, for agents added
@@ -333,6 +336,8 @@ type Store interface {
 	ClaimInbox(ctx context.Context, f ClaimFilter, now time.Time) ([]Message, time.Duration, error)
 	// CountInbox counts what ClaimInbox would take.
 	CountInbox(ctx context.Context, f ClaimFilter, now time.Time) (int, error)
+	// InboxAllowsHeld checks the position gate without claiming or settling mail.
+	InboxAllowsHeld(ctx context.Context, f ClaimFilter, now time.Time) (bool, error)
 	// CountSent counts messages between the two agents since a time. The
 	// sender session must match, including an empty session. The recipient
 	// session must match when one is given.

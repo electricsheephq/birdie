@@ -411,9 +411,10 @@ birdie hook  grok post-tool-use|stop --as NAME
 
 Use `birdie session unranked` to choose the priority of incoming agent
 messages sent without one. The default is `immediate`. A session-name setting
-overrides its agent's setting. Omit the value to clear the setting, or set
-`immediate` on a session to keep its mail unranked even if its agent uses p1
-or p3.
+applies to mail pinned to that session. Mail addressed to the agent alone uses
+the agent-wide setting. Pass an address from `birdie session list` to select its
+name and see every recent session it covers. Omit the value to clear the setting,
+or use `immediate` to keep a session's mail unranked even if its agent uses p1 or p3.
 
 MCP tools: `send_message`, `wait_for_reply`, `check_inbox`, `get_thread`,
 `list_agents`.

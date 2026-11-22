@@ -118,6 +118,83 @@ func TestTheAgentListingOmitsAnEndedSessionOutsideTheHold(t *testing.T) {
 	}
 }
 
+func TestUnpinnedMailStaysVisibleUntilARunningDefaultCanTakeIt(t *testing.T) {
+	api, b := priorityAPI(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	b.Now = func() time.Time { return now }
+	if err := b.ReportSession(ctx, "bob", "desk", bus.SessionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, to := range []string{"bob", "bob", "bob/desk"} {
+		if _, err := b.Send(ctx, "alice", bus.SendInput{To: to, Content: "update"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		session                string
+		agentHeld, sessionHeld int
+	}{
+		{"desk", 0, 3},
+		{"desk", 2, 1},
+		{"new", 0, 2},
+	} {
+		var data struct {
+			Agents []struct {
+				Name string
+				Note string `json:"delivery_note"`
+				Held int
+			}
+		}
+		senderSignalRequest(t, api, http.MethodGet, "/v1/agents", "", http.StatusOK, &data)
+		for _, a := range data.Agents {
+			if a.Name != "bob" {
+				continue
+			}
+			if a.Held != tc.agentHeld || (tc.agentHeld > 0 && a.Note != "bob: 2 held for its next session") {
+				t.Errorf("agent held = %d, note = %q; want %d held", a.Held, a.Note, tc.agentHeld)
+			}
+		}
+		if s := bobSessions(t, api)[tc.session]; s["held"] != float64(tc.sessionHeld) {
+			t.Errorf("session %s = %v; want %d held", tc.session, s, tc.sessionHeld)
+		}
+		switch tc.sessionHeld {
+		case 3:
+			now = now.Add(bus.SessionTTL + time.Millisecond)
+		case 1:
+			if err := b.ReportSession(ctx, "bob", "new", bus.SessionInput{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestAStoppedSessionWithHeldMailIsNeverWarm(t *testing.T) {
+	api, b := priorityAPI(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	b.Now = func() time.Time { return now }
+	for _, id := range []string{"ended", "lapsed"} {
+		if err := b.ReportSession(ctx, "bob", id, bus.SessionInput{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Send(ctx, "alice", bus.SendInput{To: "bob/" + id, Content: "update"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.EndSession(ctx, "bob", "ended"); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(bus.SessionTTL + time.Millisecond)
+	sessions := bobSessions(t, api)
+	for _, id := range []string{"ended", "lapsed"} {
+		s := sessions[id]
+		if s["warm"] != false || s["live"] != false || s["held"] != float64(1) {
+			t.Errorf("%s = %v", id, s)
+		}
+	}
+}
+
 func TestTheSendResultReportsTheCostOfDelivery(t *testing.T) {
 	for _, tc := range []struct {
 		name, priority, at, cost string

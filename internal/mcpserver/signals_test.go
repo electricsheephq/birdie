@@ -54,3 +54,19 @@ func TestTheSendToolReturnsTheDeliveryCost(t *testing.T) {
 		t.Fatalf("send_message = %v", got)
 	}
 }
+
+func TestTheAgentToolExplainsHeldMailOnStoppedRowsAndWarmth(t *testing.T) {
+	s, _ := setup(t, false)
+	tools := s.call("tools/list", map[string]any{})["tools"].([]any)
+	for _, item := range tools {
+		tool := item.(map[string]any)
+		if tool["name"] == "list_agents" {
+			desc := tool["description"].(string)
+			if !strings.Contains(desc, "not running") || !strings.Contains(desc, "held") || !strings.Contains(desc, "warm") || !strings.Contains(desc, "50 minutes") {
+				t.Errorf("list_agents description = %q", desc)
+			}
+			return
+		}
+	}
+	t.Fatal("list_agents is missing")
+}

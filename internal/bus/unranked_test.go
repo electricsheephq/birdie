@@ -53,7 +53,7 @@ func TestASessionNameOverrideWinsWithoutChangingOtherSessions(t *testing.T) {
 	}
 	for _, tc := range []struct{ to, want string }{
 		{"claude/api", "p3"}, {"claude/s1", "p3"}, {"claude/api#s1", "p3"},
-		{"claude", "p3"}, {"claude/web", ""}, {"claude/other", "p1"},
+		{"claude", "p1"}, {"claude/web", ""}, {"claude/other", "p1"},
 	} {
 		m, err := b.Send(ctx, "alice", bus.SendInput{To: tc.to, Content: "update"})
 		if err != nil || m.Priority != tc.want {
@@ -112,12 +112,61 @@ func TestTheP3FloorLiftsAnUnrankedFirstReplyAndQuestionsToP1(t *testing.T) {
 		want string
 	}{
 		{bus.SendInput{InReplyTo: parent.ID, Content: "answer"}, "p1"},
-		{bus.SendInput{InReplyTo: parent.ID, Content: "follow-up"}, "p3"},
+		{bus.SendInput{InReplyTo: parent.ID, Content: "follow-up", Priority: "p3"}, "p3"},
 		{bus.SendInput{To: "bob/work", Content: bus.ClarifyMarker + " Which option?"}, "p1"},
 	} {
 		m, err := b.Send(ctx, "alice", tc.in)
 		if err != nil || m.Priority != tc.want {
 			t.Errorf("%q: priority = %q, %v, want %q", tc.in.Content, m.Priority, err, tc.want)
+		}
+	}
+}
+
+func TestBothAnUnrankedAckAndAnswerToTheRecipientsRequestAreLiftedToP1(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "alice", nil)
+	addAgent(t, st, "bob", nil)
+	if err := st.SetAgentConfig(ctx, "bob", "unranked_as", "p3"); err != nil {
+		t.Fatal(err)
+	}
+	report(t, b, "bob", "desk", "work", bus.TierPush, time.Now())
+	for _, priority := range []string{"", "p3"} {
+		parent, err := b.Send(ctx, "bob", bus.SendInput{To: "alice", FromSession: "desk", Content: "request"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct{ content, sent, want string }{
+			{"ack", "", "p1"}, {"answer", priority, "p1"},
+		} {
+			if tc.sent == "p3" {
+				tc.want = "p3"
+			}
+			m, err := b.Send(ctx, "alice", bus.SendInput{InReplyTo: parent.ID, Priority: tc.sent, Content: tc.content})
+			if err != nil || m.Priority != tc.want || m.Defaulted != (tc.sent == "") {
+				t.Errorf("%s (sent %q): priority = %q, defaulted = %t, err = %v; want %q", tc.content, tc.sent, m.Priority, m.Defaulted, err, tc.want)
+			}
+			if tc.content == "answer" && tc.sent == "" && !strings.Contains(m.Note, "reply to its own message") {
+				t.Errorf("answer note = %q", m.Note)
+			}
+		}
+	}
+}
+
+func TestMailAddressedToTheAgentUsesItsSettingEvenWithAChosenSession(t *testing.T) {
+	ctx := context.Background()
+	b, st := newBus(t)
+	addAgent(t, st, "claude", nil)
+	for key, value := range map[string]string{"unranked_as": "p1", "unranked_as:api": "p3", "default_session": "api"} {
+		if err := st.SetAgentConfig(ctx, "claude", key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
+	for _, tc := range []struct{ to, want string }{{"claude", "p1"}, {"claude/api", "p3"}} {
+		m, err := b.Send(ctx, "alice", bus.SendInput{To: tc.to, Content: "update"})
+		if err != nil || m.Priority != tc.want || m.ToSession != "s1" {
+			t.Errorf("send to %s: priority = %q, session = %q, err = %v; want %q to s1", tc.to, m.Priority, m.ToSession, err, tc.want)
 		}
 	}
 }

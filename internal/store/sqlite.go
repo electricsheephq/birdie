@@ -757,6 +757,17 @@ type withName struct {
 
 func (w withName) Scan(dest ...any) error { return w.r.Scan(append(dest, w.name)...) }
 
+func (s *SQLite) InboxAllowsHeld(ctx context.Context, f bus.ClaimFilter, now time.Time) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	where, args := inboxWhere(f, now)
+	gate, _, err := positionGate(ctx, tx, f, where, args, now)
+	return gate == "", err
+}
+
 func (s *SQLite) CountInbox(ctx context.Context, f bus.ClaimFilter, now time.Time) (int, error) {
 	where, args := inboxWhere(f, now)
 	var n int

@@ -177,12 +177,6 @@ func TestBoundaryAndMidturnClaimsIgnoreDigestSeconds(t *testing.T) {
 }
 
 func TestSendersSeeDigestTimingForEachTurnRecipient(t *testing.T) {
-	d := newDigestInbox(t)
-	active := *d.now
-	d.report(t, "bob", "other", active)
-	d.claim(t, "bob", "desk", "at=turn")
-	d.claim(t, "bob", "other", "at=turn&digest=2400")
-
 	const tentative20 = "held: goes in its next digest (one every 20 minutes) while it is active, otherwise with its next turn (at most 12 hours)"
 	const tentative40 = "held: goes in its next digest (one every 40 minutes) while it is active, otherwise with its next turn (at most 12 hours)"
 	for _, tc := range []struct {
@@ -195,6 +189,11 @@ func TestSendersSeeDigestTimingForEachTurnRecipient(t *testing.T) {
 		{30*time.Minute + time.Millisecond, tentative20, tentative40},
 		{50*time.Minute + time.Millisecond, tentative20, tentative40},
 	} {
+		d := newDigestInbox(t)
+		active := *d.now
+		d.report(t, "bob", "other", active)
+		d.claim(t, "bob", "desk", "at=turn")
+		d.claim(t, "bob", "other", "at=turn&digest=2400")
 		*d.now = active.Add(tc.age)
 		for _, recipient := range []struct{ session, note string }{{"desk", tc.desk}, {"other", tc.other}} {
 			d.report(t, "bob", recipient.session, active)

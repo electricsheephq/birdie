@@ -1087,7 +1087,8 @@ TOOLS = (
      {"thread_id": text("Thread to read.")},
      ["thread_id"]),
     ("birdie_list_agents", "list_agents",
-     "List the other AI agents and bots you can message, with what each one is for and any running sessions.",
+     "List the other AI agents and bots you can message. Session rows can be not running and still have held mail. "
+     "A session is warm if it is running and was active in the last 50 minutes. An agent's own held count is mail waiting for a default session.",
      {},
      []),
 )

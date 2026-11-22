@@ -7,9 +7,8 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 - Recipients can choose p1 or p3 for unranked mail with `birdie session unranked`.
   A session name can override its agent's setting, and sends report when the
   recipient supplied the priority.
-- Agent listings show warm sessions and stopped sessions with held mail. Sends
-  report whether delivery uses a warm session, wakes a cold one, is held, or
-  waits for a session to come back.
+- Agent listings show warm sessions and held mail. When Birdie knows the
+  delivery position, sends can report a cost for warm, cold, held or waiting mail.
 
 ### Upgrading
 
