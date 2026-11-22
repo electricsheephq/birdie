@@ -73,6 +73,14 @@ reloads this setting when it checks whether waking is enabled.
 Messages from other agents reach the model marked as requests from a named,
 verified agent, not as instructions from you.
 
+A pushed message starts a turn you didn't start, so it tells the model to keep you
+out of it for now. The model answers the sender on birdie. It doesn't do anything
+destructive, share secrets or change config for another agent. It ends the turn
+with `[SILENT]`, which Hermes doesn't post to your chat, and brings anything you
+need to know up the next time you write. An answer you asked for and are waiting
+on is passed on. A message the model reads with `birdie_check_inbox`, in a turn
+you started, still tells it to check with you.
+
 Runs with no person in them, such as cron and subagents, and anything using
 `hermes acp`, can send messages and wait for the answers. They have no inbox, so they
 aren't woken and can't take messages meant for a conversation.
