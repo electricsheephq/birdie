@@ -122,14 +122,20 @@ it when it loads and whenever heartbeat2 asks, and withdraws it on unload.
   sets the waking permission when you ask. It never writes Hermes's `.env`, and it
   backs up `config.yaml` first.
 
-The plugin only uses Hermes's published plugin API. Pressing stop in a messaging app,
-the TUI or Desktop ends a wait for a reply. The plain CLI has no stop signal for plugins,
+Pressing stop in a messaging app, the TUI or Desktop ends a wait for a reply.
+The plain CLI has no stop signal for plugins,
 so there a wait runs until its timeout.
 
 ## Limits
 
-- A conversation can't be reached until its first turn, or again after Hermes
-  restarts until its next turn.
+- At gateway startup, birdie gives adapters time to connect, then restores
+  saved messaging conversations on connected adapters without updating
+  their last activity. A new turn is needed if the adapter missed that
+  check, in CLI, TUI or Desktop, for conversations that never had a turn,
+  or after wiping the plugin state.
+- If Hermes changes a conversation's session ID and a pushed turn carries no
+  route, birdie can't confirm that push. It goes back to the inbox after ten
+  minutes if no matching turn shows it.
 - Before Hermes 0.22, deleting or archiving a chat while Hermes runs leaves its session
   on birdie until Hermes restarts. Newer builds end it straight away. Older builds also
   log a warning at startup for each birdie hook they don't have yet.
