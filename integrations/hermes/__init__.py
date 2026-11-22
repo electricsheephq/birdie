@@ -329,7 +329,9 @@ class Conversation:
 
 
 def notifier(bus):
-    """send(target, text) for heartbeat2. It queues a message from this profile's
+    """send(target, text, priority=None) for heartbeat2. priority is p0, p1 or p3; anything
+    else, or none, sends p1, so a notice isn't held by a recipient that holds unranked
+    mail. It queues a message from this profile's
     agent and never raises. ok means the bus accepted the message, not that anyone
     read it. It is a closure, not a bound method, because Hermes's plugin event bus
     deep-copies payloads and keeps functions as they are."""
@@ -449,6 +451,7 @@ class Network:
             if create and is_session and not route and platform in MESSAGING_SURFACES:
                 known = self.conversations.get(self.sessions.get(session_id))
                 if known and known.restart_record and known.restart_record["surface"] == platform:
+                    self.update_record(known)  # a turn keeps the record from ageing out (at most a daily write)
                     return known
                 if known is None:
                     if (restored := self.restore(False, only_session=session_id, platform=platform)) is not None:
@@ -462,6 +465,10 @@ class Network:
                     return None
                 cwd = self.cwd()
                 conversation = self.conversations[ident] = Conversation(ident, self.name(cwd), cwd, is_session)
+            stale = (conversation.restart_record or {}).get("session_id")
+            if stale and stale != session_id and self.sessions.get(stale) == ident:
+                # Hermes moved this route to a new session id: the saved one is gone.
+                self.sessions.pop(stale, None)
             self.sessions[session_id] = ident
             if route:
                 conversation.route = route
@@ -771,11 +778,16 @@ class Network:
                              if ident in live
                              or (ident not in mapped
                                  and (not isinstance(record, dict) or record.get("session_id") not in session_ids))}
+                for ident, record in remaining.items():
+                    # A kept record must not name the Hermes session id being forgotten.
+                    if ident in live and isinstance(record, dict) and record.get("session_id") in session_ids:
+                        sid = next(sid for sid, i in self.sessions.items() if i == ident and sid not in session_ids)
+                        remaining[ident] = {**record, "session_id": sid}
                 if remaining != records and self.write_saved_conversations(remaining):
-                    for ident in records.keys() - remaining.keys():
+                    for ident in records.keys() | remaining.keys():
                         conversation = self.conversations.get(ident)
                         if conversation:
-                            conversation.restart_record = None
+                            conversation.restart_record = remaining.get(ident)
             idents = {self.sessions.pop(sid, None) for sid in session_ids}
             for ident in idents - {None}:
                 if ident not in self.sessions.values():

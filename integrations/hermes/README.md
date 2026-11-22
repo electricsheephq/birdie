@@ -81,7 +81,8 @@ aren't woken and can't take messages meant for a conversation.
 
 When heartbeat2 holds a wake because its app window is closed, it can tell
 someone through birdie (heartbeat2's `notify_via: "birdie:<agent>"`). The plugin
-offers heartbeat2 a `send(target, text)` over Hermes's plugin event bus. It offers
+offers heartbeat2 a `send(target, text, priority=None)` over Hermes's plugin event bus
+(p1 unless heartbeat2 passes p0, p1 or p3). It offers
 it when it loads and whenever heartbeat2 asks, and withdraws it on unload.
 
 - `send` queues a message from this profile's agent, marked `source: heartbeat2`.

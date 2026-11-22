@@ -1554,8 +1554,34 @@ class ReconnectTest(PluginCase):
         with network.lock:
             network.sessions["s2"] = saved.id
         network.forget({"s1"})
-        self.assertIn(saved.id, ctx.state.data[plugin.RESTART_STATE])
+        self.assertEqual(ctx.state.data[plugin.RESTART_STATE][saved.id]["session_id"], "s2")
         network.forget({"s2"})
+        self.assertNotIn(saved.id, ctx.state.data[plugin.RESTART_STATE])
+
+    def test_a_route_less_turn_keeps_a_restored_record_from_ageing_out(self):
+        ctx, old, saved = self.save_telegram()
+        ctx, network = self.restart(ctx, old)
+        self.restore_without_polling(ctx, network)
+        restored = network.conversations[saved.id]
+        stale = time.time() - 2 * 86400
+        ctx.state.data[plugin.RESTART_STATE][saved.id]["saved_at"] = stale
+        restored.restart_record = dict(ctx.state.data[plugin.RESTART_STATE][saved.id])
+        ctx.session_key = lambda: ""
+        ctx.session_surface = lambda: "telegram"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, platform="telegram", user_message="pushed")
+        self.assertGreater(ctx.state.data[plugin.RESTART_STATE][saved.id]["saved_at"], stale + 86400)
+
+    def test_deleting_a_chat_whose_route_moved_to_a_new_session_id_drops_its_record(self):
+        ctx, old, saved = self.save_telegram()
+        ctx, network = self.restart(ctx, old)
+        self.restore_without_polling(ctx, network)
+        ctx.session_key = lambda: self.ROUTE
+        ctx.session_surface = lambda: "telegram"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session="s9", platform="telegram", user_message="hello again")
+        self.assertNotIn("s1", network.sessions)
+        ctx.hooks["on_session_delete"](session_id="s9")
         self.assertNotIn(saved.id, ctx.state.data[plugin.RESTART_STATE])
 
     def test_a_restore_pass_logs_its_outcome_once_without_conversation_details(self):
