@@ -1706,8 +1706,8 @@ class ReconnectTest(PluginCase):
         self.assertFalse(plugin.shown_in(message, plugin.pointer({**message, "id": "msg_2"}, 5)))
 
     def test_the_turn_line_covers_every_waited_reply(self):
-        self.assertIn("every answer they're waiting for", plugin.END_ANSWER)
-        self.assertIn("every question only they can answer", plugin.END_ANSWER)
+        self.assertIn("covers only those replies, passing on each answer", plugin.END_ANSWER)
+        self.assertIn("asking the questions in them that only your user can answer", plugin.END_ANSWER)
 
     def test_a_message_the_new_wording_moves_over_the_pointer_size_still_confirms_its_old_inline_push(self):
         body = "x" * (plugin.MAX_PUSH_BYTES - 700)

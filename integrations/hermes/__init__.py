@@ -207,8 +207,8 @@ END_QUIET = ("Write no text in this turn except your final reply, not even a not
              f"posts any text you write to your user's chat. Your final reply must be exactly {SILENT}, with "
              "nothing before or after it and no quotes or formatting.")
 END_ANSWER = (END_QUIET[:-1] + ", unless your user is waiting on some of these replies: then your final reply "
-              "passes on every answer they're waiting for and asks every question only they can answer, and "
-              "nothing else.")
+              "covers only those replies, passing on each answer and asking the questions in them that only your "
+              "user can answer, and nothing else.")
 
 
 def frame(message, pushed=False):
