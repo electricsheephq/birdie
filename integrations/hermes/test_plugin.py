@@ -1540,6 +1540,24 @@ class ReconnectTest(PluginCase):
         self.assertEqual(network.conversations, {})
         self.assertEqual(ctx.state.data[plugin.RESTART_STATE], {})
 
+    def test_a_daily_turn_keeps_an_unchanged_record_from_ageing_out(self):
+        ctx, network, saved = self.save_telegram()
+        stale = time.time() - 2 * 86400
+        ctx.state.data[plugin.RESTART_STATE][saved.id]["saved_at"] = stale
+        saved.restart_record = dict(ctx.state.data[plugin.RESTART_STATE][saved.id])
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, platform="telegram", user_message="still here")
+        self.assertGreater(ctx.state.data[plugin.RESTART_STATE][saved.id]["saved_at"], stale + 86400)
+
+    def test_ending_one_hermes_session_keeps_the_record_while_another_still_maps_to_it(self):
+        ctx, network, saved = self.save_telegram()
+        with network.lock:
+            network.sessions["s2"] = saved.id
+        network.forget({"s1"})
+        self.assertIn(saved.id, ctx.state.data[plugin.RESTART_STATE])
+        network.forget({"s2"})
+        self.assertNotIn(saved.id, ctx.state.data[plugin.RESTART_STATE])
+
     def test_a_restore_pass_logs_its_outcome_once_without_conversation_details(self):
         ctx, old, _ = self.save_telegram()
         ctx, network = self.restart(ctx, old)

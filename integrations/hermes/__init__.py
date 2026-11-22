@@ -62,6 +62,7 @@ WAKE_SURFACES = {"cli", "tui", "desktop", "telegram", "discord", "slack", "whats
 MESSAGING_SURFACES = WAKE_SURFACES - {"cli", "tui", "desktop"}
 RESTART_STATE = "conversations"
 RESTART_MAX_AGE = 30 * 86400
+RESTART_REFRESH = 86400  # an unchanged record is rewritten at most daily, so its age tracks activity
 RESTORE_WAIT_SECONDS = 180
 RESTORE_POLL_SECONDS = 1
 RESTORE_SETTLE_SECONDS = 20
@@ -500,7 +501,8 @@ class Network:
     def update_record(self, conversation, **changes):
         # The caller holds the Network lock, including across the state read and write.
         record = {**(conversation.restart_record or {}), **changes}
-        if self.closed.is_set() or conversation.closed.is_set() or conversation.restart_record == record:
+        fresh = time.time() - record.get("saved_at", 0) < RESTART_REFRESH
+        if self.closed.is_set() or conversation.closed.is_set() or (conversation.restart_record == record and fresh):
             return
         records = self.saved_conversations()
         record = {**record, "saved_at": time.time()}
@@ -762,10 +764,13 @@ class Network:
                                and conversation.restart_record is None}
             records = self.saved_conversations() if session_ids and not restarting else None
             if records:
-                mapped = {self.sessions.get(sid) for sid in session_ids}
+                # A conversation still mapped from another Hermes session id keeps its record.
+                live = {ident for sid, ident in self.sessions.items() if sid not in session_ids}
+                mapped = {self.sessions.get(sid) for sid in session_ids} - live
                 remaining = {ident: record for ident, record in records.items()
-                             if ident not in mapped
-                             and (not isinstance(record, dict) or record.get("session_id") not in session_ids)}
+                             if ident in live
+                             or (ident not in mapped
+                                 and (not isinstance(record, dict) or record.get("session_id") not in session_ids))}
                 if remaining != records and self.write_saved_conversations(remaining):
                     for ident in records.keys() - remaining.keys():
                         conversation = self.conversations.get(ident)
