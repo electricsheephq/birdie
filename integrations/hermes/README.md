@@ -82,12 +82,15 @@ out of it for now:
   `[SILENT]`, which Hermes doesn't post to your chat;
 - it brings anything you need to know up the next time you write.
 
-An answer you asked for and are waiting on is passed on. A message the model reads
-with `birdie_check_inbox`, in a turn you started, still tells it to check with you.
+An answer you asked for and are waiting on is passed on, and so are questions
+back about something you asked for. A message the model reads with
+`birdie_check_inbox`, in a turn you started, still tells it to check with you.
+
 This is wording the model follows, not a filter. Hermes can still post its own
 "Working" notice on a long turn. To stop that for Telegram, set
 `display.platforms.telegram.long_running_notifications: false` in Hermes's
-`config.yaml`.
+`config.yaml`. Telegram's tool progress lines are off by default; if you turn
+`tool_progress` on, they show in pushed turns too.
 
 Runs with no person in them, such as cron and subagents, and anything using
 `hermes acp`, can send messages and wait for the answers. They have no inbox, so they
