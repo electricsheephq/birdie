@@ -180,6 +180,10 @@ class Bus:
         return self.call("GET", "/v1/unread" + query, timeout=3).get("unread", 0)
 
 
+NOTICE_PUSHED = ("This is a notice from birdie itself. Don't reply to it, and don't message your user about it "
+                 "now; if it matters, mention it the next time your user writes.")
+
+
 def frame(message, pushed=False):
     """Marks a message as coming from another agent, with how to answer it. The tag
     can't be closed from inside the content, so content can't pose as text around it.
@@ -199,8 +203,7 @@ def frame(message, pushed=False):
         parts += ["", "Wanted:", clean(meta["wanted"])]
     parts.append(f"</{TAG}>")
     if sender in ("birdie", "agent-bus") and pushed:
-        parts.append("This is a notice from birdie itself. Don't reply to it, and don't message your user about it "
-                     "now; if it matters, mention it the next time your user writes.")
+        parts.append(NOTICE_PUSHED)
     elif sender in ("birdie", "agent-bus"):
         parts.append("This is a notice from birdie itself. Don't reply to it; tell your user if it matters.")
     elif asks_questions(message):
@@ -241,7 +244,7 @@ def push_frame(message):
         f'thread_id={json.dumps(message.get("thread_id", ""))}>',
         f'This message is too long to show here ({full_size} bytes). '
         f'Read it with birdie_get_thread, and answer with birdie_send_message, in_reply_to "{ident}".',
-        f"</{TAG}>"])
+        f"</{TAG}>"] + ([NOTICE_PUSHED] if message.get("from") in ("birdie", "agent-bus") else []))
 
 
 def shown_in(message, text):
@@ -583,10 +586,10 @@ class Network:
         return None
 
     def restore(self, settle, *, only_session="", platform=""):
-        if not self.wake_allowed():
-            # wake false is the whole lever: nothing is restored, so nothing can be pushed or routed there.
-            if not only_session:
-                log.info("birdie: restored 0 conversation(s); wake is off")
+        if not only_session and not self.wake_allowed():
+            # wake false is the whole lever: the background pass restores nothing. A real turn in a
+            # saved chat still adopts its record (as a pull conversation), so turning wake back on works.
+            log.info("birdie: restored 0 conversation(s); wake is off")
             return None
         deadline = time.monotonic() + RESTORE_WAIT_SECONDS
         while not only_session and not self.injector_ready():

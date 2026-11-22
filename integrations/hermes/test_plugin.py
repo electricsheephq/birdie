@@ -1594,6 +1594,28 @@ class ReconnectTest(PluginCase):
         self.assertEqual(network.conversations, {})
         self.assertIn(saved.id, ctx.state.data[plugin.RESTART_STATE])  # kept for when wake is back on
 
+    def test_with_wake_off_a_turn_in_a_saved_chat_still_adopts_it_so_wake_can_come_back(self):
+        ctx, old, saved = self.save_telegram()
+        self.write_config(False)
+        ctx, network = self.restart(ctx, old)
+        ctx._manager.has_gateway_message_injector = True
+        ctx.session_key = lambda: ""
+        ctx.session_surface = lambda: "telegram"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, platform="telegram", user_message="hi")
+        adopted = network.conversations[saved.id]
+        self.assertEqual(adopted.route, self.ROUTE)
+        self.assertFalse(adopted.wake)
+        self.write_config(True)
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, platform="telegram", user_message="again")
+        self.assertTrue(network.conversations[saved.id].wake)
+
+    def test_an_oversized_pushed_notice_also_says_not_to_message_the_user(self):
+        notice = {"from": "birdie", "id": "msg_1", "thread_id": "thr_1", "content": "x", "content_bytes": 10 ** 6}
+        self.assertIn(plugin.NOTICE_PUSHED, plugin.push_frame(notice))
+        self.assertNotIn(plugin.NOTICE_PUSHED, plugin.push_frame({**notice, "from": "peer"}))
+
     def test_wake_turned_off_during_the_startup_wait_restores_nothing(self):
         ctx, old, saved = self.save_telegram()
         ctx, network = self.restart(ctx, old)
