@@ -53,7 +53,7 @@ func TestASessionNameOverrideWinsWithoutChangingOtherSessions(t *testing.T) {
 	}
 	for _, tc := range []struct{ to, want string }{
 		{"claude/api", "p3"}, {"claude/s1", "p3"}, {"claude/api#s1", "p3"},
-		{"claude", "p1"}, {"claude/web", ""}, {"claude/other", "p1"},
+		{"claude", "p3"}, {"claude/web", ""}, {"claude/other", "p1"},
 	} {
 		m, err := b.Send(ctx, "alice", bus.SendInput{To: tc.to, Content: "update"})
 		if err != nil || m.Priority != tc.want {
@@ -153,7 +153,7 @@ func TestBothAnUnrankedAckAndAnswerToTheRecipientsRequestAreLiftedToP1(t *testin
 	}
 }
 
-func TestMailAddressedToTheAgentUsesItsSettingEvenWithAChosenSession(t *testing.T) {
+func TestMailRoutedToAChosenSessionUsesThatSessionsSetting(t *testing.T) {
 	ctx := context.Background()
 	b, st := newBus(t)
 	addAgent(t, st, "claude", nil)
@@ -163,7 +163,7 @@ func TestMailAddressedToTheAgentUsesItsSettingEvenWithAChosenSession(t *testing.
 		}
 	}
 	report(t, b, "claude", "s1", "api", bus.TierPush, time.Now())
-	for _, tc := range []struct{ to, want string }{{"claude", "p1"}, {"claude/api", "p3"}} {
+	for _, tc := range []struct{ to, want string }{{"claude", "p3"}, {"claude/api", "p3"}} {
 		m, err := b.Send(ctx, "alice", bus.SendInput{To: tc.to, Content: "update"})
 		if err != nil || m.Priority != tc.want || m.ToSession != "s1" {
 			t.Errorf("send to %s: priority = %q, session = %q, err = %v; want %q to s1", tc.to, m.Priority, m.ToSession, err, tc.want)

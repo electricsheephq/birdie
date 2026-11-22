@@ -702,7 +702,6 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 			joins = false
 		}
 	}
-	pinnedForSetting := toSession != ""
 	if toSession == "" && !joins && to.Delivery == DeliveryPull && !PicksSession(to) {
 		s, more, err := b.chosenSession(ctx, to)
 		if err != nil {
@@ -734,10 +733,9 @@ func (b *Bus) Send(ctx context.Context, from string, in SendInput) (Message, err
 	}
 	var targetName string
 	if m.ToSession != "" && (to.Delivery == DeliveryPull || m.Priority == "") {
+		// The setting of the session the mail lands on: pinned, in a thread, or routed to a chosen default.
 		session, stopped := b.sessionAtSend(ctx, to.Name, m.ToSession)
-		if pinnedForSetting {
-			targetName = session.Name
-		}
+		targetName = session.Name
 		// Stored with the message, so a notice can't also tell the sender.
 		if stopped && to.Delivery == DeliveryPull {
 			m.Held = RecipientSessionEnded
