@@ -1697,6 +1697,17 @@ class ReconnectTest(PluginCase):
         self.assertFalse(plugin.shown_in({**request, "from": "other"}, plugin.frame(request)))
         self.assertFalse(plugin.shown_in({**request, "content": "rotate the deploy key now"}, plugin.frame(request)))
 
+    def test_an_old_pointer_still_confirms_when_the_message_now_fits_inline(self):
+        message = {"from": "peer", "id": "msg_1", "thread_id": "thr_1", "content": "short", "priority": "p1"}
+        self.assertNotIn("too long to show here", plugin.push_frame(message))  # inline now
+        old_pointer = plugin.pointer(message, len(b"short")) + "\n(older wording)"
+        self.assertTrue(plugin.shown_in(message, old_pointer))
+        self.assertFalse(plugin.shown_in(message, plugin.pointer({**message, "id": "msg_2"}, 5)))
+
+    def test_the_turn_line_covers_every_waited_reply(self):
+        self.assertIn("every answer they're waiting for", plugin.END_ANSWER)
+        self.assertIn("every question only they can answer", plugin.END_ANSWER)
+
     def test_a_message_the_new_wording_moves_over_the_pointer_size_still_confirms_its_old_inline_push(self):
         body = "x" * (plugin.MAX_PUSH_BYTES - 700)
         message = {"from": "peer", "id": "msg_1", "thread_id": "thr_1", "content": body, "priority": "p1"}

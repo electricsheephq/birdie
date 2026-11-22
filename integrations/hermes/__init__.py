@@ -204,8 +204,9 @@ POINTER_HOLDS = "After you read it, this still holds: "
 END_QUIET = ("Write nothing in this turn except tool calls, not even a note between them: Hermes posts any text "
              f"you write to your user's chat. When you're done, your final reply must be exactly {SILENT}, with "
              "nothing before or after it and no quotes or formatting.")
-END_ANSWER = (END_QUIET[:-1] + ", unless your user is waiting on one of these replies: then your final reply "
-              "passes on that answer, or asks them its questions, and nothing else.")
+END_ANSWER = (END_QUIET[:-1] + ", unless your user is waiting on some of these replies: then your final reply "
+              "passes on every answer they're waiting for and asks every question only they can answer, and "
+              "nothing else.")
 
 
 def frame(message, pushed=False):
@@ -289,22 +290,29 @@ def push_frame(message):
             text = frame(message, pushed=True)
             if len(text.encode()) <= MAX_PUSH_BYTES:
                 return text
+    return "\n".join([pointer(message, full_size), POINTER_HOLDS + pushed_tail(message)])
+
+
+def pointer(message, full_size):
+    """The tagged part of a push too long to show: where to read the message instead."""
     ident = message.get("id", "")
     return "\n".join([
         f'<{TAG} from={json.dumps(message.get("from", ""))} message_id={json.dumps(ident)} '
         f'thread_id={json.dumps(message.get("thread_id", ""))}>',
         f'This message is too long to show here ({full_size} bytes). '
         f'Read it with birdie_get_thread, and answer with birdie_send_message, in_reply_to "{ident}".',
-        f"</{TAG}>", POINTER_HOLDS + pushed_tail(message)])
+        f"</{TAG}>"])
 
 
 def shown_in(message, text):
     """Whether a turn shows this push: its whole frame up to the closing tag, which holds
-    all of the content. Older plugins put other wording after the tag, or none, and
-    wording of another length can move a message across the pointer size, so either
-    form of the frame counts, and a push from before an upgrade isn't put in again."""
+    all of the content, or its whole pointer. Older plugins put other wording after the
+    tag, or none, and wording of another length moves a message across the pointer
+    size, so both forms count whatever its size now, and a push from before an upgrade
+    isn't put in again."""
     closing = f"</{TAG}>"
-    return any(f.split(closing, 1)[0] + closing in text for f in (push_frame(message), frame(message)))
+    full_size = message.get("content_bytes") or len(message.get("content", "").encode())
+    return frame(message).split(closing, 1)[0] + closing in text or pointer(message, full_size) in text
 
 
 def now():
