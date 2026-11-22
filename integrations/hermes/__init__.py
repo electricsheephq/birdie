@@ -244,6 +244,14 @@ def push_frame(message):
         f"</{TAG}>"])
 
 
+def shown_in(message, text):
+    """Whether a turn shows this push. A notice pushed by a plugin before the pushed-notice
+    wording also matches its old frame, so an upgrade doesn't push it again."""
+    if push_frame(message) in text:
+        return True
+    return message.get("from") in ("birdie", "agent-bus") and frame(message) in text
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -588,6 +596,9 @@ class Network:
                     log.info("birdie: restored 0 conversation(s); injector did not become ready")
                 return
         if not only_session and ((settle and self.closed.wait(RESTORE_SETTLE_SECONDS)) or not self.injector_ready()):
+            return
+        if not only_session and not self.wake_allowed():
+            log.info("birdie: restored 0 conversation(s); wake was turned off")  # during the waits above
             return
         surfaces = {platform} if only_session else self.connected_surfaces()
         with self.lock:
@@ -1086,7 +1097,7 @@ class Network:
             return False
         for message in reply.get("messages") or []:
             if message.get("id") == ident:
-                return message.get("to_session", "") in ("", conversation.id) and push_frame(message) in text
+                return message.get("to_session", "") in ("", conversation.id) and shown_in(message, text)
         return False
 
     def expire_pending(self, conversation):

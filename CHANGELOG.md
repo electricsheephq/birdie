@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- Hermes: with `wake` off, the plugin restores nothing after a restart, so `wake: false` stops pushes and routing at once. A birdie notice pushed as its own turn tells the model not to message its user about it then.
+- Hermes: with `wake` off, the plugin restores nothing after a restart, so after a restart `wake: false` keeps it from pushing or taking mail (a registration from before the restart lapses within 90 seconds). A birdie notice pushed as its own turn tells the model not to message its user about it then.
 - The Hermes plugin's HeartBeat notifier sends p1 unless HeartBeat picks a level, so a recipient that holds unranked mail as p3 still sees HeartBeat notices.
 
 Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.

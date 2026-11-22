@@ -1594,6 +1594,22 @@ class ReconnectTest(PluginCase):
         self.assertEqual(network.conversations, {})
         self.assertIn(saved.id, ctx.state.data[plugin.RESTART_STATE])  # kept for when wake is back on
 
+    def test_wake_turned_off_during_the_startup_wait_restores_nothing(self):
+        ctx, old, saved = self.save_telegram()
+        ctx, network = self.restart(ctx, old)
+        with mock.patch.object(network, "wake_allowed", side_effect=[True, False]), \
+                mock.patch.object(network, "report", wraps=network.report) as report:
+            self.restore_without_polling(ctx, network)
+            report.assert_not_called()
+        self.assertEqual(network.conversations, {})
+
+    def test_a_notice_pushed_with_the_old_wording_is_still_recognised_as_shown(self):
+        notice = {"from": "birdie", "id": "msg_1", "thread_id": "thr_1", "content": "held: your message waits"}
+        self.assertTrue(plugin.shown_in(notice, "before\n" + plugin.frame(notice) + "\nafter"))
+        self.assertTrue(plugin.shown_in(notice, plugin.push_frame(notice)))
+        peer_message = {**notice, "from": "peer"}
+        self.assertFalse(plugin.shown_in(peer_message, plugin.frame(notice)))
+
     def test_a_pushed_birdie_notice_tells_the_model_not_to_message_its_user_now(self):
         notice = {"from": "birdie", "id": "msg_1", "thread_id": "thr_1", "content": "held: your message waits"}
         self.assertIn("don't message your user about it now", plugin.push_frame(notice))
