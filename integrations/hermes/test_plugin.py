@@ -1584,6 +1584,22 @@ class ReconnectTest(PluginCase):
         ctx.hooks["on_session_delete"](session_id="s9")
         self.assertNotIn(saved.id, ctx.state.data[plugin.RESTART_STATE])
 
+    def test_with_wake_off_nothing_is_restored_or_reported(self):
+        ctx, old, saved = self.save_telegram()
+        self.write_config(False)
+        ctx, network = self.restart(ctx, old)
+        with mock.patch.object(network, "report", wraps=network.report) as report:
+            self.restore_without_polling(ctx, network)
+            report.assert_not_called()
+        self.assertEqual(network.conversations, {})
+        self.assertIn(saved.id, ctx.state.data[plugin.RESTART_STATE])  # kept for when wake is back on
+
+    def test_a_pushed_birdie_notice_tells_the_model_not_to_message_its_user_now(self):
+        notice = {"from": "birdie", "id": "msg_1", "thread_id": "thr_1", "content": "held: your message waits"}
+        self.assertIn("don't message your user about it now", plugin.push_frame(notice))
+        self.assertNotIn("tell your user if it matters", plugin.push_frame(notice))
+        self.assertIn("tell your user if it matters", plugin.frame(notice))
+
     def test_a_restore_pass_logs_its_outcome_once_without_conversation_details(self):
         ctx, old, _ = self.save_telegram()
         ctx, network = self.restart(ctx, old)

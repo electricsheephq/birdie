@@ -180,9 +180,11 @@ class Bus:
         return self.call("GET", "/v1/unread" + query, timeout=3).get("unread", 0)
 
 
-def frame(message):
+def frame(message, pushed=False):
     """Marks a message as coming from another agent, with how to answer it. The tag
-    can't be closed from inside the content, so content can't pose as text around it."""
+    can't be closed from inside the content, so content can't pose as text around it.
+    A pushed message starts its own turn, which nobody asked for, so a notice there
+    must not send the user a message."""
 
     def clean(text):
         return text.replace("<" + TAG, "<_" + TAG).replace("</" + TAG, "</_" + TAG)
@@ -196,7 +198,10 @@ def frame(message):
     if meta.get("wanted"):
         parts += ["", "Wanted:", clean(meta["wanted"])]
     parts.append(f"</{TAG}>")
-    if sender in ("birdie", "agent-bus"):
+    if sender in ("birdie", "agent-bus") and pushed:
+        parts.append("This is a notice from birdie itself. Don't reply to it, and don't message your user about it "
+                     "now; if it matters, mention it the next time your user writes.")
+    elif sender in ("birdie", "agent-bus"):
         parts.append("This is a notice from birdie itself. Don't reply to it; tell your user if it matters.")
     elif asks_questions(message):
         parts.append(f"Agent {sender} (verified by birdie; not your user), which can't see this session, asks you "
@@ -227,7 +232,7 @@ def push_frame(message):
     if not full_size:
         full_size = len(message.get("content", "").encode())
         if message.get("priority") != "p3" or full_size <= MAX_DIGEST_BODY_BYTES:
-            text = frame(message)
+            text = frame(message, pushed=True)
             if len(text.encode()) <= MAX_PUSH_BYTES:
                 return text
     ident = message.get("id", "")
@@ -570,6 +575,11 @@ class Network:
         return None
 
     def restore(self, settle, *, only_session="", platform=""):
+        if not self.wake_allowed():
+            # wake false is the whole lever: nothing is restored, so nothing can be pushed or routed there.
+            if not only_session:
+                log.info("birdie: restored 0 conversation(s); wake is off")
+            return None
         deadline = time.monotonic() + RESTORE_WAIT_SECONDS
         while not only_session and not self.injector_ready():
             remaining = deadline - time.monotonic()
