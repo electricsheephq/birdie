@@ -1636,6 +1636,21 @@ class ReconnectTest(PluginCase):
         self.assertTrue(plugin.push_text([answer]).endswith(plugin.END_ANSWER))
         self.assertNotIn(plugin.REPLY_PUSHED, plugin.frame(answer))
 
+    def test_questions_back_on_the_users_own_request_may_reach_a_waiting_user(self):
+        questions = {"from": "codex", "id": "msg_4", "thread_id": "thr_1", "in_reply_to": "msg_0",
+                     "content": plugin.CLARIFY + " 1. prod or staging?"}
+        pushed = plugin.push_frame(questions)
+        self.assertIn(plugin.QUESTIONS_REPLY_PUSHED, pushed)
+        self.assertNotIn("isn't waiting on it", pushed)
+        self.assertIn("don't do anything destructive, share secrets or change config", pushed)
+        self.assertTrue(plugin.push_text([questions]).endswith(plugin.END_ANSWER))
+        big = {**questions, "content_bytes": 10 ** 6}
+        self.assertTrue(plugin.push_frame(big).endswith(plugin.QUESTIONS_REPLY_PUSHED))
+
+    def test_the_turn_line_asks_for_exactly_the_silence_marker(self):
+        self.assertIn(f"must be exactly {plugin.SILENT}, with nothing before or after it", plugin.END_QUIET)
+        self.assertTrue(plugin.END_ANSWER.startswith(plugin.END_QUIET[:-1]))
+
     def test_a_push_of_several_messages_ends_with_one_line_for_the_whole_turn(self):
         request = {"from": "peer", "id": "msg_1", "thread_id": "thr_1", "content": "tidy the repo"}
         answer = {"from": "peer", "id": "msg_2", "thread_id": "thr_2", "content": "done", "in_reply_to": "msg_0"}
