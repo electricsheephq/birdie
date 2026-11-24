@@ -356,6 +356,17 @@ def frame_fingerprint(text):
     return hashlib.sha256(text.split(f"</{TAG}>", 1)[0].encode()).hexdigest()
 
 
+def restored_fingerprints(conversation, ident, message):
+    """The frames a delayed turn may show for a restored push: the one the copy before the
+    restart pushed and, once delivery has claimed the message again, the one this copy would
+    push. An upgrade can move a message across the pointer threshold."""
+    if "_frame" in message:
+        return (message["_frame"],)
+    current = frame_fingerprint(push_frame(message))
+    saved = conversation.restored_frames.get(ident)
+    return (current,) if saved in (None, current) else (saved, current)
+
+
 def shown_ids(text):
     """The birdie messages a turn's text shows: message id -> thread id."""
     shown = {}
@@ -399,6 +410,9 @@ class Conversation:
         # Given back because no turn showed them in time. A turn can still show
         # one late; it then counts as delivered when delivery takes it again.
         self.expired = collections.OrderedDict()
+        # Restored pushes: the fingerprint of the frame the copy before the restart pushed.
+        # A claim of the message again replaces its stub in pending, and keeps this.
+        self.restored_frames = {}
 
     def was_delivered(self, message_id):
         with self.lock:
@@ -637,8 +651,8 @@ class Network:
         for c in self.conversations.values() if frames else ():
             if c.restored and c.restart_record and c.restart_record["surface"] == surface:
                 with c.lock:
-                    if any((ident, m.get("_frame") or frame_fingerprint(push_frame(m))) in frames
-                           for ident, (m, _) in c.pending.items()):
+                    if any((ident, fingerprint) in frames for ident, (m, _) in c.pending.items()
+                           for fingerprint in restored_fingerprints(c, ident, m)):
                         matches.append(c)
         return matches[0] if len(matches) == 1 else None
 
@@ -721,6 +735,7 @@ class Network:
                 for mid, (deadline, fingerprint, lease) in record.get("pending", {}).items():
                     stub = {"id": mid, "_frame": fingerprint, "lease_until": lease, "thread_id": None}
                     conversation.pending[mid] = (stub, deadline + offset)
+                    conversation.restored_frames[mid] = fingerprint
                 self.sees_turn_text = True
                 self.conversations[ident] = conversation
                 self.sessions[session_id] = ident
