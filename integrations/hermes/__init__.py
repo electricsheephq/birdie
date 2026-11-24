@@ -749,15 +749,19 @@ class Network:
                 # nothing: its session id may belong to the next copy already, and
                 # reporting would bring an ended session back.
                 return
-            reply = self.bus.call("PUT", "/v1/sessions/" + urllib.parse.quote(conversation.id, safe=""), {
-                "name": conversation.name, "cwd": conversation.cwd,
-                "tier": "push" if conversation.wake else "pull", "active_at": conversation.active_at,
-            }, timeout=3)
-            conversation.pull_only = bool(reply.get("pull_only"))  # in report order
-            if conversation.ended and not self.replaced(conversation):
-                # Ended while this PUT was on its way. end() waits only so long for it, so its
-                # DELETE may have gone first: take the session back off the bus.
-                self.delete_session(conversation)
+            try:
+                reply = self.bus.call("PUT", "/v1/sessions/" + urllib.parse.quote(conversation.id, safe=""), {
+                    "name": conversation.name, "cwd": conversation.cwd,
+                    "tier": "push" if conversation.wake else "pull", "active_at": conversation.active_at,
+                }, timeout=3)
+                conversation.pull_only = bool(reply.get("pull_only"))  # in report order
+            finally:
+                # Ended while this PUT was on its way (even one that raised, which the bus may
+                # still apply). end() waits only so long, so its DELETE may have gone first: take
+                # the session back off the bus. Not once this copy is unloaded: the next copy
+                # may already hold a conversation with this id, which this copy can't see.
+                if conversation.ended and not self.closed.is_set() and not self.replaced(conversation):
+                    self.delete_session(conversation)
 
     def pushing(self, conversation):
         """Whether messages come into this conversation on their own. Delivery keeps

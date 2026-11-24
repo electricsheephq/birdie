@@ -1226,7 +1226,8 @@ class PluginTest(PluginCase):
                 deleted.set()
             return result
 
-        with mock.patch.object(network.bus, "call", slow_put):
+        with mock.patch.object(network.bus, "call", slow_put), \
+                mock.patch.object(plugin, "REPORT_DRAIN_SECONDS", 10):  # margin for a loaded runner
             reporter = threading.Thread(target=network.report, args=(conversation,))
             reporter.start()
             self.assertTrue(started.wait(10))
@@ -1234,7 +1235,7 @@ class PluginTest(PluginCase):
             deleter.start()
             try:
                 # Without the wait the DELETE lands while the PUT is held; with it, it can't.
-                self.assertFalse(deleted.wait(0.5), "the DELETE didn't wait for the report on its way")
+                self.assertFalse(deleted.wait(2), "the DELETE didn't wait for the report on its way")
             finally:
                 release.set()
                 reporter.join(15)
