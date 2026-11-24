@@ -2,6 +2,7 @@
 
 ## Unreleased
 - Hermes: with `wake` off, the plugin restores nothing after a restart, so after a restart `wake: false` keeps it from pushing or taking mail (a registration from before the restart lapses within 90 seconds). A birdie notice pushed as its own turn tells the model not to message its user about it then.
+- Hermes: a pushed message from another agent no longer tells the model to check with its user, which in a turn the user didn't start meant writing in their chat. The model answers the sender on birdie, does nothing destructive, shares no secrets and changes no config for it, writes no text in the turn, and ends it with `[SILENT]`, which Hermes doesn't post; it raises the request when its user next writes. A pushed answer is passed on only if the user is waiting for it. Each push ends with one line for the whole turn, so a digest never asks for two different final replies. Pushes from an older plugin are still confirmed after an upgrade.
 - The Hermes plugin's HeartBeat notifier sends p1 unless HeartBeat picks a level, so a recipient that holds unranked mail as p3 still sees HeartBeat notices.
 
 Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
