@@ -1232,31 +1232,91 @@ class PluginTest(PluginCase):
             self.assertTrue(started.wait(10))
             deleter = threading.Thread(target=ctx.hooks["on_session_delete"], kwargs={"deleted_ids": ["s1"]})
             deleter.start()
-            # Without the wait the DELETE lands while the PUT is held; with it, it can't.
-            self.assertFalse(deleted.wait(2), "the DELETE didn't wait for the report on its way")
-            release.set()
-            reporter.join(15)
-            deleter.join(15)
+            try:
+                # Without the wait the DELETE lands while the PUT is held; with it, it can't.
+                self.assertFalse(deleted.wait(0.5), "the DELETE didn't wait for the report on its way")
+            finally:
+                release.set()
+                reporter.join(15)
+                deleter.join(15)
         self.assertFalse(reporter.is_alive() or deleter.is_alive())
         self.assertTrue(deleted.is_set())
         self.assertTrue(conversation.closed.is_set())
         self.assertFalse(any(s["id"] == conversation.id for s in self.sessions()),
                          "a report on its way brought a deleted session back")
 
-    def test_ending_a_replaced_conversation_doesnt_delete_its_successor(self):
-        # A reset and a new turn on the same route can register a new conversation with the
-        # same id before the old one's end sends DELETE; that DELETE would end the new one.
+    def test_a_report_that_outlasts_the_drain_takes_its_session_back(self):
+        # end() waits only so long for a report on its way. A PUT that lands after its DELETE
+        # must take the session back off the bus itself.
+        self.write_config(True)
+        ctx, network = self.load()
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx)
+        conversation = network.conversation("s1")
+        started, release, deleted = threading.Event(), threading.Event(), threading.Event()
+        call = network.bus.call
+
+        def stalled_put(method, path, *args, **kwargs):
+            if method == "PUT" and path.startswith("/v1/sessions/") and not release.is_set():
+                started.set()
+                release.wait(10)
+            result = call(method, path, *args, **kwargs)
+            if method == "DELETE":
+                deleted.set()
+            return result
+
+        with mock.patch.object(plugin, "REPORT_DRAIN_SECONDS", 0.2), \
+                mock.patch.object(network.bus, "call", stalled_put):
+            reporter = threading.Thread(target=network.report, args=(conversation,))
+            reporter.start()
+            try:
+                self.assertTrue(started.wait(10))
+                ctx.hooks["on_session_delete"](deleted_ids=["s1"])
+                self.assertTrue(deleted.wait(10), "end() didn't give up waiting")
+            finally:
+                release.set()
+                reporter.join(15)
+        self.assertFalse(reporter.is_alive())
+        self.assertFalse(any(s["id"] == conversation.id for s in self.sessions()),
+                         "a PUT that outlasted the drain brought the session back")
+
+    def test_an_old_delete_doesnt_end_a_new_conversation_with_its_id(self):
+        # A reset ends a conversation; a new turn on the same route makes another with the same
+        # id. The old DELETE and the new PUT must not interleave so the new one is ended.
+        self.write_config(True)
         ctx, network = self.load()
         with mock.patch.object(network, "start_threads"):
             self.turn(ctx)
         old = network.conversation("s1")
-        successor = copy.copy(old)
         with network.lock:
-            network.conversations[old.id] = successor
-        with mock.patch.object(network.bus, "call") as call:
-            network.end(old)
-        self.assertTrue(old.closed.is_set())
-        self.assertFalse([c for c in call.call_args_list if c.args and c.args[0] == "DELETE"])
+            network.conversations.pop(old.id)  # what forget() does before end()
+        new = plugin.Conversation(old.id, old.name, old.cwd, True)
+        in_delete, release = threading.Event(), threading.Event()
+        call = network.bus.call
+
+        def parked_delete(method, path, *args, **kwargs):
+            if method == "DELETE" and not release.is_set():
+                in_delete.set()
+                release.wait(10)
+            return call(method, path, *args, **kwargs)
+
+        with mock.patch.object(network.bus, "call", parked_delete):
+            ender = threading.Thread(target=network.end, args=(old,))
+            ender.start()
+            try:
+                self.assertTrue(in_delete.wait(10))
+                with network.lock:
+                    network.conversations[new.id] = new  # made after end() checked for it
+                reporter = threading.Thread(target=network.report, args=(new,))
+                reporter.start()
+                time.sleep(0.5)  # unless it waits, the new PUT lands before the old DELETE
+            finally:
+                release.set()
+                ender.join(15)
+            reporter.join(15)
+        self.assertFalse(ender.is_alive() or reporter.is_alive())
+        self.assertTrue(any(s["id"] == new.id for s in self.sessions()),
+                        "an old DELETE ended the new conversation")
 
     def test_finishing_a_conversation_ends_its_session_and_wake(self):
         self.write_config(True)
