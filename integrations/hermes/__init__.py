@@ -37,9 +37,10 @@ LEASE_SECONDS = 120
 WAIT_STEP_SECONDS = 2  # how often a waiting tool notices it was interrupted
 MAX_CHECK_SECONDS = 120
 REPORT_DRAIN_SECONDS = 1  # how long ending a session waits for a report on its way
-# Hermes ends a tool call after 420 s by default (agent/tool_executor.py, tools.sequential_call), and a
-# plugin tool can't declare a longer deadline. A wait that outlived the call could take a reply, confirm
-# it to the bus, and return it to a call nobody reads any more, so the wait ends well before that.
+# Hermes ends a tool call after 420 s by default (timeouts.tools.sequential_call), and a plugin tool
+# can't declare a longer deadline. A wait that outlived the call could take a reply, confirm it to the
+# bus, and return it to a call nobody reads any more. So a wait also stops when Hermes gives up on the
+# call (hermes_gave_up), and this cap covers a Hermes without that flag.
 MAX_REPLY_SECONDS = 400
 RETRY_SECONDS = 5
 TURN_RETRY_SECONDS = 60 * 60
@@ -107,6 +108,16 @@ def load_config():
 def digest_seconds(config):
     minutes = config.get("digest_minutes")
     return 60 * (max(10, min(50, minutes)) if type(minutes) is int else 20)
+
+
+def hermes_gave_up():
+    """Hermes flags a tool's thread when it gives up on the call: at its tool timeout, or when the
+    user stops the turn, the plain CLI included. Read at each wait step."""
+    try:
+        from tools.interrupt import is_interrupted
+    except ImportError:  # not running inside Hermes, or one without the flag
+        return False
+    return is_interrupted()
 
 
 def read_token():
@@ -501,6 +512,8 @@ class Network:
                 self.stopped.add(session_key)
 
     def interrupted(self, conversation):
+        if hermes_gave_up():
+            return True
         with self.lock:
             return bool(conversation.route) and conversation.route in self.stopped
 
@@ -1238,6 +1251,9 @@ class Network:
         while True:
             step = min(WAIT_STEP_SECONDS, max(0, deadline - time.monotonic()))
             messages = self.bus.inbox(self.session_of(conversation), wait=step, thread=thread)
+            if messages and self.interrupted(conversation):
+                self.give_back(messages)  # nobody would see them; they come back for a later turn
+                raise InterruptedError
             if messages:
                 for message in messages:
                     self.bus.ack(message["id"])
@@ -1291,6 +1307,9 @@ class Network:
                     except BusError as err:
                         log.debug("birdie: thread inbox: %s", err)
                         continue
+                if messages and self.interrupted(conversation):
+                    self.give_back(messages)  # nobody would see them; delivery shows them later
+                    raise InterruptedError
                 fresh = []
                 for message in messages:
                     if conversation.mark_delivered(message["id"]):
