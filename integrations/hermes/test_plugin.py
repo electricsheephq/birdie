@@ -1125,6 +1125,24 @@ class PluginTest(PluginCase):
         peer("POST", "/v1/messages", {"in_reply_to": peer_inbox(5)[0]["id"], "content": "a"})
         self.assertIn("is answering", self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 5}))
 
+    def test_a_wait_ends_before_hermes_abandons_the_tool_call(self):
+        # Hermes ends a tool call after 420 s by default. A wait that outlived it could take a
+        # reply, confirm it to the bus, and hand it to a call nobody reads any more.
+        self.assertLess(plugin.MAX_REPLY_SECONDS, 420)
+        for wake in (True, False):
+            self.write_config(wake)
+            ctx, network = self.load()
+            self.turn(ctx)
+            sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}))
+            asked = []
+            with mock.patch.object(network, "wait_pushed", side_effect=lambda c, t, s: asked.append(s) or ([], False)), \
+                    mock.patch.object(network, "take", side_effect=lambda c, s, t: asked.append(s) or []):
+                self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 600})
+            self.assertTrue(asked)
+            self.assertTrue(all(s <= plugin.MAX_REPLY_SECONDS for s in asked), asked)
+        properties = next(tool[3] for tool in plugin.TOOLS if tool[0] == "birdie_wait_for_reply")
+        self.assertIn(f"max {plugin.MAX_REPLY_SECONDS}", properties["timeout_seconds"]["description"])
+
     def test_a_new_request_says_how_to_ask_first_and_a_question_says_it_asks(self):
         new = plugin.frame({"from": "peer", "id": "m1", "thread_id": "t1", "content": "tidy the repo"})
         self.assertIn(f'ask first: reply starting "{plugin.CLARIFY}"', new)
