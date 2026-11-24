@@ -14,6 +14,7 @@ import types
 import unittest
 import urllib.parse
 import urllib.request
+from functools import wraps
 from pathlib import Path
 from unittest import mock
 
@@ -119,6 +120,18 @@ class Context:
 
     def session_surface(self):
         return "cli"
+
+
+class MutingContext(Context):
+    mute_result = True
+
+    def inject_message(self, text, role="user", *, session_key=None, origin=None, quiet=False):
+        self.injected.append((session_key, text, quiet))
+        if quiet == "full":
+            if isinstance(self.mute_result, Exception):
+                raise self.mute_result
+            return self.mute_result
+        return self.accept
 
 
 class State:
@@ -593,6 +606,176 @@ class PluginTest(PluginCase):
         self.assertIn("not your user", ctx.injected[0][1])
         time.sleep(1.5)
         self.assertEqual(len(ctx.injected), 1, "an accepted message must not come again")
+
+    def quiet_push_network(self, ctx, levels=("full",), **settings):
+        self.write_config(True, **settings)
+        name = "hermes_cli.plugins_injection"
+        injection = None
+        if levels is not None:
+            injection = types.ModuleType(name)
+            injection.QUIET_LEVELS = frozenset(levels)
+        with mock.patch.dict(sys.modules, {name: injection}):
+            network = plugin.Network(ctx, plugin.load_config())
+        network.bus = mock.Mock(spec=plugin.Bus)
+        network.bus.call.return_value = {}
+        return network
+
+    def quiet_push_target(self, ctx, *, route="telegram:quiet-test", levels=("full",), **settings):
+        network = self.quiet_push_network(ctx, levels, **settings)
+        conversation = plugin.Conversation("quiet-test", "quiet-test", "", True)
+        conversation.route = route
+        conversation.surface = "telegram"
+        conversation.wake = True
+        return network, conversation
+
+    def spy_on_injection(self, ctx):
+        inject_message = ctx.inject_message
+        attempts = mock.Mock(wraps=inject_message)
+
+        @wraps(inject_message)
+        def record(*args, **kwargs):
+            return attempts(*args, **kwargs)
+
+        ctx.inject_message = record
+        return attempts
+
+    def quiet_push_message(self, ident="new-mail", **fields):
+        return {"id": ident, "thread_id": "thread-" + ident, "from": "peer",
+                "content": ident, "priority": "p1", **fields}
+
+    def test_an_old_core_can_receive_pushes_without_the_quiet_keyword(self):
+        ctx = Context()
+        inject = self.spy_on_injection(ctx)
+        network, conversation = self.quiet_push_target(ctx, levels=None)
+        message = self.quiet_push_message()
+        network.deliver(conversation, message)
+        inject.assert_called_once_with(plugin.push_text([message]), session_key=conversation.route)
+        network.bus.ack.assert_called_once_with(message["id"])
+
+    def test_a_core_with_full_quiet_mutes_keyed_new_mail_and_birdie_notices(self):
+        ctx = MutingContext()
+        network, conversation = self.quiet_push_target(ctx)
+        messages = [self.quiet_push_message(),
+                    self.quiet_push_message("digest", priority="p3"),
+                    self.quiet_push_message("notice", **{"from": "birdie", "in_reply_to": "earlier"})]
+        for message in messages:
+            network.deliver(conversation, message)
+        self.assertEqual(ctx.injected, [(conversation.route, plugin.push_text([m]), "full") for m in messages])
+
+    def test_only_a_keyed_messaging_turn_gets_full_quiet(self):
+        for surface, quiet_arg in (("tui", {}), ("telegram", {"quiet": "full"})):
+            with self.subTest(surface=surface):
+                ctx = MutingContext()
+                route = f"{surface}:quiet-test"
+                ctx.session_key = lambda: route
+                ctx.session_surface = lambda: surface
+                inject = self.spy_on_injection(ctx)
+                network = self.quiet_push_network(ctx)
+                with mock.patch.object(network, "start_threads"):
+                    network.before_turn(session_id="quiet-test", platform=surface)
+                conversation = network.conversation("quiet-test")
+                message = self.quiet_push_message()
+                network.deliver(conversation, message)
+                inject.assert_called_once_with(plugin.push_text([message]), session_key=route, **quiet_arg)
+
+    def test_replies_and_p0_pushes_omit_the_quiet_keyword(self):
+        ctx = MutingContext()
+        network, conversation = self.quiet_push_target(ctx)
+        with mock.patch.object(ctx, "inject_message", wraps=ctx.inject_message) as inject:
+            reply = self.quiet_push_message("answer", in_reply_to="earlier")
+            urgent = self.quiet_push_message("urgent", priority="p0")
+            network.deliver(conversation, reply)
+            network.deliver(conversation, urgent)
+        self.assertEqual(inject.call_args_list, [mock.call(plugin.push_text([m]), session_key=conversation.route)
+                                               for m in (reply, urgent)])
+
+    def test_a_digest_keeps_reply_and_p0_visible_first_and_preserves_each_groups_order(self):
+        ctx = MutingContext()
+        network, conversation = self.quiet_push_target(ctx)
+        update = self.quiet_push_message("digest", priority="p3")
+        reply = self.quiet_push_message("answer", in_reply_to="earlier")
+        later_update = self.quiet_push_message("later-update")
+        urgent = self.quiet_push_message("urgent", priority="p0")
+        network.deliver_digest(conversation, [update, reply, later_update, urgent])
+        self.assertEqual(ctx.injected, [(conversation.route, plugin.push_text([reply, urgent]), False),
+                                        (conversation.route, plugin.push_text([update, later_update]), "full")])
+
+    def test_a_keyless_push_does_not_use_full_quiet(self):
+        ctx = MutingContext()
+        network, conversation = self.quiet_push_target(ctx, route="")
+        message = self.quiet_push_message()
+        network.deliver(conversation, message)
+        self.assertEqual(ctx.injected, [(None, plugin.push_text([message]), False)])
+
+    def test_non_true_quiet_pushes_values_turn_muting_off_at_load_and_reload(self):
+        for setting in (False, "false", 0, None):
+            with self.subTest(setting=setting):
+                ctx = MutingContext()
+                network, conversation = self.quiet_push_target(ctx, quiet_pushes=setting)
+                self.assertIs(network.mute_pushes, False)
+                self.write_config(True, quiet_pushes=True)
+                self.assertTrue(network.wake_allowed())
+                self.assertIs(network.mute_pushes, True)
+                self.write_config(True, quiet_pushes=setting)
+                message = self.quiet_push_message()
+                network.deliver(conversation, message)
+                self.assertEqual(ctx.injected, [(conversation.route, plugin.push_text([message]), False)])
+
+    def test_muting_requires_both_the_full_level_and_the_quiet_parameter(self):
+        message = self.quiet_push_message()
+        with self.subTest("display-only level"):
+            ctx = MutingContext()
+            network, conversation = self.quiet_push_target(ctx, levels=("display",))
+            network.deliver(conversation, message)
+            self.assertEqual(ctx.injected, [(conversation.route, plugin.push_text([message]), False)])
+        with self.subTest("no quiet parameter"):
+            ctx = Context()
+            inject = self.spy_on_injection(ctx)
+            network, conversation = self.quiet_push_target(ctx)
+            network.deliver(conversation, message)
+            inject.assert_called_once_with(plugin.push_text([message]), session_key=conversation.route)
+
+    def test_a_refused_muted_push_is_retried_once_without_quiet_and_confirmed(self):
+        for refusal in (False, TypeError("quiet rejected")):
+            with self.subTest(refusal=refusal):
+                ctx = MutingContext()
+                ctx.mute_result = refusal
+                network, conversation = self.quiet_push_target(ctx)
+                message = self.quiet_push_message()
+                rendered = plugin.push_text([message])
+                with mock.patch.object(ctx, "inject_message", wraps=ctx.inject_message) as inject:
+                    network.deliver(conversation, message)
+                self.assertEqual(inject.call_args_list, [mock.call(rendered, session_key=conversation.route, quiet="full"),
+                                                       mock.call(rendered, session_key=conversation.route)])
+                network.bus.ack.assert_called_once_with(message["id"])
+                self.assertTrue(conversation.was_delivered(message["id"]))
+
+    def test_a_muted_push_that_raises_another_exception_is_given_back_without_retry(self):
+        ctx = MutingContext()
+        ctx.mute_result = RuntimeError("injection failed")
+        inject = self.spy_on_injection(ctx)
+        network, conversation = self.quiet_push_target(ctx)
+        message = self.quiet_push_message(lease_until=123)
+        with self.assertLogs(plugin.log, "WARNING"):
+            network.deliver(conversation, message)
+        inject.assert_called_once_with(plugin.push_text([message]), session_key=conversation.route, quiet="full")
+        network.bus.nack.assert_called_once_with(message["id"], lease_until=123, timeout=10)
+        network.bus.ack.assert_not_called()
+        self.assertFalse(conversation.wake)
+
+    def test_a_refused_muted_push_and_refused_retry_are_given_back_after_two_calls(self):
+        ctx = MutingContext(accept=False)
+        ctx.mute_result = False
+        inject = self.spy_on_injection(ctx)
+        network, conversation = self.quiet_push_target(ctx)
+        message = self.quiet_push_message(lease_until=123)
+        rendered = plugin.push_text([message])
+        network.deliver(conversation, message)
+        self.assertEqual(inject.call_args_list, [mock.call(rendered, session_key=conversation.route, quiet="full"),
+                                               mock.call(rendered, session_key=conversation.route)])
+        network.bus.nack.assert_called_once_with(message["id"], lease_until=123, timeout=10)
+        network.bus.ack.assert_not_called()
+        self.assertFalse(conversation.wake)
 
     def test_a_long_message_is_pushed_as_a_pointer(self):
         self.write_config(True)
