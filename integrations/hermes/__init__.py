@@ -367,6 +367,9 @@ class Conversation:
         self.pull_only = False
         self.active_at = now()
         self.closed = threading.Event()
+        # Held around a session report's check and PUT, so ending the session can wait for
+        # a report already on its way: a PUT that landed after the DELETE would bring it back.
+        self.report_lock = threading.Lock()
         self.poller = None
         self.lock = threading.Lock()
         self.quiet_until = 0.0
@@ -723,15 +726,16 @@ class Network:
                  "%d bus report(s) failed", len(restored), skipped, failed)
 
     def report(self, conversation):
-        if conversation.closed.is_set() or self.closed.is_set():
-            # An ended conversation, or a copy Hermes has unloaded, speaks for
-            # nothing: its session id may belong to the next copy already, and
-            # reporting would bring an ended session back.
-            return
-        reply = self.bus.call("PUT", "/v1/sessions/" + urllib.parse.quote(conversation.id, safe=""), {
-            "name": conversation.name, "cwd": conversation.cwd,
-            "tier": "push" if conversation.wake else "pull", "active_at": conversation.active_at,
-        }, timeout=3)
+        with conversation.report_lock:
+            if conversation.closed.is_set() or self.closed.is_set():
+                # An ended conversation, or a copy Hermes has unloaded, speaks for
+                # nothing: its session id may belong to the next copy already, and
+                # reporting would bring an ended session back.
+                return
+            reply = self.bus.call("PUT", "/v1/sessions/" + urllib.parse.quote(conversation.id, safe=""), {
+                "name": conversation.name, "cwd": conversation.cwd,
+                "tier": "push" if conversation.wake else "pull", "active_at": conversation.active_at,
+            }, timeout=3)
         conversation.pull_only = bool(reply.get("pull_only"))
 
     def pushing(self, conversation):
@@ -886,6 +890,8 @@ class Network:
 
     def end(self, conversation):
         conversation.closed.set()
+        with conversation.report_lock:
+            pass  # a report already on its way lands first; no later one starts once closed
         if conversation.is_session:
             try:
                 self.bus.call("DELETE", "/v1/sessions/" + urllib.parse.quote(conversation.id, safe=""), timeout=3)
