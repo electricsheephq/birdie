@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 import os
+import queue
 import sqlite3
 import sys
 import tempfile
@@ -1148,19 +1149,45 @@ class PluginTest(PluginCase):
     def test_a_wait_stops_when_hermes_gives_up_on_the_call(self):
         # At its tool timeout, or a stop in the plain CLI, Hermes flags the tool's thread and
         # no longer reads the call. A reply taken then must go back, not be confirmed.
+        claimed = threading.Event()  # the wait has the reply, by either route
+
+        class Waiter(queue.Queue):  # what delivery hands a waited-for reply over through
+            def put(self, item, *args, **kwargs):
+                super().put(item, *args, **kwargs)
+                claimed.set()
+
         gave_up = types.ModuleType("tools.interrupt")
-        gave_up.is_interrupted = lambda: True
         for wake in (True, False):
             self.write_config(wake)
-            ctx, _ = self.load()
+            ctx, network = self.load()
             self.turn(ctx)
             sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}))
-            peer("POST", "/v1/messages", {"in_reply_to": peer_inbox(5)[0]["id"], "content": "the reply"})
-            with mock.patch.dict(sys.modules, {"tools": types.ModuleType("tools"), "tools.interrupt": gave_up}):
+            question = peer_inbox(5)[0]["id"]
+            inbox = network.bus.inbox
+
+            def watched(*args, **kwargs):  # the wait's own claim of the thread
+                messages = inbox(*args, **kwargs)
+                if any(m.get("content") == "the reply" for m in messages or []):
+                    claimed.set()
+                return messages
+            def reply():
+                peer("POST", "/v1/messages", {"in_reply_to": question, "content": "the reply"})
+            if wake:
+                # Hermes gives up just as the reply reaches the wait.
+                gave_up.is_interrupted = claimed.is_set
+                threading.Timer(1, reply).start()
+            else:
+                gave_up.is_interrupted = lambda: True
+                reply()
+            with mock.patch.dict(sys.modules, {"tools": types.ModuleType("tools"), "tools.interrupt": gave_up}), \
+                    mock.patch.object(plugin, "queue", types.SimpleNamespace(Queue=Waiter, Empty=queue.Empty)), \
+                    mock.patch.object(network.bus, "inbox", watched):
                 started = time.monotonic()
                 result = self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 60})
                 self.assertLess(time.monotonic() - started, 15)
             self.assertIn("Stopped waiting", result, f"wake={wake}")
+            if wake:
+                self.assertTrue(claimed.is_set(), "the push-mode wait had the reply")
             later = self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 8})
             shown = later + "".join(text for _, text in ctx.injected)
             self.assertIn("the reply", shown, f"wake={wake}: a reply given back comes again")
