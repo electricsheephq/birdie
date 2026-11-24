@@ -86,8 +86,15 @@ An answer you asked for and are waiting on is passed on, and so are questions
 back about something you asked for. A message the model reads with
 `birdie_check_inbox`, in a turn you started, still tells it to check with you.
 
-This is wording the model follows, not a filter. Hermes can still post its own
-"Working" notice on a long turn. To stop that for Telegram, set
+Birdie asks Hermes to fully mute pushes for new messages and Birdie notices only
+in messaging sessions such as Telegram, Discord and Slack. Other sessions and
+pushes Hermes refuses to mute fall back to ordinary pushes quieted by their
+wording. Replies and P0 messages always use ordinary pushes. Full muting needs
+a Hermes core with `QUIET_LEVELS` containing `"full"`. Set `"quiet_pushes": false`
+in the plugin's `birdie.json` to turn it off.
+
+On ordinary pushes, Hermes can still post its own "Working" notice on a long
+turn. To stop that for Telegram, set
 `display.platforms.telegram.long_running_notifications: false` in Hermes's
 `config.yaml`. Telegram's tool progress lines are off by default; if you turn
 `tool_progress` on, they show in pushed turns too.

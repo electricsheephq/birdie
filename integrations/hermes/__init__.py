@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -108,6 +109,14 @@ def load_config():
 def digest_seconds(config):
     minutes = config.get("digest_minutes")
     return 60 * (max(10, min(50, minutes)) if type(minutes) is int else 20)
+
+
+def supports_muting(ctx):
+    try:
+        from hermes_cli.plugins_injection import QUIET_LEVELS
+        return "full" in QUIET_LEVELS and "quiet" in inspect.signature(ctx.inject_message).parameters
+    except Exception:
+        return False
 
 
 def hermes_gave_up():
@@ -275,6 +284,10 @@ def is_reply(message):
     return message.get("from") not in ("birdie", "agent-bus") and bool(message.get("in_reply_to"))
 
 
+def can_mute(message):
+    return message.get("priority") != "p0" and not is_reply(message)
+
+
 def pushed_tail(message):
     """The pushed wording after a message's frame or pointer, by the same cases as frame()."""
     if message.get("from") in ("birdie", "agent-bus"):
@@ -385,6 +398,7 @@ class Conversation:
         self.cwd = cwd
         self.is_session = is_session
         self.route = ""
+        self.surface = ""
         self.restart_record = None
         self.restored = False
         self.wake = False
@@ -470,6 +484,8 @@ class Network:
         self.agent = config["agent"]
         self.bus = Bus(config["url"])
         self.digest_seconds = digest_seconds(config)
+        self.mute_supported = supports_muting(ctx)
+        self.mute_pushes = config.get("quiet_pushes", True) is True
         self.lock = threading.RLock()
         self.session_locks = {}  # bus session id -> lock (session_lock)
         self.conversations = {}
@@ -536,6 +552,7 @@ class Network:
         try:
             config = load_config()
             self.digest_seconds = digest_seconds(config)
+            self.mute_pushes = config.get("quiet_pushes", True) is True
             return config.get("wake") is True
         except (OSError, ValueError):
             return False
@@ -726,6 +743,7 @@ class Network:
                     continue
                 conversation = Conversation(ident, record["name"], record["cwd"], True)
                 conversation.route = record["route"]
+                conversation.surface = surface
                 conversation.restart_record = record
                 conversation.restored = True
                 conversation.wake = self.can_wake(conversation, surface)
@@ -845,6 +863,7 @@ class Network:
                 route = self.route()
                 if not route and platform in MESSAGING_SURFACES:
                     surface = platform  # A messaging turn can't use the CLI's keyless wake.
+                conversation.surface = surface
                 if route or conversation.restart_record is None:
                     conversation.active_at = now()
                 conversation.wake = self.can_wake(conversation, surface)
@@ -1068,18 +1087,38 @@ class Network:
             self.expire_pending(conversation)
 
     def deliver_digest(self, conversation, messages):
-        # A claim with P3 shares a push with any ready mail carrying it. Bound the
-        # rendered text as well, since frames and metadata add to the bus's body budget.
-        end_size = len(END_ANSWER.encode()) + 2  # push_text's last line
-        batch, size = [], end_size
+        # Keep replies and urgent mail ahead of updates so their push can stay visible.
+        visible, mutable = [], []
         for message in messages:
-            frame_size = len(push_frame(message).encode()) + 2
-            if batch and size + frame_size > MAX_DIGEST_PUSH_BYTES:
+            group = mutable if can_mute(message) else visible
+            group.append(message)
+
+        # Frames and metadata add to the bus's body budget.
+        end_size = len(END_ANSWER.encode()) + 2  # push_text's last line
+        for group in (visible, mutable):
+            batch, size = [], end_size
+            for message in group:
+                frame_size = len(push_frame(message).encode()) + 2
+                if batch and size + frame_size > MAX_DIGEST_PUSH_BYTES:
+                    self.deliver(conversation, *batch)
+                    batch, size = [], end_size
+                batch.append(message)
+                size += frame_size
+            if batch:
                 self.deliver(conversation, *batch)
-                batch, size = [], end_size
-            batch.append(message)
-            size += frame_size
-        self.deliver(conversation, *batch)
+
+    def inject_push(self, text, conversation, messages):
+        route = conversation.route
+        if (self.mute_supported and self.mute_pushes and route
+                and conversation.surface in MESSAGING_SURFACES and all(can_mute(m) for m in messages)):
+            try:
+                accepted = self.ctx.inject_message(text, session_key=route, quiet="full")
+            except TypeError:
+                accepted = False
+            if accepted is not False:
+                return bool(accepted)
+            log.debug("birdie: Hermes refused a muted push, retrying without quiet")
+        return bool(self.ctx.inject_message(text, session_key=route or None))
 
     def deliver(self, conversation, message, *more):
         """Puts mail into the conversation. Hermes accepting it only means the
@@ -1135,7 +1174,7 @@ class Network:
                     self.return_unshown(conversation, ready, reserved)
                     return
                 try:
-                    accepted = bool(self.ctx.inject_message(text, session_key=conversation.route or None))
+                    accepted = self.inject_push(text, conversation, ready)
                 except Exception:
                     log.warning("birdie: Hermes refused a message", exc_info=True)
             if accepted and reserved:
