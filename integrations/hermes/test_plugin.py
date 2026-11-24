@@ -78,13 +78,19 @@ class Context:
     """The parts of Hermes's PluginContext the plugin touches."""
     profile_name = "test"
 
-    def __init__(self, accept=True, inject=True):
+    def __init__(self, accept=True, inject=True, state=None, ready=False, platforms=()):
         self.accept = accept
         self.injected = []
         self.hooks = {}
         self.tools = {}
         self.schemas = {}
         self.unload = None
+        self.state = State() if state is None else state
+        self.factories = {}
+        self.adapters = {name: types.SimpleNamespace(is_connected=True) for name in platforms}
+        owner = types.SimpleNamespace(_adapters_for_profile=lambda profile: self.adapters)
+        self._manager = types.SimpleNamespace(has_gateway_message_injector=ready,
+                                              _gateway_message_injector=(owner, None))
         if not inject:
             self.inject_message = None
 
@@ -93,6 +99,9 @@ class Context:
 
     def register_hook(self, name, callback):
         self.hooks[name] = callback
+
+    def register_platform_handler(self, platform, factory):
+        self.factories[platform] = factory
 
     def register_tool(self, name, toolset, schema, handler, description=""):
         self.tools[name] = handler
@@ -107,6 +116,19 @@ class Context:
 
     def session_surface(self):
         return "cli"
+
+
+class State:
+    def __init__(self):
+        self.data = {}
+        self.writes = 0
+
+    def get(self, key, default=None):
+        return copy.deepcopy(self.data.get(key, default))
+
+    def set(self, key, value):
+        self.data[key] = copy.deepcopy(value)
+        self.writes += 1
 
 
 class PluginCase(unittest.TestCase):
@@ -124,6 +146,10 @@ class PluginCase(unittest.TestCase):
     def tearDown(self):
         for network in self.networks:
             network.close()
+        # A gateway unload leaves saved routes live until the bus's TTL.
+        bus = plugin.Bus(URL)
+        for session in self.sessions():
+            bus.call("DELETE", f"/v1/sessions/{session['id']}")
         pull_only(False)
         self.drain()
         self.dir.cleanup()
@@ -1282,8 +1308,16 @@ class Heartbeat2NotifierTest(PluginCase):
         self.assertEqual(result["status"], "queued")
         self.assertIsNone(result["error"])
         got = peer_inbox(wait=2)
-        self.assertEqual([(m["from"], m["content"], (m.get("meta") or {}).get("source")) for m in got],
-                         [("hermes", "HeartBeat: 'standup' is waiting in the Desktop app.", "heartbeat2")])
+        self.assertEqual([(m["from"], m["content"], (m.get("meta") or {}).get("source"), m.get("priority")) for m in got],
+                         [("hermes", "HeartBeat: 'standup' is waiting in the Desktop app.", "heartbeat2", "p1")])
+
+    def test_the_notifier_sends_p1_unless_heartbeat2_picks_a_level(self):
+        ctx = self.load_with_events()
+        send = ctx.emitted[0][1]["send"]
+        for level, want in (("p3", "p3"), ("p0", "p0"), ("urgent", "p1"), (None, "p1")):
+            self.assertTrue(send("peer", "HeartBeat: level %s" % level, level)["ok"])
+            got = peer_inbox(wait=2)
+            self.assertEqual([m.get("priority") for m in got], [want], level)
 
     def test_heartbeat2_asking_again_gets_the_same_offer_and_unload_withdraws_it(self):
         ctx = self.load_with_events()
@@ -1325,6 +1359,467 @@ class Heartbeat2NotifierTest(PluginCase):
         _, network = self.load()
         self.assertIsNone(network.notifier_stamp)
         network.withdraw_notifier()  # nothing to withdraw, and no emit to call
+
+
+class ReconnectTest(PluginCase):
+    ROUTE = "agent:test:telegram:dm:fixture"
+    EPOCH = "1970-01-01T00:00:00.001Z"
+
+    def setUp(self):
+        super().setUp()
+        self.ROUTE = f"{self.ROUTE}-{self._testMethodName}"
+        self.write_config(True)
+        for name, seconds in (("RESTORE_WAIT_SECONDS", 0.25), ("RESTORE_SETTLE_SECONDS", 0.05),
+                              ("RESTORE_POLL_SECONDS", 0.01)):
+            patcher = mock.patch.object(plugin, name, seconds, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def save_telegram(self):
+        ctx, network = self.load()
+        ctx.session_key = lambda: self.ROUTE
+        ctx.session_surface = lambda: "telegram"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, platform="telegram", user_message="hello")
+        return ctx, network, network.conversation("s1")
+
+    def restart(self, ctx, network, **kwargs):
+        network.close()
+        return self.load(state=ctx.state, platforms=("telegram",), **kwargs)
+
+    def connect(self, ctx):
+        ctx.factories["telegram"](None, ctx.adapters["telegram"])
+
+    def claim(self, saved):
+        sent = peer("POST", "/v1/messages", {"to": f"hermes/{saved.id}", "content": "wake", "priority": "p1"})
+        message, = [m for m in plugin.Bus(URL).inbox(saved.id, push=True) if m["id"] == sent["id"]]
+        return message
+
+    def restore_without_polling(self, ctx, network):
+        ctx._manager.has_gateway_message_injector = True
+        with mock.patch.object(network, "start_threads"):
+            network.restore(False)
+
+    def test_a_compacted_session_keeps_waking_under_its_new_id_after_restart(self):
+        ctx, old, saved = self.save_telegram()
+        ctx.hooks["post_compaction"](session_id="s2", old_session_id="s1")
+        saved_id = ctx.state.data[plugin.RESTART_STATE][saved.id]["session_id"]
+        ctx, network = self.restart(ctx, old)
+        self.restore_without_polling(ctx, network)
+        restored = network.conversations[saved.id]
+        message = self.claim(saved)
+        network.deliver(restored, message)
+        _, deadline = restored.pending[message["id"]]
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session="s2", platform="telegram", user_message=ctx.injected[0][1])
+        with mock.patch.object(plugin.time, "monotonic", return_value=deadline + 1):
+            network.expire_pending(restored)
+        self.assertEqual(network.sessions, {"s2": saved.id})
+        self.assertEqual([s["id"] for s in self.sessions()], [saved.id])
+        self.assertEqual(status(message["id"]), "delivered")
+        self.assertTrue(restored.wake)
+        self.assertEqual(saved_id, "s2")
+
+    def test_a_reset_finds_the_saved_record_even_if_its_session_id_is_stale(self):
+        ctx, network, saved = self.save_telegram()
+        ctx.hooks["post_compaction"](session_id="s2", old_session_id="s1")
+        ctx.state.data[plugin.RESTART_STATE][saved.id]["session_id"] = "s1"
+        ctx.hooks["on_session_reset"](old_session_id="s2", session_id="s3")
+        self.assertEqual(ctx.state.data[plugin.RESTART_STATE], {})
+        self.assertTrue(saved.closed.is_set())
+
+    def test_an_early_route_less_turn_adopts_the_saved_conversation_once(self):
+        ctx, old, saved = self.save_telegram()
+        message = self.claim(saved)
+        old.deliver(saved, message)
+        _, text = ctx.injected[0]
+        ctx, network = self.restart(ctx, old)
+        ctx._manager.has_gateway_message_injector = True
+        with mock.patch.object(network, "start_threads") as start:
+            self.turn(ctx, platform="telegram", user_message=text)
+            network.restore(False)
+        restored = network.conversation("s1")
+        self.assertEqual(restored.id, saved.id)
+        self.assertEqual(restored.active_at, self.EPOCH)
+        self.assertTrue(restored.wake and network.sees_turn_text)
+        self.assertEqual(status(message["id"]), "delivered")
+        start.assert_called_once_with(restored)
+
+    def test_a_full_pending_frame_maps_a_new_id_to_its_restored_conversation(self):
+        ctx, old, saved = self.save_telegram()
+        message = self.claim(saved)
+        old.deliver(saved, message)
+        _, text = ctx.injected[0]
+        ctx, network = self.restart(ctx, old)
+        self.restore_without_polling(ctx, network)
+        restored = network.conversation("s1")
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session="s2", platform="telegram", user_message=text)
+        self.assertIs(network.conversations[network.sessions["s2"]], restored)
+        self.assertEqual(ctx.state.data[plugin.RESTART_STATE][saved.id]["session_id"], "s2")
+        self.assertFalse(ctx.state.data[plugin.RESTART_STATE][saved.id].get("pending"))
+        self.assertEqual(restored.pending, {})
+        self.assertEqual(status(message["id"]), "delivered")
+
+    def test_a_partial_frame_and_an_ambiguous_match_keep_the_new_turn_pull_only(self):
+        ctx, old, saved = self.save_telegram()
+        ctx.session_key = lambda: self.ROUTE + "-second"
+        with mock.patch.object(old, "start_threads"):
+            self.turn(ctx, session="second", platform="telegram", user_message="hello")
+        ctx, network = self.restart(ctx, old)
+        self.restore_without_polling(ctx, network)
+        first = self.claim(saved)
+        second = self.claim(network.conversation("second"))
+        network.deliver(network.conversation("s1"), first)
+        network.deliver(network.conversation("second"), second)
+        a, b = (text for _, text in ctx.injected)
+        with mock.patch.object(network, "start_threads"):
+            for session, text in (("partial", a.splitlines()[0]), ("ambiguous", a + "\n\n" + b)):
+                self.turn(ctx, session=session, platform="telegram", user_message=text)
+                other = network.conversation(session)
+                self.assertNotIn(other.id, ctx.state.data[plugin.RESTART_STATE])
+                self.assertFalse(other.wake)
+        self.assertIn(first["id"], network.conversation("s1").pending)
+        self.assertIn(second["id"], network.conversation("second").pending)
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session="unambiguous", platform="telegram", user_message=a)
+        self.assertEqual(network.conversation("unambiguous").id, saved.id)
+
+    def test_a_fifo_push_is_not_injected_again_after_its_claim_expires_during_restart(self):
+        ctx, old, saved = self.save_telegram()
+        message = self.claim(saved)
+        old.deliver(saved, message)
+        _, deadline = saved.pending[message["id"]]
+        self.assertEqual(len(ctx.injected), 1)
+        ctx, network = self.restart(ctx, old)
+        self.restore_without_polling(ctx, network)
+        restored = network.conversation("s1")
+        with sqlite3.connect(DB, timeout=10) as db:
+            db.execute("UPDATE messages SET lease_until = 1 WHERE id = ?", (message["id"],))
+        reclaimed, = [m for m in network.bus.inbox(saved.id, push=True) if m["id"] == message["id"]]
+        network.deliver(restored, reclaimed)
+        self.assertEqual(ctx.injected, [])
+        self.assertAlmostEqual(restored.pending[message["id"]][1], deadline, delta=1)
+        with mock.patch.object(plugin.time, "monotonic", return_value=deadline + 1):
+            network.expire_pending(restored)
+        self.assertEqual(status(message["id"]), "queued")
+        self.assertFalse(restored.wake)
+        self.assertFalse(ctx.state.data[plugin.RESTART_STATE][saved.id].get("pending"))
+
+    def test_a_late_adapter_factory_restores_the_record_it_skipped(self):
+        ctx, old, saved = self.save_telegram()
+        ctx, network = self.restart(ctx, old)
+        ctx.adapters["telegram"].is_connected = False
+        ctx._manager.has_gateway_message_injector = True
+        self.connect(ctx)
+        network.restore_thread.join(2)
+        self.assertEqual(network.conversations, {})
+        ctx.adapters["telegram"].is_connected = True
+        with mock.patch.object(network, "start_threads"):
+            self.connect(ctx)
+            network.restore_thread.join(2)
+        self.assertIn(saved.id, network.conversations)
+
+    def test_a_factory_can_retry_after_the_first_wait_for_the_injector_times_out(self):
+        ctx, old, saved = self.save_telegram()
+        ctx, network = self.restart(ctx, old)
+        self.connect(ctx)
+        network.restore_thread.join(2)
+        self.assertEqual(network.conversations, {})
+        ctx._manager.has_gateway_message_injector = True
+        with mock.patch.object(network, "start_threads"):
+            self.connect(ctx)
+            network.restore_thread.join(2)
+        self.assertIn(saved.id, network.conversations)
+
+    def test_a_saved_conversation_older_than_thirty_days_is_dropped(self):
+        ctx, old, saved = self.save_telegram()
+        ctx.state.data[plugin.RESTART_STATE][saved.id]["saved_at"] = time.time() - 31 * 86400
+        ctx, network = self.restart(ctx, old)
+        self.restore_without_polling(ctx, network)
+        self.assertEqual(network.conversations, {})
+        self.assertEqual(ctx.state.data[plugin.RESTART_STATE], {})
+
+    def test_a_daily_turn_keeps_an_unchanged_record_from_ageing_out(self):
+        ctx, network, saved = self.save_telegram()
+        stale = time.time() - 2 * 86400
+        ctx.state.data[plugin.RESTART_STATE][saved.id]["saved_at"] = stale
+        saved.restart_record = dict(ctx.state.data[plugin.RESTART_STATE][saved.id])
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, platform="telegram", user_message="still here")
+        self.assertGreater(ctx.state.data[plugin.RESTART_STATE][saved.id]["saved_at"], stale + 86400)
+
+    def test_ending_one_hermes_session_keeps_the_record_while_another_still_maps_to_it(self):
+        ctx, network, saved = self.save_telegram()
+        with network.lock:
+            network.sessions["s2"] = saved.id
+        network.forget({"s1"})
+        self.assertEqual(ctx.state.data[plugin.RESTART_STATE][saved.id]["session_id"], "s2")
+        network.forget({"s2"})
+        self.assertNotIn(saved.id, ctx.state.data[plugin.RESTART_STATE])
+
+    def test_a_route_less_turn_keeps_a_restored_record_from_ageing_out(self):
+        ctx, old, saved = self.save_telegram()
+        ctx, network = self.restart(ctx, old)
+        self.restore_without_polling(ctx, network)
+        restored = network.conversations[saved.id]
+        stale = time.time() - 2 * 86400
+        ctx.state.data[plugin.RESTART_STATE][saved.id]["saved_at"] = stale
+        restored.restart_record = dict(ctx.state.data[plugin.RESTART_STATE][saved.id])
+        ctx.session_key = lambda: ""
+        ctx.session_surface = lambda: "telegram"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, platform="telegram", user_message="pushed")
+        self.assertGreater(ctx.state.data[plugin.RESTART_STATE][saved.id]["saved_at"], stale + 86400)
+
+    def test_deleting_a_chat_whose_route_moved_to_a_new_session_id_drops_its_record(self):
+        ctx, old, saved = self.save_telegram()
+        ctx, network = self.restart(ctx, old)
+        self.restore_without_polling(ctx, network)
+        ctx.session_key = lambda: self.ROUTE
+        ctx.session_surface = lambda: "telegram"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session="s9", platform="telegram", user_message="hello again")
+        self.assertNotIn("s1", network.sessions)
+        ctx.hooks["on_session_delete"](session_id="s9")
+        self.assertNotIn(saved.id, ctx.state.data[plugin.RESTART_STATE])
+
+    def test_with_wake_off_nothing_is_restored_or_reported(self):
+        ctx, old, saved = self.save_telegram()
+        self.write_config(False)
+        ctx, network = self.restart(ctx, old)
+        with mock.patch.object(network, "report", wraps=network.report) as report:
+            self.restore_without_polling(ctx, network)
+            report.assert_not_called()
+        self.assertEqual(network.conversations, {})
+        self.assertIn(saved.id, ctx.state.data[plugin.RESTART_STATE])  # kept for when wake is back on
+
+    def test_with_wake_off_a_turn_in_a_saved_chat_still_adopts_it_so_wake_can_come_back(self):
+        ctx, old, saved = self.save_telegram()
+        self.write_config(False)
+        ctx, network = self.restart(ctx, old)
+        ctx._manager.has_gateway_message_injector = True
+        ctx.session_key = lambda: ""
+        ctx.session_surface = lambda: "telegram"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, platform="telegram", user_message="hi")
+        adopted = network.conversations[saved.id]
+        self.assertEqual(adopted.route, self.ROUTE)
+        self.assertFalse(adopted.wake)
+        self.write_config(True)
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, platform="telegram", user_message="again")
+        self.assertTrue(network.conversations[saved.id].wake)
+
+    def test_an_oversized_pushed_notice_also_says_not_to_message_the_user(self):
+        notice = {"from": "birdie", "id": "msg_1", "thread_id": "thr_1", "content": "x", "content_bytes": 10 ** 6}
+        self.assertIn(plugin.NOTICE_PUSHED, plugin.push_frame(notice))
+        self.assertNotIn(plugin.NOTICE_PUSHED, plugin.push_frame({**notice, "from": "peer"}))
+
+    def test_wake_turned_off_during_the_startup_wait_restores_nothing(self):
+        ctx, old, saved = self.save_telegram()
+        ctx, network = self.restart(ctx, old)
+        with mock.patch.object(network, "wake_allowed", side_effect=[True, False]), \
+                mock.patch.object(network, "report", wraps=network.report) as report:
+            self.restore_without_polling(ctx, network)
+            report.assert_not_called()
+        self.assertEqual(network.conversations, {})
+
+    def test_a_notice_pushed_with_the_old_wording_is_still_recognised_as_shown(self):
+        notice = {"from": "birdie", "id": "msg_1", "thread_id": "thr_1", "content": "held: your message waits"}
+        self.assertTrue(plugin.shown_in(notice, "before\n" + plugin.frame(notice) + "\nafter"))
+        self.assertTrue(plugin.shown_in(notice, plugin.push_frame(notice)))
+        peer_message = {**notice, "from": "peer"}
+        self.assertFalse(plugin.shown_in(peer_message, plugin.frame(notice)))
+
+    def test_a_pushed_birdie_notice_tells_the_model_not_to_message_its_user_now(self):
+        notice = {"from": "birdie", "id": "msg_1", "thread_id": "thr_1", "content": "held: your message waits"}
+        self.assertIn("don't message your user about it now", plugin.push_frame(notice))
+        self.assertNotIn("tell your user if it matters", plugin.push_frame(notice))
+        self.assertIn("tell your user if it matters", plugin.frame(notice))
+
+    def test_a_restore_pass_logs_its_outcome_once_without_conversation_details(self):
+        ctx, old, _ = self.save_telegram()
+        ctx, network = self.restart(ctx, old)
+        with self.assertLogs(plugin.log, level="INFO") as logs:
+            self.restore_without_polling(ctx, network)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("restored 1 conversation(s)", logs.output[0])
+        self.assertIn("0 skipped", logs.output[0])
+        self.assertNotIn(self.ROUTE, logs.output[0])
+
+    def test_a_saved_telegram_conversation_wakes_for_p1_after_the_injector_appears(self):
+        old_ctx, old, saved = self.save_telegram()
+        ctx, network = self.restart(old_ctx, old)
+        with mock.patch.object(network, "report", wraps=network.report) as report:
+            self.connect(ctx)
+            self.assertEqual(network.conversations, {})
+            report.assert_not_called()
+            ctx._manager.has_gateway_message_injector = True
+            self.assertTrue(wait_until(lambda: network.conversations.get(saved.id)
+                                      and network.conversations[saved.id].poller))
+            restored = network.conversation("s1")
+            self.assertEqual(restored.active_at, self.EPOCH)
+            self.assertTrue(restored.poller.is_alive())
+            report.assert_called_with(restored)
+        sent = peer("POST", "/v1/messages", {"to": f"hermes/{saved.id}", "content": "wake", "priority": "p1"})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        route, text = ctx.injected[0]
+        self.assertEqual(route, self.ROUTE)
+        self.assertEqual(list(plugin.shown_ids(text)), [sent["id"]])
+        self.assertEqual(status(sent["id"]), "claimed")
+        ctx.session_surface = lambda: "telegram"
+        self.turn(ctx, platform="telegram", user_message=text)
+        self.assertEqual(status(sent["id"]), "delivered")
+        self.assertIs(network.conversation("s1"), restored)
+        self.assertEqual(restored.active_at, self.EPOCH)
+        self.assertNotIn(sent["id"], old_ctx.state.data[plugin.RESTART_STATE][saved.id].get("pending", {}))
+
+    def test_a_lone_p3_stays_held_when_a_cold_conversation_reconnects(self):
+        old_ctx, old, saved = self.save_telegram()
+        sent = peer("POST", "/v1/messages", {"to": f"hermes/{saved.id}", "content": "digest", "priority": "p3"})
+        cold = int((time.time() - 2 * 3600) * 1000)
+        with sqlite3.connect(DB, timeout=10) as db:
+            db.execute("UPDATE sessions SET active_at = ? WHERE id = ?", (cold, saved.id))
+            # Old enough for a warm digest, but younger than the cold-session hold ceiling.
+            db.execute("UPDATE messages SET created_at = ? WHERE id = ?",
+                       (int((time.time() - 30 * 60) * 1000), sent["id"]))
+        ctx, network = self.restart(old_ctx, old)
+        polled = threading.Event()
+        inbox = network.bus.inbox
+
+        def poll(*args, **kwargs):
+            result = inbox(*args, **kwargs)
+            polled.set()
+            return result
+
+        network.bus.inbox = poll
+        ctx._manager.has_gateway_message_injector = True
+        self.connect(ctx)
+        self.assertTrue(polled.wait(8))
+        with sqlite3.connect(DB, timeout=10) as db:
+            self.assertEqual(db.execute("SELECT active_at FROM sessions WHERE id = ?", (saved.id,)).fetchone(), (cold,))
+        self.assertEqual(status(sent["id"]), "queued")
+        self.assertEqual(ctx.injected, [])
+
+    def test_a_factory_without_an_injector_stops_waiting_without_touching_the_bus(self):
+        old_ctx, old, _ = self.save_telegram()
+        ctx, network = self.restart(old_ctx, old)
+        with mock.patch.object(network.bus, "call") as bus:
+            ctx.factories["matrix"](None, types.SimpleNamespace(is_connected=True))
+            network.restore_thread.join(2)
+            self.assertFalse(network.restore_thread.is_alive())
+            bus.assert_not_called()
+        self.assertEqual(network.conversations, {})
+
+    def test_adapter_refires_use_one_worker_and_leave_a_known_conversation_in_place(self):
+        ctx, network, saved = self.save_telegram()
+        ctx.adapters["telegram"] = types.SimpleNamespace(is_connected=True)
+        with mock.patch.object(network.bus, "call") as bus:
+            self.connect(ctx)
+            thread = network.restore_thread
+            self.connect(ctx)
+            self.assertIs(network.restore_thread, thread)
+            ctx._manager.has_gateway_message_injector = True
+            thread.join(2)
+            self.connect(ctx)
+            network.restore_thread.join(2)
+            self.assertFalse(thread.is_alive())
+            bus.assert_not_called()
+        self.assertIs(network.conversation("s1"), saved)
+        self.assertIsNone(saved.poller)
+
+    def test_a_restored_push_goes_back_after_600_seconds_without_a_turn(self):
+        old_ctx, old, saved = self.save_telegram()
+        ctx, network = self.restart(old_ctx, old, ready=True)
+        self.assertTrue(wait_until(lambda: saved.id in network.conversations))
+        sent = peer("POST", "/v1/messages", {"to": f"hermes/{saved.id}", "content": "no turn", "priority": "p1"})
+        self.assertTrue(wait_until(lambda: ctx.injected))
+        self.assertEqual(status(sent["id"]), "claimed")
+        restored = network.conversation("s1")
+        _, deadline = restored.pending[sent["id"]]
+        with mock.patch.object(plugin.time, "monotonic", return_value=deadline - 1):
+            network.expire_pending(restored)
+        self.assertEqual(status(sent["id"]), "claimed")
+        self.assertEqual(plugin.PENDING_SECONDS, 600)
+        with mock.patch.object(plugin.time, "monotonic", return_value=deadline):
+            network.expire_pending(restored)
+        # An inbox poll already in flight may briefly claim the returned mail again.
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued"))
+        self.assertFalse(restored.wake)
+        self.assertEqual(len(ctx.injected), 1)
+
+    def test_shutdown_keeps_the_record_and_a_real_end_reset_or_delete_drops_it(self):
+        for hook, kwargs in (("on_session_finalize", {"session_id": "s1"}),
+                             ("on_session_reset", {"old_session_id": "s1", "session_id": "s2"}),
+                             ("on_session_delete", {"deleted_ids": ["s1"]})):
+            with self.subTest(hook=hook):
+                old_ctx, old, saved = self.save_telegram()
+                old_ctx.hooks["on_session_finalize"](session_id="s1", reason="shutdown")
+                self.assertTrue(any(s["id"] == saved.id for s in self.sessions()), "shutdown sent DELETE")
+                old.close()
+                self.assertTrue(any(s["id"] == saved.id for s in self.sessions()), "unload sent DELETE")
+                ctx, network = self.restart(old_ctx, old, ready=True)
+                self.assertTrue(wait_until(lambda: saved.id in network.conversations))
+                restored = network.conversation("s1")
+                ctx.hooks[hook](**kwargs)
+                self.assertTrue(restored.closed.is_set())
+                self.assertFalse(any(ctx.state.data.values()))
+                self.assertFalse(any(s["id"] == saved.id for s in self.sessions()))
+
+    def test_cli_route_less_and_keep_warm_turns_write_no_record(self):
+        ctx, network = self.load()
+        self.assertEqual(set(ctx.factories), {"telegram", "discord", "slack", "whatsapp", "signal", "matrix"})
+        ctx.session_key = lambda: "agent:test:local:fixture"
+        self.turn(ctx, session="cli")
+        ctx.session_key = lambda: self.ROUTE
+        ctx.session_surface = lambda: "telegram"
+        self.turn(ctx, session="warm", platform="telegram", user_message=PluginTest.KEEP_WARM)
+        self.assertNotIn("warm", network.sessions)
+        ctx.session_key = lambda: ""
+        self.turn(ctx, session="no-route", platform="telegram", user_message="hello")
+        self.assertEqual(ctx.state.writes, 0)
+
+    def test_a_record_is_rewritten_only_when_a_real_turn_changes_it(self):
+        ctx, network, _ = self.save_telegram()
+        ctx.session_cwd = lambda: "/fixture/project"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, platform="telegram", user_message="new cwd")
+            self.turn(ctx, platform="telegram", user_message="same cwd")
+            self.turn(ctx, session="s2", platform="telegram", user_message="new session id")
+        self.assertEqual(ctx.state.writes, 3)
+        ctx, network = self.restart(ctx, network, ready=True)
+        self.assertTrue(wait_until(lambda: "s2" in network.sessions))
+        restored = network.conversation("s2")
+        self.assertEqual((restored.name, restored.cwd), ("project", "/fixture/project"))
+
+    def test_force_reload_restores_at_register_and_skips_a_disconnected_adapter(self):
+        old_ctx, old, saved = self.save_telegram()
+        old.close()
+        _, offline = self.load(state=old_ctx.state, ready=True)
+        offline.restore_thread.join(2)
+        self.assertEqual(offline.conversations, {})
+        _, network = self.load(state=old_ctx.state, ready=True, platforms=("telegram",))
+        network.restore_thread.join(2)
+        self.assertFalse(network.restore_thread.is_alive())
+        self.assertEqual(network.conversation("s1").id, saved.id)
+
+    def test_a_route_less_turn_with_a_changed_id_stays_pull_only_until_the_route_is_known(self):
+        old_ctx, old, saved = self.save_telegram()
+        ctx, network = self.restart(old_ctx, old)
+        self.restore_without_polling(ctx, network)
+        # A host surface fallback to CLI mustn't turn an unkeyed Telegram turn into a keyless wake.
+        self.turn(ctx, session="reset-id", platform="telegram", user_message="route was unavailable")
+        other = network.conversation("reset-id")
+        self.assertNotEqual(saved.id, other.id)
+        self.assertFalse(other.wake)
+        self.assertEqual(ctx.state.writes, 1)
+        ctx.session_key = lambda: self.ROUTE
+        ctx.session_surface = lambda: "telegram"
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx, session="reset-id", platform="telegram", user_message="route is back")
+        self.assertEqual(network.conversation("reset-id").id, saved.id)
+        self.assertEqual(ctx.state.writes, 2)
 
 
 if __name__ == "__main__":

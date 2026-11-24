@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- Hermes: with `wake` off, the plugin restores nothing after a restart, so after a restart `wake: false` keeps it from pushing or taking mail (a registration from before the restart lapses within 90 seconds). A birdie notice pushed as its own turn tells the model not to message its user about it then.
+- The Hermes plugin's HeartBeat notifier sends p1 unless HeartBeat picks a level, so a recipient that holds unranked mail as p3 still sees HeartBeat notices.
 
 Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 
@@ -83,6 +85,7 @@ Changes since the `eva-pin-2026-11-15` tag (bbcdfcc), which comes after v0.5.0.
 
 ### Fixed
 
+- Saved Hermes messaging conversations reconnect after a gateway restart without waiting for a user turn or warming the session (#58 I11).
 - Hermes can fetch held mail with `birdie_check_inbox` while pushes are on.
 - Oversized p3 pushes use the same thread pointer before and after a Hermes plugin reload, so a turn that shows one can confirm it.
 - Answers for a closed session no longer reach another one (#6). With the
