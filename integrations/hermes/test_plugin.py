@@ -1203,6 +1203,38 @@ class PluginTest(PluginCase):
         # The next turn's wait runs again.
         self.assertIn("No reply yet", self.call(ctx, "birdie_wait_for_reply", {"thread_id": "thr_x", "timeout_seconds": 0.3}))
 
+    def test_a_report_on_its_way_doesnt_bring_back_a_deleted_session(self):
+        # A heartbeat or restore report checks that the conversation is open, then PUTs its
+        # session. A delete in between must not be undone by that PUT landing after the DELETE.
+        self.write_config(True)
+        ctx, network = self.load()
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx)
+        conversation = network.conversation("s1")
+        self.assertTrue(any(s["id"] == conversation.id for s in self.sessions()))
+        started, release = threading.Event(), threading.Event()
+        call = network.bus.call
+
+        def slow_put(method, path, *args, **kwargs):
+            if method == "PUT" and path.startswith("/v1/sessions/"):
+                started.set()
+                release.wait(10)
+            return call(method, path, *args, **kwargs)
+
+        with mock.patch.object(network.bus, "call", slow_put):
+            reporter = threading.Thread(target=network.report, args=(conversation,))
+            reporter.start()
+            self.assertTrue(started.wait(10))
+            deleter = threading.Thread(target=ctx.hooks["on_session_delete"], kwargs={"deleted_ids": ["s1"]})
+            deleter.start()
+            time.sleep(0.5)  # the delete goes first unless it waits for the report on its way
+            release.set()
+            reporter.join(15)
+            deleter.join(15)
+        self.assertTrue(conversation.closed.is_set())
+        self.assertFalse(any(s["id"] == conversation.id for s in self.sessions()),
+                         "a report on its way brought a deleted session back")
+
     def test_finishing_a_conversation_ends_its_session_and_wake(self):
         self.write_config(True)
         ctx, _ = self.load()
