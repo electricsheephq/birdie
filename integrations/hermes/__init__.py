@@ -37,7 +37,10 @@ LEASE_SECONDS = 120
 WAIT_STEP_SECONDS = 2  # how often a waiting tool notices it was interrupted
 MAX_CHECK_SECONDS = 120
 REPORT_DRAIN_SECONDS = 1  # how long ending a session waits for a report on its way
-MAX_REPLY_SECONDS = 600
+# Hermes ends a tool call after 420 s by default (agent/tool_executor.py, tools.sequential_call), and a
+# plugin tool can't declare a longer deadline. A wait that outlived the call could take a reply, confirm
+# it to the bus, and return it to a call nobody reads any more, so the wait ends well before that.
+MAX_REPLY_SECONDS = 400
 RETRY_SECONDS = 5
 TURN_RETRY_SECONDS = 60 * 60
 QUIET_SECONDS = 5 * 60
@@ -1453,7 +1456,7 @@ TOOLS = (
     ("birdie_wait_for_reply", "wait_for_reply",
      "Wait for the answer to a message you sent, when your user is waiting on it. Returns it, or says none came in time.",
      {"thread_id": text("thread_id returned by birdie_send_message."),
-      "timeout_seconds": {"type": "number", "description": "Default 120, max 600."}},
+      "timeout_seconds": {"type": "number", "description": "Default 120, max 400."}},
      ["thread_id"]),
     ("birdie_get_thread", "get_thread",
      "Read the full history of a thread you are part of.",
