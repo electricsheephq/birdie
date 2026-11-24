@@ -1667,6 +1667,27 @@ class ReconnectTest(PluginCase):
         self.assertEqual(restored.pending, {})
         self.assertEqual(status(message["id"]), "delivered")
 
+    def test_a_restored_push_claimed_again_before_its_turn_still_maps_the_new_id(self):
+        # An upgrade can move a message across the pointer threshold: other wording after the
+        # tag changes the frame's size. The delayed turn still shows the frame the copy before
+        # the restart pushed, so a claim of it again must not lose the saved fingerprint.
+        ctx, old, saved = self.save_telegram()
+        message = self.claim(saved)
+        old.deliver(saved, message)
+        _, text = ctx.injected[0]
+        ctx, network = self.restart(ctx, old)
+        self.restore_without_polling(ctx, network)
+        restored = network.conversation("s1")
+        with mock.patch.object(plugin, "MAX_PUSH_BYTES", 10):  # this copy would push a pointer
+            network.deliver(restored, message)  # its lease ran out before its turn: claimed again
+            self.assertNotIn("_frame", restored.pending[message["id"]][0])
+            with mock.patch.object(network, "start_threads"):
+                self.turn(ctx, session="s2", platform="telegram", user_message=text)
+        self.assertIs(network.conversations[network.sessions["s2"]], restored)
+        self.assertEqual(restored.pending, {})
+        self.assertEqual(status(message["id"]), "delivered")
+        self.assertEqual(len(ctx.injected), 0, "put in again after the restart")
+
     def test_a_partial_frame_and_an_ambiguous_match_keep_the_new_turn_pull_only(self):
         ctx, old, saved = self.save_telegram()
         ctx.session_key = lambda: self.ROUTE + "-second"
