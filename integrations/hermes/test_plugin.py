@@ -65,7 +65,9 @@ def peer_inbox(wait=0):
     return messages
 
 
-def wait_until(check, seconds=8):
+def wait_until(check, seconds=20):
+    """Waits for something that must happen; the limit only ends a failing test. It allows for a
+    loaded runner, and stays under the 30 s heartbeat, which would otherwise redo what a test checks."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if check():
@@ -641,7 +643,7 @@ class PluginTest(PluginCase):
         with mock.patch.object(plugin, "PENDING_SECONDS", 1):
             sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "dropped by the gateway"})
             self.assertTrue(wait_until(lambda: ctx.injected))
-            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued", 6), "a push the gateway dropped was lost")
+            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued"), "a push the gateway dropped was lost")
         self.assertTrue(wait_until(lambda: self.sessions()[0]["tier"] == "pull"), "senders aren't told it must check")
         self.assertEqual(len(ctx.injected), 1, "put in again with no turn in between")
         self.assertIn("dropped by the gateway", self.call(ctx, "birdie_check_inbox"))
@@ -695,7 +697,7 @@ class PluginTest(PluginCase):
         self.turn(ctx, user_message="hello")
         sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "eager"})
         self.assertTrue(wait_until(lambda: ctx.injected))
-        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 4), "a push its turn showed wasn't confirmed")
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered"), "a push its turn showed wasn't confirmed")
 
     def test_a_push_shown_after_it_was_given_back_isnt_put_in_again(self):
         self.write_config(True)
@@ -704,10 +706,10 @@ class PluginTest(PluginCase):
         with mock.patch.object(plugin, "PENDING_SECONDS", 1):
             sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "late turn"})
             self.assertTrue(wait_until(lambda: ctx.injected))
-            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued", 6))
+            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued"))
         # The turn it was put in for comes late, and turns waking back on.
         self.turn(ctx, user_message=ctx.injected[0][1])
-        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 6), "not confirmed when taken again")
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered"), "not confirmed when taken again")
         self.assertEqual(len(ctx.injected), 1, "put in a second time after its turn showed it")
 
     def test_a_late_turn_after_a_refused_retry_isnt_put_in_again(self):
@@ -717,7 +719,7 @@ class PluginTest(PluginCase):
         with mock.patch.object(plugin, "PENDING_SECONDS", 1):
             sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "retried"})
             self.assertTrue(wait_until(lambda: ctx.injected))
-            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued", 6))
+            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued"))
         first = ctx.injected[0][1]
         # A turn that doesn't show it turns waking back on, and Hermes refuses the retry.
         ctx.accept = False
@@ -727,7 +729,7 @@ class PluginTest(PluginCase):
         # Then the turn the first push was put in for comes late.
         ctx.accept = True
         self.turn(ctx, user_message=first)
-        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 6), "not confirmed when taken again")
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered"), "not confirmed when taken again")
         self.assertEqual(len(ctx.injected), 2, "put in again after its turn showed it")
 
     def test_a_push_put_in_before_a_reload_is_confirmed_when_its_turn_shows_it(self):
@@ -741,7 +743,7 @@ class PluginTest(PluginCase):
         ctx, _ = self.load()
         self.turn(ctx, user_message=old_ctx.injected[0][1])
         # Delivered now, so when the old claim runs out it isn't taken and put in again.
-        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 4), "the new copy didn't confirm it")
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered"), "the new copy didn't confirm it")
 
     def test_an_oversized_digest_frame_matches_its_thread_copy_and_confirms_after_reload(self):
         self.write_config(True)
@@ -884,7 +886,7 @@ class PluginTest(PluginCase):
 
         with mock.patch.object(network.bus, "inbox", side_effect=inbox_with_next_reply):
             result = self.call(ctx, "birdie_wait_for_reply",
-                               {"thread_id": sent["thread_id"], "timeout_seconds": 3}, session=session)
+                               {"thread_id": sent["thread_id"], "timeout_seconds": 20}, session=session)
         self.assertEqual(status(old["id"]), "delivered")
         self.assertNotIn("already shown", result)
         self.assertIn("new reply", result)
@@ -939,7 +941,7 @@ class PluginTest(PluginCase):
         self.assertIn("held for the tool", self.call(ctx, "birdie_check_inbox"))
         pull_only(False)  # no new turn, no restart
         peer("POST", "/v1/messages", {"to": "hermes", "content": "pushed again"})
-        self.assertTrue(wait_until(lambda: ctx.injected, 10), "not pushed once pull-only was off")
+        self.assertTrue(wait_until(lambda: ctx.injected), "not pushed once pull-only was off")
         self.assertIn("pushed again", ctx.injected[0][1])
 
     def test_a_wait_gets_its_reply_when_made_pull_only_since_the_last_report(self):
