@@ -65,7 +65,9 @@ def peer_inbox(wait=0):
     return messages
 
 
-def wait_until(check, seconds=8):
+def wait_until(check, seconds=20):
+    """Waits for something that must happen; the limit only ends a failing test. It allows for a
+    loaded runner, and stays under the 30 s heartbeat, which would otherwise redo what a test checks."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if check():
@@ -641,7 +643,7 @@ class PluginTest(PluginCase):
         with mock.patch.object(plugin, "PENDING_SECONDS", 1):
             sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "dropped by the gateway"})
             self.assertTrue(wait_until(lambda: ctx.injected))
-            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued", 6), "a push the gateway dropped was lost")
+            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued"), "a push the gateway dropped was lost")
         self.assertTrue(wait_until(lambda: self.sessions()[0]["tier"] == "pull"), "senders aren't told it must check")
         self.assertEqual(len(ctx.injected), 1, "put in again with no turn in between")
         self.assertIn("dropped by the gateway", self.call(ctx, "birdie_check_inbox"))
@@ -695,7 +697,7 @@ class PluginTest(PluginCase):
         self.turn(ctx, user_message="hello")
         sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "eager"})
         self.assertTrue(wait_until(lambda: ctx.injected))
-        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 4), "a push its turn showed wasn't confirmed")
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered"), "a push its turn showed wasn't confirmed")
 
     def test_a_push_shown_after_it_was_given_back_isnt_put_in_again(self):
         self.write_config(True)
@@ -704,10 +706,10 @@ class PluginTest(PluginCase):
         with mock.patch.object(plugin, "PENDING_SECONDS", 1):
             sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "late turn"})
             self.assertTrue(wait_until(lambda: ctx.injected))
-            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued", 6))
+            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued"))
         # The turn it was put in for comes late, and turns waking back on.
         self.turn(ctx, user_message=ctx.injected[0][1])
-        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 6), "not confirmed when taken again")
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered"), "not confirmed when taken again")
         self.assertEqual(len(ctx.injected), 1, "put in a second time after its turn showed it")
 
     def test_a_late_turn_after_a_refused_retry_isnt_put_in_again(self):
@@ -717,7 +719,7 @@ class PluginTest(PluginCase):
         with mock.patch.object(plugin, "PENDING_SECONDS", 1):
             sent = peer("POST", "/v1/messages", {"to": "hermes", "content": "retried"})
             self.assertTrue(wait_until(lambda: ctx.injected))
-            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued", 6))
+            self.assertTrue(wait_until(lambda: status(sent["id"]) == "queued"))
         first = ctx.injected[0][1]
         # A turn that doesn't show it turns waking back on, and Hermes refuses the retry.
         ctx.accept = False
@@ -727,7 +729,7 @@ class PluginTest(PluginCase):
         # Then the turn the first push was put in for comes late.
         ctx.accept = True
         self.turn(ctx, user_message=first)
-        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 6), "not confirmed when taken again")
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered"), "not confirmed when taken again")
         self.assertEqual(len(ctx.injected), 2, "put in again after its turn showed it")
 
     def test_a_push_put_in_before_a_reload_is_confirmed_when_its_turn_shows_it(self):
@@ -741,7 +743,7 @@ class PluginTest(PluginCase):
         ctx, _ = self.load()
         self.turn(ctx, user_message=old_ctx.injected[0][1])
         # Delivered now, so when the old claim runs out it isn't taken and put in again.
-        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered", 4), "the new copy didn't confirm it")
+        self.assertTrue(wait_until(lambda: status(sent["id"]) == "delivered"), "the new copy didn't confirm it")
 
     def test_an_oversized_digest_frame_matches_its_thread_copy_and_confirms_after_reload(self):
         self.write_config(True)
@@ -884,7 +886,7 @@ class PluginTest(PluginCase):
 
         with mock.patch.object(network.bus, "inbox", side_effect=inbox_with_next_reply):
             result = self.call(ctx, "birdie_wait_for_reply",
-                               {"thread_id": sent["thread_id"], "timeout_seconds": 3}, session=session)
+                               {"thread_id": sent["thread_id"], "timeout_seconds": 20}, session=session)
         self.assertEqual(status(old["id"]), "delivered")
         self.assertNotIn("already shown", result)
         self.assertIn("new reply", result)
@@ -939,7 +941,7 @@ class PluginTest(PluginCase):
         self.assertIn("held for the tool", self.call(ctx, "birdie_check_inbox"))
         pull_only(False)  # no new turn, no restart
         peer("POST", "/v1/messages", {"to": "hermes", "content": "pushed again"})
-        self.assertTrue(wait_until(lambda: ctx.injected, 10), "not pushed once pull-only was off")
+        self.assertTrue(wait_until(lambda: ctx.injected), "not pushed once pull-only was off")
         self.assertIn("pushed again", ctx.injected[0][1])
 
     def test_a_wait_gets_its_reply_when_made_pull_only_since_the_last_report(self):
@@ -1202,6 +1204,120 @@ class PluginTest(PluginCase):
         self.assertIn("Stopped waiting", result["error"])
         # The next turn's wait runs again.
         self.assertIn("No reply yet", self.call(ctx, "birdie_wait_for_reply", {"thread_id": "thr_x", "timeout_seconds": 0.3}))
+
+    def test_a_report_on_its_way_doesnt_bring_back_a_deleted_session(self):
+        # A heartbeat or restore report checks that the conversation is open, then PUTs its
+        # session. A delete in between must not be undone by that PUT landing after the DELETE.
+        self.write_config(True)
+        ctx, network = self.load()
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx)
+        conversation = network.conversation("s1")
+        self.assertTrue(any(s["id"] == conversation.id for s in self.sessions()))
+        started, release, deleted = threading.Event(), threading.Event(), threading.Event()
+        call = network.bus.call
+
+        def slow_put(method, path, *args, **kwargs):
+            if method == "PUT" and path.startswith("/v1/sessions/"):
+                started.set()
+                release.wait(10)
+            result = call(method, path, *args, **kwargs)
+            if method == "DELETE":
+                deleted.set()
+            return result
+
+        with mock.patch.object(network.bus, "call", slow_put), \
+                mock.patch.object(plugin, "REPORT_DRAIN_SECONDS", 10):  # margin for a loaded runner
+            reporter = threading.Thread(target=network.report, args=(conversation,))
+            reporter.start()
+            self.assertTrue(started.wait(10))
+            deleter = threading.Thread(target=ctx.hooks["on_session_delete"], kwargs={"deleted_ids": ["s1"]})
+            deleter.start()
+            try:
+                # Without the wait the DELETE lands while the PUT is held; with it, it can't.
+                self.assertFalse(deleted.wait(2), "the DELETE didn't wait for the report on its way")
+            finally:
+                release.set()
+                reporter.join(15)
+                deleter.join(15)
+        self.assertFalse(reporter.is_alive() or deleter.is_alive())
+        self.assertTrue(deleted.is_set())
+        self.assertTrue(conversation.closed.is_set())
+        self.assertFalse(any(s["id"] == conversation.id for s in self.sessions()),
+                         "a report on its way brought a deleted session back")
+
+    def test_a_report_that_outlasts_the_drain_takes_its_session_back(self):
+        # end() waits only so long for a report on its way. A PUT that lands after its DELETE
+        # must take the session back off the bus itself.
+        self.write_config(True)
+        ctx, network = self.load()
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx)
+        conversation = network.conversation("s1")
+        started, release, deleted = threading.Event(), threading.Event(), threading.Event()
+        call = network.bus.call
+
+        def stalled_put(method, path, *args, **kwargs):
+            if method == "PUT" and path.startswith("/v1/sessions/") and not release.is_set():
+                started.set()
+                release.wait(10)
+            result = call(method, path, *args, **kwargs)
+            if method == "DELETE":
+                deleted.set()
+            return result
+
+        with mock.patch.object(plugin, "REPORT_DRAIN_SECONDS", 0.2), \
+                mock.patch.object(network.bus, "call", stalled_put):
+            reporter = threading.Thread(target=network.report, args=(conversation,))
+            reporter.start()
+            try:
+                self.assertTrue(started.wait(10))
+                ctx.hooks["on_session_delete"](deleted_ids=["s1"])
+                self.assertTrue(deleted.wait(10), "end() didn't give up waiting")
+            finally:
+                release.set()
+                reporter.join(15)
+        self.assertFalse(reporter.is_alive())
+        self.assertFalse(any(s["id"] == conversation.id for s in self.sessions()),
+                         "a PUT that outlasted the drain brought the session back")
+
+    def test_an_old_delete_doesnt_end_a_new_conversation_with_its_id(self):
+        # A reset ends a conversation; a new turn on the same route makes another with the same
+        # id. The old DELETE and the new PUT must not interleave so the new one is ended.
+        self.write_config(True)
+        ctx, network = self.load()
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx)
+        old = network.conversation("s1")
+        with network.lock:
+            network.conversations.pop(old.id)  # what forget() does before end()
+        new = plugin.Conversation(old.id, old.name, old.cwd, True)
+        in_delete, release = threading.Event(), threading.Event()
+        call = network.bus.call
+
+        def parked_delete(method, path, *args, **kwargs):
+            if method == "DELETE" and not release.is_set():
+                in_delete.set()
+                release.wait(10)
+            return call(method, path, *args, **kwargs)
+
+        with mock.patch.object(network.bus, "call", parked_delete):
+            ender = threading.Thread(target=network.end, args=(old,))
+            ender.start()
+            try:
+                self.assertTrue(in_delete.wait(10))
+                with network.lock:
+                    network.conversations[new.id] = new  # made after end() checked for it
+                reporter = threading.Thread(target=network.report, args=(new,))
+                reporter.start()
+                time.sleep(0.5)  # unless it waits, the new PUT lands before the old DELETE
+            finally:
+                release.set()
+                ender.join(15)
+            reporter.join(15)
+        self.assertFalse(ender.is_alive() or reporter.is_alive())
+        self.assertTrue(any(s["id"] == new.id for s in self.sessions()),
+                        "an old DELETE ended the new conversation")
 
     def test_finishing_a_conversation_ends_its_session_and_wake(self):
         self.write_config(True)

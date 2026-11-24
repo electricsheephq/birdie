@@ -161,6 +161,10 @@ func newClaudeInboxWithAck(t *testing.T, initialStatus string, beforeAck func(*h
 	return f
 }
 
+// loadedMacWait bounds a wait for something that must happen. It only ends a failing test,
+// so it allows for a runner or Mac under heavy load (stress-ng runs, 2026-11-24).
+const loadedMacWait = 20 * time.Second
+
 func (f *claudeInbox) poll(t *testing.T, at string) observedClaim {
 	t.Helper()
 	select {
@@ -169,7 +173,7 @@ func (f *claudeInbox) poll(t *testing.T, at string) observedClaim {
 			t.Fatalf("poll at=%q wait=%q, want at=%q and wait=5 at boundaries", p.at, p.wait, at)
 		}
 		return p
-	case <-time.After(7 * time.Second):
+	case <-time.After(loadedMacWait):
 		t.Fatal("no next push poll")
 		return observedClaim{}
 	}
@@ -198,7 +202,7 @@ func (f *claudeInbox) frame(t *testing.T, ids ...string) string {
 			t.Fatalf("socket frame ids = %v, want %v", got, ids)
 		}
 		return content
-	case <-time.After(7 * time.Second):
+	case <-time.After(loadedMacWait):
 		t.Fatal("no socket frame")
 		return ""
 	}
@@ -454,7 +458,7 @@ func TestATemporaryRegistryReadFailureDoesNotStartAnUngatedPoll(t *testing.T) {
 	}
 	select {
 	case <-cutShort:
-	case <-time.After(7 * time.Second):
+	case <-time.After(loadedMacWait):
 		t.Fatal("busy poll did not finish")
 	}
 	select {
