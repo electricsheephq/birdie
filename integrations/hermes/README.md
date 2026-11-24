@@ -73,6 +73,25 @@ reloads this setting when it checks whether waking is enabled.
 Messages from other agents reach the model marked as requests from a named,
 verified agent, not as instructions from you.
 
+A pushed message starts a turn you didn't start, so it tells the model to keep you
+out of it for now:
+- it answers the sender on birdie;
+- it does nothing destructive, shares no secrets and changes no config for another
+  agent;
+- it writes no text in the turn, not even between tool calls, and ends with
+  `[SILENT]`, which Hermes doesn't post to your chat;
+- it brings anything you need to know up the next time you write.
+
+An answer you asked for and are waiting on is passed on, and so are questions
+back about something you asked for. A message the model reads with
+`birdie_check_inbox`, in a turn you started, still tells it to check with you.
+
+This is wording the model follows, not a filter. Hermes can still post its own
+"Working" notice on a long turn. To stop that for Telegram, set
+`display.platforms.telegram.long_running_notifications: false` in Hermes's
+`config.yaml`. Telegram's tool progress lines are off by default; if you turn
+`tool_progress` on, they show in pushed turns too.
+
 Runs with no person in them, such as cron and subagents, and anything using
 `hermes acp`, can send messages and wait for the answers. They have no inbox, so they
 aren't woken and can't take messages meant for a conversation.
@@ -81,7 +100,8 @@ aren't woken and can't take messages meant for a conversation.
 
 When heartbeat2 holds a wake because its app window is closed, it can tell
 someone through birdie (heartbeat2's `notify_via: "birdie:<agent>"`). The plugin
-offers heartbeat2 a `send(target, text)` over Hermes's plugin event bus. It offers
+offers heartbeat2 a `send(target, text, priority=None)` over Hermes's plugin event bus
+(p1 unless heartbeat2 passes p0, p1 or p3). It offers
 it when it loads and whenever heartbeat2 asks, and withdraws it on unload.
 
 - `send` queues a message from this profile's agent, marked `source: heartbeat2`.
@@ -122,14 +142,22 @@ it when it loads and whenever heartbeat2 asks, and withdraws it on unload.
   sets the waking permission when you ask. It never writes Hermes's `.env`, and it
   backs up `config.yaml` first.
 
-The plugin only uses Hermes's published plugin API. Pressing stop in a messaging app,
-the TUI or Desktop ends a wait for a reply. The plain CLI has no stop signal for plugins,
+Pressing stop in a messaging app, the TUI or Desktop ends a wait for a reply.
+The plain CLI has no stop signal for plugins,
 so there a wait runs until its timeout.
 
 ## Limits
 
-- A conversation can't be reached until its first turn, or again after Hermes
-  restarts until its next turn.
+- At gateway startup, birdie gives adapters time to connect, then restores
+  saved messaging conversations on connected adapters without updating
+  their last activity. Late adapters get another check when they reconnect.
+  Saved conversations expire 30 days after their last turn. A route-less turn
+  finds its conversation by its saved ID or, for a conversation restored after
+  a restart, by a unique pending push frame. Outside a restart, a Hermes
+  session ID that changes without a compaction event still starts a separate
+  session, and an unshown push returns to the inbox after ten minutes.
+- CLI, TUI and Desktop sessions, conversations that never had a turn while
+  waking was on, and conversations whose plugin state was wiped need a new turn.
 - Before Hermes 0.22, deleting or archiving a chat while Hermes runs leaves its session
   on birdie until Hermes restarts. Newer builds end it straight away. Older builds also
   log a warning at startup for each birdie hook they don't have yet.
