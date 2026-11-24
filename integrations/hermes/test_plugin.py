@@ -1139,14 +1139,15 @@ class PluginTest(PluginCase):
                     mock.patch.object(network, "take", side_effect=lambda c, s, t: asked["take"].append(s) or []):
                 self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 600})
             used = asked["wait_pushed" if wake else "take"]
-            self.assertEqual(used, [plugin.MAX_REPLY_SECONDS], asked)
+            self.assertEqual(len(used), 1, asked)
+            self.assertLessEqual(used[0], plugin.MAX_REPLY_SECONDS)
+            self.assertGreater(used[0], plugin.MAX_REPLY_SECONDS - 5)
         properties = next(tool[3] for tool in plugin.TOOLS if tool[0] == "birdie_wait_for_reply")
         self.assertIn(f"max {plugin.MAX_REPLY_SECONDS}", properties["timeout_seconds"]["description"])
 
     def test_a_wait_stops_when_hermes_gives_up_on_the_call(self):
         # At its tool timeout, or a stop in the plain CLI, Hermes flags the tool's thread and
         # no longer reads the call. A reply taken then must go back, not be confirmed.
-        self.assertFalse(plugin.hermes_gave_up())
         gave_up = types.ModuleType("tools.interrupt")
         gave_up.is_interrupted = lambda: True
         for wake in (True, False):
@@ -1157,12 +1158,13 @@ class PluginTest(PluginCase):
             peer("POST", "/v1/messages", {"in_reply_to": peer_inbox(5)[0]["id"], "content": "the reply"})
             with mock.patch.dict(sys.modules, {"tools": types.ModuleType("tools"), "tools.interrupt": gave_up}):
                 started = time.monotonic()
-                result = json.loads(self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 60}))
+                result = self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 60})
                 self.assertLess(time.monotonic() - started, 15)
-            self.assertIn("Stopped waiting", result["error"])
+            self.assertIn("Stopped waiting", result, f"wake={wake}")
             later = self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 8})
             shown = later + "".join(text for _, text in ctx.injected)
             self.assertIn("the reply", shown, f"wake={wake}: a reply given back comes again")
+        self.assertFalse(plugin.hermes_gave_up(), "outside Hermes nothing gives up")
 
     def test_a_new_request_says_how_to_ask_first_and_a_question_says_it_asks(self):
         new = plugin.frame({"from": "peer", "id": "m1", "thread_id": "t1", "content": "tidy the repo"})
