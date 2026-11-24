@@ -182,10 +182,32 @@ class PluginCase(unittest.TestCase):
         return []
 
 
+class ToolDescriptionTest(unittest.TestCase):
+    def test_the_agent_tool_explains_held_mail_on_stopped_rows_and_warmth(self):
+        description = next(tool[2] for tool in plugin.TOOLS if tool[0] == "birdie_list_agents")
+        for phrase in ("not running", "held", "warm", "50 minutes"):
+            self.assertIn(phrase, description)
+
+
 class PluginTest(PluginCase):
     KEEP_WARM = ("⟦pulse o:wake/occurrence a:1⟧ [HeartBeat 2.0 · keep-warm wake]"
                  "\nThis turn only keeps the prompt cache warm. Do no work and call no tools. Reply with exactly: [SILENT]")
     KEEP_WARM_TAGGED = KEEP_WARM.replace("a:1⟧", "a:1 n:0123456789abcdef⟧")
+
+    def test_the_send_tool_shows_when_the_recipient_defaulted_the_priority(self):
+        ctx, network = self.load()
+        sent = {"id": "m1", "thread_id": "t1", "status": "queued", "priority": "p3", "defaulted": True}
+        with mock.patch.object(network.bus, "call", return_value=sent):
+            result = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "update"}))
+        self.assertEqual(result.get("priority"), "p3")
+        self.assertIs(result.get("defaulted"), True)
+
+    def test_the_send_tool_returns_the_delivery_cost(self):
+        ctx, network = self.load()
+        sent = {"id": "m1", "thread_id": "t1", "status": "queued", "cost": "wakes_cold"}
+        with mock.patch.object(network.bus, "call", return_value=sent):
+            result = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "update"}))
+        self.assertEqual(result.get("cost"), "wakes_cold")
 
     def test_the_send_tool_accepts_only_the_supported_priorities_and_passes_them(self):
         ctx, _ = self.load()

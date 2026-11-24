@@ -4,10 +4,41 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
 )
+
+var generatedSessionID = regexp.MustCompile(`(?i)^([0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}|hermes-[0-9a-f]{16}|proc-[0-9]+)$`)
+
+// UnrankedTarget resolves a CLI target to a setting shared by sessions with that name.
+func (b *Bus) UnrankedTarget(ctx context.Context, a Agent, addr Address) (string, []Session, error) {
+	recent, err := b.RecentSessions(ctx, a)
+	if err != nil {
+		return "", nil, err
+	}
+	name := addr.Session
+	for _, s := range recent {
+		matchesID := s.ID == addr.Session
+		if addr.ID != "" {
+			matchesID = s.ID == addr.ID && s.Name == addr.Session
+		}
+		if matchesID {
+			if s.Name == "" {
+				return "", nil, fmt.Errorf("session %s has no name; set unranked mail for %s instead", s.Address, a.Name)
+			}
+			name = s.Name
+			addr.ID = ""
+			break
+		}
+	}
+	covers := slices.DeleteFunc(recent, func(s Session) bool { return s.Name != name })
+	if addr.ID != "" || (len(covers) == 0 && generatedSessionID.MatchString(name)) {
+		return "", nil, fmt.Errorf("no recent session matches %s; run birdie session list --all for its address", addr)
+	}
+	return name, covers, nil
+}
 
 // Codes of AddressError.
 const (

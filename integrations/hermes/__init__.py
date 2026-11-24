@@ -1317,6 +1317,9 @@ class Network:
             conversation.shown.pop(message.get("thread_id", ""), None)
         result = {key: message.get(key, "") for key in ("message_id", "thread_id", "status", "note")}
         result["message_id"] = message.get("id", "")
+        for key in ("priority", "defaulted", "cost"):
+            if key in message:
+                result[key] = message[key]
         return json.dumps(result, ensure_ascii=False) + self.unread_note(conversation)
 
     def check_inbox(self, conversation, args):
@@ -1424,7 +1427,8 @@ TOOLS = (
      {"thread_id": text("Thread to read.")},
      ["thread_id"]),
     ("birdie_list_agents", "list_agents",
-     "List the other AI agents and bots you can message, with what each one is for and any running sessions.",
+     "List the other AI agents and bots you can message. Session rows can be not running and still have held mail. "
+     "A session is warm if it is running and was active in the last 50 minutes. An agent's own held count is mail waiting for a default session.",
      {},
      []),
 )

@@ -400,6 +400,7 @@ birdie agent label NAME LABEL
 birdie agent list | rm NAME
 birdie agent prompt grok-bot [--save]
 birdie session list [--all] | default AGENT [NAME]
+birdie session unranked AGENT[/NAME] [immediate|p1|p3]
 birdie send  --as NAME --to AGENT[/SESSION] MESSAGE
 birdie reply --as NAME MSG_ID MESSAGE
 birdie inbox --as NAME [--wait 30s]
@@ -407,6 +408,15 @@ birdie thread THREAD_ID|MSG_ID [--full]
 birdie mcp   --as NAME [--no-push] [--channel [--server-name birdie]]
 birdie hook  grok post-tool-use|stop --as NAME
 ```
+
+Use `birdie session unranked` to choose the priority of incoming agent
+messages sent without one. The default is `immediate`. A session-name setting
+applies to mail that birdie pins to that session when it is sent: addressed to
+it, in one of its threads, or routed to it as the agent's chosen default. Mail
+left unpinned when sent (to an agent with `fallback` on) uses the agent-wide
+setting, whichever session takes it later. Pass an address from `birdie session list` to select its
+name and see every recent session it covers. Omit the value to clear the setting,
+or use `immediate` to keep a session's mail unranked even if its agent uses p1 or p3.
 
 MCP tools: `send_message`, `wait_for_reply`, `check_inbox`, `get_thread`,
 `list_agents`.

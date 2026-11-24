@@ -20,6 +20,7 @@ The user doesn't have to mention them: "ask Grok Bot…" is enough.
    (`claude/api#3f2a9c1e`); a name alone (`claude/api`) works when only one
    session has it. Claude sessions must be addressed one by one; for other
    agents, the agent's default session takes a message sent to the agent.
+   Read `warm` before interrupting a session and `held` to see how much mail is already waiting.
    Hermes's `birdie_send_message` can also set `priority`.
    Choose the lowest `priority` that fits. Use `p0` for a stop sign (data loss,
    a live failure, or something irreversible) or a decision that blocks you and

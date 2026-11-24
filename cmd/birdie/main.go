@@ -51,6 +51,7 @@ Usage:
   birdie session list [--all]
   birdie session default AGENT [NAME]
   birdie session fallback AGENT [on|off]
+  birdie session unranked AGENT[/NAME] [immediate|p1|p3]
   birdie session pull-only ADDRESS on|off
   birdie send --as NAME --to AGENT[/SESSION] [--thread ID] [--context TEXT] [--wanted TEXT] MESSAGE
   birdie reply --as NAME MSG_ID MESSAGE
@@ -318,6 +319,45 @@ func session(ctx context.Context, args []string) error {
 			fmt.Printf("%s: a message addressed to %s alone goes to its default session, the most recently active one unless you chose one\n", a.DisplayName(), agent)
 		} else {
 			fmt.Printf("%s: a message addressed to %s alone needs a session's address (birdie session list shows them), unless you chose a default session with `birdie session default`\n", a.DisplayName(), agent)
+		}
+		return nil
+	}, func(addr bus.Address, value string) error {
+		var covers []bus.Session
+		if addr.Session != "" {
+			a, err := st.GetAgent(ctx, addr.Agent)
+			if err != nil {
+				return err
+			}
+			name, sessions, err := b.UnrankedTarget(ctx, a, addr)
+			if err != nil {
+				return err
+			}
+			addr.Session, addr.ID, covers = name, "", sessions
+		}
+		if err := st.SetAgentConfig(ctx, addr.Agent, bus.UnrankedKey(addr.Session), value); err != nil {
+			return fmt.Errorf("set unranked mail for %q: %w", addr, err)
+		}
+		a, err := st.GetAgent(ctx, addr.Agent)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s: unranked mail is handled as %s\n", addr, a.UnrankedAs(addr.Session))
+		if len(covers) > 0 {
+			var labels []string
+			for _, s := range covers {
+				state := "stopped"
+				if s.Running {
+					state = "running"
+				}
+				labels = append(labels, s.Address+" ("+state+")")
+			}
+			fmt.Printf("covers: %s\n", strings.Join(labels, ", "))
+		} else if addr.Session != "" {
+			fmt.Println("no session has this name yet")
+		}
+		if addr.Session != "" && bus.PicksSession(a) {
+			// Mail to an agent that picks its own session is left unpinned when sent, so only the agent-wide value covers it.
+			fmt.Printf("note: a message addressed to %s alone uses the agent-wide setting (%s), even when this session takes it; this setting covers mail sent to this session or in its threads\n", addr.Agent, a.UnrankedAs(""))
 		}
 		return nil
 	}, args)

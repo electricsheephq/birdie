@@ -139,22 +139,21 @@ func TestAWarmTurnClaimSpacesDigestsAndKeepsTheByteBudget(t *testing.T) {
 }
 
 func TestASenderGetsDeliveryNotesForWarmAndColdTurnRecipients(t *testing.T) {
-	p := newPriorityInbox(t)
-	p.report(t, *p.now)
-	p.claim(t, "turn")
 	for _, tc := range []struct{ priority, note string }{
 		{"p0", "goes now; it starts its next turn"},
 		{"p1", "goes now; it sees this when its current turn ends, or at once if it is idle"},
 		{"p3", "held: goes in its next digest, within about 20 minutes"},
 		{"", "queued: bob gets this right away"},
 	} {
+		p := newPriorityInbox(t)
+		p.report(t, *p.now)
+		p.claim(t, "turn")
 		if got := p.send(t, "alice", tc.priority, "hello").Note; got != tc.note {
 			t.Errorf("%q note = %q, want %q", tc.priority, got, tc.note)
 		}
 	}
 	const warm = "held: goes in its next digest, within about 20 minutes"
 	const cold = "held: goes in its next digest (one every 20 minutes) while it is active, otherwise with its next turn (at most 12 hours)"
-	active := *p.now
 	for _, tc := range []struct {
 		age  time.Duration
 		note string
@@ -164,12 +163,86 @@ func TestASenderGetsDeliveryNotesForWarmAndColdTurnRecipients(t *testing.T) {
 		{30*time.Minute + time.Millisecond, cold},
 		{bus.CacheIdle + time.Millisecond, cold},
 	} {
-		*p.now = active.Add(tc.age)
-		p.report(t, active)
+		p := newPriorityInbox(t)
+		p.report(t, p.now.Add(-tc.age))
+		p.claim(t, "turn")
 		if got := p.sendToDesk(t, "alice", "p3", "update").Note; got != tc.note {
 			t.Errorf("note at activity age %v = %q, want %q", tc.age, got, tc.note)
 		}
 	}
+}
+
+func TestBoundaryP3WakesAColdSessionButWaitsForADigestWhenWarm(t *testing.T) {
+	for _, tc := range []struct {
+		idle       time.Duration
+		cost, note string
+	}{
+		{bus.CacheIdle, "wakes_cold", "goes now; it has been idle over 50 minutes, so this starts its next turn"},
+		{time.Minute, "held", "held: goes in its next digest"},
+	} {
+		t.Run(tc.cost, func(t *testing.T) {
+			p := newPriorityInbox(t)
+			p.report(t, p.now.Add(-tc.idle))
+			p.claim(t, bus.Boundary)
+			m := p.sendToDesk(t, "alice", "p3", "update")
+			if m.Cost != tc.cost || !strings.HasPrefix(m.Note, tc.note) {
+				t.Errorf("cost = %q, note = %q; want %q, %q", m.Cost, m.Note, tc.cost, tc.note)
+			}
+			*p.now = p.now.Add(bus.Coalesce)
+			if tc.cost == "held" {
+				p.claim(t, bus.Boundary)
+				return
+			}
+			p.ack(t, p.claim(t, bus.Boundary, m.ID))
+			second := p.sendToDesk(t, "alice", "p3", "another update")
+			if second.Cost != "held" || !strings.HasPrefix(second.Note, "held:") {
+				t.Errorf("during cooldown: cost = %q, note = %q", second.Cost, second.Note)
+			}
+			*p.now = p.now.Add(bus.Coalesce)
+			p.claim(t, bus.Boundary)
+		})
+	}
+}
+
+func TestP3GetsTheCostOfAnImmediateBatchAtTheBoundaryOrTurn(t *testing.T) {
+	for _, at := range []string{bus.Boundary, bus.Turn} {
+		t.Run(at, func(t *testing.T) {
+			p := newPriorityInbox(t)
+			p.report(t, p.now.Add(-time.Hour))
+			p.claim(t, at)
+			answer := p.sendToDesk(t, "alice", "p1", "answer")
+			update := p.sendToDesk(t, "carol", "p3", "update")
+			if update.Cost != "wakes_cold" || !strings.HasPrefix(update.Note, "goes now;") {
+				t.Errorf("p3 riding with p1: cost = %q, note = %q", update.Cost, update.Note)
+			}
+			*p.now = p.now.Add(bus.Coalesce)
+			p.claim(t, at, answer.ID, update.ID)
+		})
+	}
+}
+
+func TestMidturnMailReleasedByTheValveIsShownAsGoingNow(t *testing.T) {
+	p := newPriorityInbox(t)
+	first := p.send(t, "alice", "p3", "older update")
+	*p.now = p.now.Add(bus.Valve)
+	p.report(t, *p.now)
+	// The old message is ready but unclaimed until the next positioned poll.
+	m, err := p.ReceiveFor(context.Background(), bus.ReceiveInput{Agent: "bob", Session: "desk", Push: true, At: bus.Midturn, Lease: time.Millisecond})
+	if err != nil || len(m) != 1 || m[0].ID != first.ID {
+		t.Fatalf("first valve claim = %v, %v", m, err)
+	}
+	// Advance past the release cooldown, leaving an expired lease to be claimed again.
+	*p.now = p.now.Add(bus.Valve)
+	p.report(t, *p.now)
+	answer := p.sendToDesk(t, "carol", "p1", "answer")
+	update := p.sendToDesk(t, "dora", "p3", "update")
+	for _, m := range []bus.Message{answer, update} {
+		if m.Cost != "warm" || !strings.HasPrefix(m.Note, "goes now;") {
+			t.Errorf("%s: cost = %q, note = %q", m.Priority, m.Cost, m.Note)
+		}
+	}
+	*p.now = p.now.Add(bus.Coalesce)
+	p.claim(t, bus.Midturn, answer.ID, first.ID, update.ID)
 }
 
 func TestAStreamOfP3ReachesASessionAsOneClaimPerInterval(t *testing.T) {
@@ -342,7 +415,7 @@ func TestAP1SentMidturnWaitsForTheBoundaryAndRidesWithP3(t *testing.T) {
 	p.claim(t, "midturn")
 	fyi := p.send(t, "alice", "p3", "update")
 	answer := p.send(t, "carol", "p1", "answer")
-	if answer.Note != "held: sees this when its turn ends" || !strings.HasPrefix(fyi.Note, "held: goes in its next digest") {
+	if answer.Note != "held: sees this when its turn ends, or during a long turn after about 40 minutes" || !strings.HasPrefix(fyi.Note, "held: goes in its next digest") {
 		t.Fatalf("notes = %q, %q", answer.Note, fyi.Note)
 	}
 	p.claim(t, "midturn")

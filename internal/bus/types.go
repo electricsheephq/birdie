@@ -78,8 +78,11 @@ type Agent struct {
 	Delivery  string            `json:"delivery"`
 	Config    map[string]string `json:"-"`
 	CreatedAt time.Time         `json:"created_at"`
-	// Sessions lists the agent's running sessions, when it has any.
+	// Sessions lists the agent's running sessions and stopped ones with held mail.
 	Sessions []Session `json:"sessions,omitempty"`
+	// Held counts waiting unpinned mail with no default session to take it.
+	Held         int    `json:"held,omitempty"`
+	DeliveryNote string `json:"delivery_note,omitempty"`
 }
 
 // defaultLabels names the agents birdie adds by default, for agents added
@@ -116,6 +119,28 @@ func (a Agent) DisplayName() string {
 	return LabelOf(a.Name, a.Config)
 }
 
+// UnrankedKey is the config key for an agent or one of its session names.
+func UnrankedKey(name string) string {
+	if name == "" {
+		return "unranked_as"
+	}
+	return "unranked_as:" + name
+}
+
+// UnrankedAs returns the effective setting for unranked mail.
+func (a Agent) UnrankedAs(name string) string {
+	value := a.Config[UnrankedKey(name)]
+	if value == "" {
+		value = a.Config[UnrankedKey("")]
+	}
+	switch value {
+	case "p1", "p3":
+		return value
+	default:
+		return "immediate"
+	}
+}
+
 // Session is one running conversation of an agent, such as one open Claude
 // Code window. All sessions of an agent share its name and token.
 type Session struct {
@@ -137,7 +162,10 @@ type Session struct {
 	// Default marks the session that takes new conversations.
 	Default bool `json:"default,omitempty"`
 	// Held counts mail waiting for this session on agent listings.
-	Held int `json:"held,omitempty"`
+	Held         int    `json:"held,omitempty"`
+	Running      bool   `json:"live"`
+	Warm         bool   `json:"warm"`
+	DeliveryNote string `json:"delivery_note,omitempty"`
 	// ActiveAt is when its user or model last did something. While it is idle
 	// or waiting, that is when it stopped.
 	ActiveAt time.Time `json:"active_at"`
@@ -152,6 +180,10 @@ type Session struct {
 // Live reports whether the session counts as running at now.
 func (s Session) Live(now time.Time) bool {
 	return s.EndedAt.IsZero() && !s.LastSeen.Before(now.Add(-SessionTTL))
+}
+
+func (s Session) cacheWarm(now time.Time) bool {
+	return s.ActiveAt.UnixMilli() >= now.Add(-CacheIdle).UnixMilli()
 }
 
 // StoppedAt is when a session that isn't running stopped: when it closed, or
@@ -188,6 +220,8 @@ type Message struct {
 	ToSession   string `json:"to_session,omitempty"`
 	Content     string `json:"content"`
 	Priority    string `json:"priority,omitempty"`
+	// Defaulted reports on a send result that the recipient set the priority.
+	Defaulted bool `json:"defaulted,omitempty"`
 	// ContentBytes gives the full body size when a positioned claim uses a P3 pointer.
 	ContentBytes int               `json:"content_bytes,omitempty"`
 	Meta         map[string]string `json:"meta,omitempty"`
@@ -196,6 +230,8 @@ type Message struct {
 	// Note says when the recipient will see the message. Only set on the
 	// result of a send.
 	Note string `json:"note,omitempty"`
+	// Cost describes the delivery expected at the time of the send.
+	Cost string `json:"cost,omitempty"`
 	// Held, on the result of a send, is RecipientSessionEnded when the
 	// session the message is for isn't running: it waits for that session to
 	// come back, and expires if it doesn't in time.
@@ -300,6 +336,8 @@ type Store interface {
 	ClaimInbox(ctx context.Context, f ClaimFilter, now time.Time) ([]Message, time.Duration, error)
 	// CountInbox counts what ClaimInbox would take.
 	CountInbox(ctx context.Context, f ClaimFilter, now time.Time) (int, error)
+	// InboxAllowsHeld checks the position gate without claiming or settling mail.
+	InboxAllowsHeld(ctx context.Context, f ClaimFilter, now time.Time) (bool, error)
 	// CountSent counts messages between the two agents since a time. The
 	// sender session must match, including an empty session. The recipient
 	// session must match when one is given.
@@ -351,9 +389,9 @@ type Store interface {
 	// RecentSessions returns the agent's sessions seen since a time, running
 	// or not.
 	RecentSessions(ctx context.Context, agent string, since time.Time) ([]Session, error)
-	// QueuedBySession counts waiting messages by recipient agent and session,
-	// including expired leases and the empty session for unpinned mail.
-	QueuedBySession(ctx context.Context, now time.Time) (map[[2]string]int, error)
+	// QueuedBySession counts waiting messages by recipient and session, including
+	// expired leases and unpinned mail. It excludes mail past the hold for stopped sessions.
+	QueuedBySession(ctx context.Context, now, holdSince time.Time) (map[[2]string]int, error)
 
 	Close() error
 }
