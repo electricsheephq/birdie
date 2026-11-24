@@ -1212,14 +1212,17 @@ class PluginTest(PluginCase):
             self.turn(ctx)
         conversation = network.conversation("s1")
         self.assertTrue(any(s["id"] == conversation.id for s in self.sessions()))
-        started, release = threading.Event(), threading.Event()
+        started, release, deleted = threading.Event(), threading.Event(), threading.Event()
         call = network.bus.call
 
         def slow_put(method, path, *args, **kwargs):
             if method == "PUT" and path.startswith("/v1/sessions/"):
                 started.set()
                 release.wait(10)
-            return call(method, path, *args, **kwargs)
+            result = call(method, path, *args, **kwargs)
+            if method == "DELETE":
+                deleted.set()
+            return result
 
         with mock.patch.object(network.bus, "call", slow_put):
             reporter = threading.Thread(target=network.report, args=(conversation,))
@@ -1227,13 +1230,31 @@ class PluginTest(PluginCase):
             self.assertTrue(started.wait(10))
             deleter = threading.Thread(target=ctx.hooks["on_session_delete"], kwargs={"deleted_ids": ["s1"]})
             deleter.start()
-            time.sleep(0.5)  # the delete goes first unless it waits for the report on its way
+            # Without the wait the DELETE lands while the PUT is held; with it, it can't.
+            self.assertFalse(deleted.wait(2), "the DELETE didn't wait for the report on its way")
             release.set()
             reporter.join(15)
             deleter.join(15)
+        self.assertFalse(reporter.is_alive() or deleter.is_alive())
+        self.assertTrue(deleted.is_set())
         self.assertTrue(conversation.closed.is_set())
         self.assertFalse(any(s["id"] == conversation.id for s in self.sessions()),
                          "a report on its way brought a deleted session back")
+
+    def test_ending_a_replaced_conversation_doesnt_delete_its_successor(self):
+        # A reset and a new turn on the same route can register a new conversation with the
+        # same id before the old one's end sends DELETE; that DELETE would end the new one.
+        ctx, network = self.load()
+        with mock.patch.object(network, "start_threads"):
+            self.turn(ctx)
+        old = network.conversation("s1")
+        successor = copy.copy(old)
+        with network.lock:
+            network.conversations[old.id] = successor
+        with mock.patch.object(network.bus, "call") as call:
+            network.end(old)
+        self.assertTrue(old.closed.is_set())
+        self.assertFalse([c for c in call.call_args_list if c.args and c.args[0] == "DELETE"])
 
     def test_finishing_a_conversation_ends_its_session_and_wake(self):
         self.write_config(True)

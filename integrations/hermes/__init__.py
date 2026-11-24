@@ -36,6 +36,7 @@ POLL_SECONDS = 25
 LEASE_SECONDS = 120
 WAIT_STEP_SECONDS = 2  # how often a waiting tool notices it was interrupted
 MAX_CHECK_SECONDS = 120
+REPORT_DRAIN_SECONDS = 3.5  # how long ending a session waits for a report on its way
 MAX_REPLY_SECONDS = 600
 RETRY_SECONDS = 5
 TURN_RETRY_SECONDS = 60 * 60
@@ -736,7 +737,7 @@ class Network:
                 "name": conversation.name, "cwd": conversation.cwd,
                 "tier": "push" if conversation.wake else "pull", "active_at": conversation.active_at,
             }, timeout=3)
-        conversation.pull_only = bool(reply.get("pull_only"))
+            conversation.pull_only = bool(reply.get("pull_only"))  # in report order
 
     def pushing(self, conversation):
         """Whether messages come into this conversation on their own. Delivery keeps
@@ -890,9 +891,15 @@ class Network:
 
     def end(self, conversation):
         conversation.closed.set()
-        with conversation.report_lock:
-            pass  # a report already on its way lands first; no later one starts once closed
-        if conversation.is_session:
+        # A report already on its way lands first; none starts once closed. The wait is
+        # bounded, so a stalled bus can't hold up a delete, reset or unload for long.
+        if conversation.report_lock.acquire(timeout=REPORT_DRAIN_SECONDS):
+            conversation.report_lock.release()
+        with self.lock:
+            # A reset and a new turn on the same route can already have a new conversation
+            # with this id on the bus: deleting it would end that one.
+            replaced = self.conversations.get(conversation.id) not in (None, conversation)
+        if conversation.is_session and not replaced:
             try:
                 self.bus.call("DELETE", "/v1/sessions/" + urllib.parse.quote(conversation.id, safe=""), timeout=3)
             except BusError as err:
