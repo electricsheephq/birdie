@@ -142,9 +142,12 @@ it when it loads and whenever heartbeat2 asks, and withdraws it on unload.
   sets the waking permission when you ask. It never writes Hermes's `.env`, and it
   backs up `config.yaml` first.
 
-Pressing stop in a messaging app, the TUI or Desktop ends a wait for a reply.
-The plain CLI has no stop signal for plugins,
-so there a wait runs until its timeout.
+The plugin uses Hermes's published plugin API, and one flag besides: the one Hermes
+sets on a tool's thread when it gives up on the call. So a wait for a reply ends when
+the user presses stop, in a messaging app, the TUI, Desktop or the plain CLI, and when
+Hermes's tool timeout ends the call; a reply that arrives then comes in a later turn.
+A Hermes without that flag has no stop signal for plugins in the plain CLI, and there a
+wait runs until its timeout, at most 400 seconds.
 
 ## Limits
 

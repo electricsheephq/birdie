@@ -37,7 +37,11 @@ LEASE_SECONDS = 120
 WAIT_STEP_SECONDS = 2  # how often a waiting tool notices it was interrupted
 MAX_CHECK_SECONDS = 120
 REPORT_DRAIN_SECONDS = 1  # how long ending a session waits for a report on its way
-MAX_REPLY_SECONDS = 600
+# Hermes ends a tool call after 420 s by default (timeouts.tools.sequential_call), and a plugin tool
+# can't declare a longer deadline. A wait that outlived the call could take a reply, confirm it to the
+# bus, and return it to a call nobody reads any more. So a wait also stops when Hermes gives up on the
+# call (hermes_gave_up), and this cap covers a Hermes without that flag.
+MAX_REPLY_SECONDS = 400
 RETRY_SECONDS = 5
 TURN_RETRY_SECONDS = 60 * 60
 QUIET_SECONDS = 5 * 60
@@ -104,6 +108,16 @@ def load_config():
 def digest_seconds(config):
     minutes = config.get("digest_minutes")
     return 60 * (max(10, min(50, minutes)) if type(minutes) is int else 20)
+
+
+def hermes_gave_up():
+    """Hermes flags a tool's thread when it gives up on the call: at its tool timeout, or when the
+    user stops the turn, the plain CLI included. Read at each wait step."""
+    try:
+        from tools.interrupt import is_interrupted
+    except ImportError:  # not running inside Hermes, or one without the flag
+        return False
+    return is_interrupted()
 
 
 def read_token():
@@ -342,6 +356,17 @@ def frame_fingerprint(text):
     return hashlib.sha256(text.split(f"</{TAG}>", 1)[0].encode()).hexdigest()
 
 
+def restored_fingerprints(conversation, ident, message):
+    """The frames a delayed turn may show for a restored push: the one the copy before the
+    restart pushed and, once delivery has claimed the message again, the one this copy would
+    push. An upgrade can move a message across the pointer threshold."""
+    if "_frame" in message:
+        return (message["_frame"],)
+    current = frame_fingerprint(push_frame(message))
+    saved = conversation.restored_frames.get(ident)
+    return (current,) if saved in (None, current) else (saved, current)
+
+
 def shown_ids(text):
     """The birdie messages a turn's text shows: message id -> thread id."""
     shown = {}
@@ -385,6 +410,9 @@ class Conversation:
         # Given back because no turn showed them in time. A turn can still show
         # one late; it then counts as delivered when delivery takes it again.
         self.expired = collections.OrderedDict()
+        # Restored pushes: the fingerprint of the frame the copy before the restart pushed.
+        # A claim of the message again replaces its stub in pending, and keeps this.
+        self.restored_frames = {}
 
     def was_delivered(self, message_id):
         with self.lock:
@@ -498,6 +526,8 @@ class Network:
                 self.stopped.add(session_key)
 
     def interrupted(self, conversation):
+        if hermes_gave_up():
+            return True
         with self.lock:
             return bool(conversation.route) and conversation.route in self.stopped
 
@@ -621,8 +651,8 @@ class Network:
         for c in self.conversations.values() if frames else ():
             if c.restored and c.restart_record and c.restart_record["surface"] == surface:
                 with c.lock:
-                    if any((ident, m.get("_frame") or frame_fingerprint(push_frame(m))) in frames
-                           for ident, (m, _) in c.pending.items()):
+                    if any((ident, fingerprint) in frames for ident, (m, _) in c.pending.items()
+                           for fingerprint in restored_fingerprints(c, ident, m)):
                         matches.append(c)
         return matches[0] if len(matches) == 1 else None
 
@@ -705,6 +735,7 @@ class Network:
                 for mid, (deadline, fingerprint, lease) in record.get("pending", {}).items():
                     stub = {"id": mid, "_frame": fingerprint, "lease_until": lease, "thread_id": None}
                     conversation.pending[mid] = (stub, deadline + offset)
+                    conversation.restored_frames[mid] = fingerprint
                 self.sees_turn_text = True
                 self.conversations[ident] = conversation
                 self.sessions[session_id] = ident
@@ -1235,6 +1266,9 @@ class Network:
         while True:
             step = min(WAIT_STEP_SECONDS, max(0, deadline - time.monotonic()))
             messages = self.bus.inbox(self.session_of(conversation), wait=step, thread=thread)
+            if messages and self.interrupted(conversation):
+                self.give_back(messages)  # nobody would see them; they come back for a later turn
+                raise InterruptedError
             if messages:
                 for message in messages:
                     self.bus.ack(message["id"])
@@ -1288,6 +1322,9 @@ class Network:
                     except BusError as err:
                         log.debug("birdie: thread inbox: %s", err)
                         continue
+                if messages and self.interrupted(conversation):
+                    self.give_back(messages)  # nobody would see them; delivery shows them later
+                    raise InterruptedError
                 fresh = []
                 for message in messages:
                     if conversation.mark_delivered(message["id"]):
@@ -1453,7 +1490,7 @@ TOOLS = (
     ("birdie_wait_for_reply", "wait_for_reply",
      "Wait for the answer to a message you sent, when your user is waiting on it. Returns it, or says none came in time.",
      {"thread_id": text("thread_id returned by birdie_send_message."),
-      "timeout_seconds": {"type": "number", "description": "Default 120, max 600."}},
+      "timeout_seconds": {"type": "number", "description": "Default 120, max 400."}},
      ["thread_id"]),
     ("birdie_get_thread", "get_thread",
      "Read the full history of a thread you are part of.",

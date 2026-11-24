@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 import os
+import queue
 import sqlite3
 import sys
 import tempfile
@@ -1125,6 +1126,73 @@ class PluginTest(PluginCase):
         peer("POST", "/v1/messages", {"in_reply_to": peer_inbox(5)[0]["id"], "content": "a"})
         self.assertIn("is answering", self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 5}))
 
+    def test_a_wait_ends_before_hermes_abandons_the_tool_call(self):
+        # Hermes ends a tool call after 420 s by default. A wait that outlived it could take a
+        # reply, confirm it to the bus, and hand it to a call nobody reads any more.
+        self.assertLess(plugin.MAX_REPLY_SECONDS, 420)
+        for wake in (True, False):
+            self.write_config(wake)
+            ctx, network = self.load()
+            self.turn(ctx)
+            sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}))
+            asked = {"wait_pushed": [], "take": []}
+            with mock.patch.object(network, "wait_pushed", side_effect=lambda c, t, s: asked["wait_pushed"].append(s) or ([], False)), \
+                    mock.patch.object(network, "take", side_effect=lambda c, s, t: asked["take"].append(s) or []):
+                self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 600})
+            used = asked["wait_pushed" if wake else "take"]
+            self.assertEqual(len(used), 1, asked)
+            self.assertLessEqual(used[0], plugin.MAX_REPLY_SECONDS)
+            self.assertGreater(used[0], plugin.MAX_REPLY_SECONDS - 5)
+        properties = next(tool[3] for tool in plugin.TOOLS if tool[0] == "birdie_wait_for_reply")
+        self.assertIn(f"max {plugin.MAX_REPLY_SECONDS}", properties["timeout_seconds"]["description"])
+
+    def test_a_wait_stops_when_hermes_gives_up_on_the_call(self):
+        # At its tool timeout, or a stop in the plain CLI, Hermes flags the tool's thread and
+        # no longer reads the call. A reply taken then must go back, not be confirmed.
+        claimed = threading.Event()  # the wait has the reply, by either route
+
+        class Waiter(queue.Queue):  # what delivery hands a waited-for reply over through
+            def put(self, item, *args, **kwargs):
+                super().put(item, *args, **kwargs)
+                claimed.set()
+
+        gave_up = types.ModuleType("tools.interrupt")
+        for wake in (True, False):
+            self.write_config(wake)
+            ctx, network = self.load()
+            self.turn(ctx)
+            sent = json.loads(self.call(ctx, "birdie_send_message", {"to": "peer", "content": "q"}))
+            question = peer_inbox(5)[0]["id"]
+            inbox = network.bus.inbox
+
+            def watched(*args, **kwargs):  # the wait's own claim of the thread
+                messages = inbox(*args, **kwargs)
+                if any(m.get("content") == "the reply" for m in messages or []):
+                    claimed.set()
+                return messages
+            def reply():
+                peer("POST", "/v1/messages", {"in_reply_to": question, "content": "the reply"})
+            if wake:
+                # Hermes gives up just as the reply reaches the wait.
+                gave_up.is_interrupted = claimed.is_set
+                threading.Timer(1, reply).start()
+            else:
+                gave_up.is_interrupted = lambda: True
+                reply()
+            with mock.patch.dict(sys.modules, {"tools": types.ModuleType("tools"), "tools.interrupt": gave_up}), \
+                    mock.patch.object(plugin, "queue", types.SimpleNamespace(Queue=Waiter, Empty=queue.Empty)), \
+                    mock.patch.object(network.bus, "inbox", watched):
+                started = time.monotonic()
+                result = self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 60})
+                self.assertLess(time.monotonic() - started, 15)
+            self.assertIn("Stopped waiting", result, f"wake={wake}")
+            if wake:
+                self.assertTrue(claimed.is_set(), "the push-mode wait had the reply")
+            later = self.call(ctx, "birdie_wait_for_reply", {"thread_id": sent["thread_id"], "timeout_seconds": 8})
+            shown = later + "".join(text for _, text in ctx.injected)
+            self.assertIn("the reply", shown, f"wake={wake}: a reply given back comes again")
+        self.assertFalse(plugin.hermes_gave_up(), "outside Hermes nothing gives up")
+
     def test_a_new_request_says_how_to_ask_first_and_a_question_says_it_asks(self):
         new = plugin.frame({"from": "peer", "id": "m1", "thread_id": "t1", "content": "tidy the repo"})
         self.assertIn(f'ask first: reply starting "{plugin.CLARIFY}"', new)
@@ -1598,6 +1666,27 @@ class ReconnectTest(PluginCase):
         self.assertFalse(ctx.state.data[plugin.RESTART_STATE][saved.id].get("pending"))
         self.assertEqual(restored.pending, {})
         self.assertEqual(status(message["id"]), "delivered")
+
+    def test_a_restored_push_claimed_again_before_its_turn_still_maps_the_new_id(self):
+        # An upgrade can move a message across the pointer threshold: other wording after the
+        # tag changes the frame's size. The delayed turn still shows the frame the copy before
+        # the restart pushed, so a claim of it again must not lose the saved fingerprint.
+        ctx, old, saved = self.save_telegram()
+        message = self.claim(saved)
+        old.deliver(saved, message)
+        _, text = ctx.injected[0]
+        ctx, network = self.restart(ctx, old)
+        self.restore_without_polling(ctx, network)
+        restored = network.conversation("s1")
+        with mock.patch.object(plugin, "MAX_PUSH_BYTES", 10):  # this copy would push a pointer
+            network.deliver(restored, message)  # its lease ran out before its turn: claimed again
+            self.assertNotIn("_frame", restored.pending[message["id"]][0])
+            with mock.patch.object(network, "start_threads"):
+                self.turn(ctx, session="s2", platform="telegram", user_message=text)
+        self.assertIs(network.conversations[network.sessions["s2"]], restored)
+        self.assertEqual(restored.pending, {})
+        self.assertEqual(status(message["id"]), "delivered")
+        self.assertEqual(len(ctx.injected), 0, "put in again after the restart")
 
     def test_a_partial_frame_and_an_ambiguous_match_keep_the_new_turn_pull_only(self):
         ctx, old, saved = self.save_telegram()
